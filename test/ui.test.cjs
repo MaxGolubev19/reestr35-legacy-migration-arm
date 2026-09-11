@@ -202,7 +202,7 @@ test('empty detail renders the bundled astronaut responsively without changing i
   assert.equal(await image.getAttribute('alt'), '', 'the illustration stays decorative because the adjacent copy describes the state');
   assert.deepEqual(await image.evaluate(node => ({ complete: node.complete, width: node.naturalWidth, height: node.naturalHeight })), { complete: true, width: 2000, height: 2000 });
   assert.equal(await page.locator('#empty-detail .empty-title').innerText(), 'Выберите страницу');
-  assert.match(await page.locator('#empty-detail .empty-subtitle').innerText(), /галерея снимков, отчёт и попытки/);
+  assert.equal(await page.locator('#empty-detail .empty-subtitle').innerText(), 'Здесь появятся результаты обработки.');
   const desktop = await image.boundingBox();
   assert.ok(desktop.width <= 352 && desktop.width >= 300, 'desktop illustration uses the intended capped size');
   const asset = await page.request.get(`${base}/assets/astronaut.png`);
@@ -213,7 +213,7 @@ test('empty detail renders the bundled astronaut responsively without changing i
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 });
 
-test('terminal idle result retains an effective retry-stop action through the protected API', { timeout: 30000 }, async t => {
+test('terminal idle result has no user stop or recapture until its process finishes', { timeout: 30000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-idle-stop-'));
   let timestamp = 0, stops = 0, child, launch;
   const queue = new Queue({ root, autoStart: false, clock: () => timestamp, idleTimeoutMs: 100, setTimer: () => 1, clearTimer() {},
@@ -246,10 +246,13 @@ test('terminal idle result retains an effective retry-stop action through the pr
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   const button = page.locator(`[data-job-action="${job.id}"]`);
   await page.waitForFunction(id => document.querySelector(`[data-job-action="${id}"]`)?.dataset.status === 'needs_review', job.id);
-  assert.equal(await button.getAttribute('data-action'), 'stop'); assert.match(await button.getAttribute('title'), /Повторить остановку/);
-  assert.equal(await button.isDisabled(), false); await button.click();
-  await page.waitForFunction(id => document.querySelector(`[data-job-action="${id}"]`)?.dataset.action === 'continue-qa', job.id);
-  assert.deepEqual(posts, [`/api/jobs/${job.id}/stop`]); assert.equal(stops, 2);
+  assert.equal(await button.getAttribute('data-action'), '');
+  assert.equal(await button.isDisabled(), true);
+  await page.locator(`[data-job-id="${job.id}"]`).evaluate(row => row.click());
+  assert.equal(await page.locator('#recapture-button').isDisabled(), true);
+  await queue.stop(job.id); // Internal recovery/shutdown still owns process stopping.
+  await page.waitForFunction(id => document.querySelector(`[data-job-action="${id}"]`)?.dataset.action === 'retry', job.id);
+  assert.deepEqual(posts, []); assert.equal(stops, 2);
   assert.equal(attempt.status, 'needs_review'); assert.equal(attempt.cancellationRequested, undefined);
   assert.equal(queue.active.size, 0); assert.equal(job.attempts.length, 1);
 });
@@ -275,14 +278,14 @@ test('favicon follows workload, errors, paused/cancelled and every state poll wi
     polls++;
     return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ csrfToken: 'fixture', concurrency: 2, jobs }) });
   });
-  const makeJob = (id, status, canStop = false) => ({ id: `00000000-0000-4000-8000-${String(id).padStart(12, '0')}`, url: `https://favicon-${id}.reestr35.ru/`, status, canStop, attempts: [{ number: 1, status, files: [] }] });
+  const makeJob = (id, status, isActive = false) => ({ id: `00000000-0000-4000-8000-${String(id).padStart(12, '0')}`, url: `https://favicon-${id}.reestr35.ru/`, status, isActive, attempts: [{ number: 1, status, files: [] }] });
   const readIcon = () => page.locator('#dynamic-favicon').getAttribute('href').then(href => decodeURIComponent(href.split(',')[1]));
   const waitForIcon = (fragment) => page.waitForFunction(fragment => decodeURIComponent(document.querySelector('#dynamic-favicon').href.split(',')[1]).includes(fragment), fragment);
 
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   await waitForIcon('#2fb344');
   assert.match(await readIcon(), /<path .*stroke="#fff"/);
-  assert.equal(await page.title(), 'Снимки страниц — Реестр 35');
+  assert.equal(await page.title(), 'АРМ миграции страниц');
   const iconHandle = await page.locator('#dynamic-favicon').elementHandle();
 
   jobs = [makeJob(1, 'cancelled')];
@@ -301,7 +304,7 @@ test('favicon follows workload, errors, paused/cancelled and every state poll wi
   await waitForIcon('#206bc4');
   assert.match(await readIcon(), />3<\/text>/, 'live processes take priority; workload includes queued, excludes paused/cancelled and counts overlap once');
   assert.equal(await iconHandle.evaluate(node => node === document.querySelector('#dynamic-favicon')), true, 'the same rel=icon element is reused');
-  assert.equal(await page.title(), 'Снимки страниц — Реестр 35');
+  assert.equal(await page.title(), 'АРМ миграции страниц');
 
   const writes = await page.evaluate(() => window.faviconWrites);
   const observedPolls = polls;
@@ -311,7 +314,7 @@ test('favicon follows workload, errors, paused/cancelled and every state poll wi
   jobs = [...Array.from({ length: 1000 }, (_, index) => makeJob(index + 10, 'failed')), makeJob(2000, 'paused'), makeJob(2001, 'cancelled')];
   await page.waitForFunction(() => decodeURIComponent(document.querySelector('#dynamic-favicon').href.split(',')[1]).includes('>1000</text>'));
   assert.match(await readIcon(), /font-size="10"[^>]*>1000<\/text>/, 'large counts remain exact decimal values and use a smaller font');
-  assert.equal(await page.title(), 'Снимки страниц — Реестр 35');
+  assert.equal(await page.title(), 'АРМ миграции страниц');
 });
 
 test('range slider changes live scheduling without terminating active workers', { timeout: 30000 }, async t => {
@@ -394,7 +397,7 @@ test('queue icons expose every action, preserve selection, handle races and show
     child.finish = () => { child.exitCode = 1; child.emit('close', 1, null); };
     children.push(child); return child;
   } });
-  const statuses = ['paused', 'queued', 'running', 'stopping', 'complete', 'needs_review', 'incomplete', 'failed', 'interrupted', 'cancelled', 'validating', 'validating', 'queued', 'queued'];
+  const statuses = ['paused', 'queued', 'running', 'pausing', 'complete', 'needs_review', 'incomplete', 'failed', 'interrupted', 'cancelled', 'validating', 'validating', 'queued', 'queued'];
   queue.add(statuses.map((status, i) => `https://icon-${i}.reestr35.ru/`).join('\n'));
   queue.launch(queue.jobs[2]); queue.launch(queue.jobs[11]); queue.closing = true;
   statuses.forEach((status, i) => { queue.jobs[i].attempts[0].status = status; });
@@ -408,20 +411,6 @@ test('queue icons expose every action, preserve selection, handle races and show
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const base = `http://127.0.0.1:${server.address().port}`;
   const requests = [];
-  let exposeContinueQa = true;
-  await page.route('**/api/state', async route => {
-    const response = await route.fetch(), snapshot = await response.json();
-    const resumable = snapshot.jobs.find(item => item.id === queue.jobs[5].id);
-    if (resumable) {
-      resumable.canContinueQa = exposeContinueQa;
-      resumable.attempts.at(-1).qa = { total: 1, reviewed: 0, passed: 0, issues: 0, unreviewed: 1 };
-    }
-    await route.fulfill({ response, contentType: 'application/json', body: JSON.stringify(snapshot) });
-  });
-  await page.route(`**/api/jobs/${queue.jobs[5].id}/continue-qa`, route => {
-    exposeContinueQa = false;
-    return route.fulfill({ contentType: 'application/json', body: '{"ok":true}' });
-  });
   page.on('request', request => { if (request.method() === 'POST') requests.push(new URL(request.url()).pathname); });
   await page.goto(base);
   await page.waitForFunction(() => document.querySelectorAll('[data-job-action]').length === 14);
@@ -430,29 +419,48 @@ test('queue icons expose every action, preserve selection, handle races and show
   const select = i => page.locator(`[data-job-id="${queue.jobs[i].id}"]`).evaluate(row => row.click());
   const waitStatus = (i, status) => page.waitForFunction(([id, status]) => document.querySelector(`[data-job-action="${id}"]`)?.dataset.status === status, [queue.jobs[i].id, status]);
   const expected = [
-    ['resume', 'pause', 'secondary', 'Возобновить'], ['pause', 'clock', 'blue', 'Поставить на паузу'],
-    ['stop', 'running', 'blue', 'Остановить'], ['', 'square', 'yellow', 'Остановка уже выполняется'],
-    ['retry', 'check', 'green', 'Повторить'], ['continue-qa', 'check', 'blue', 'Продолжить проверку'],
-    ['retry', 'alert', 'red', 'Повторить'], ['retry', 'alert', 'red', 'Повторить'],
-    ['retry', 'alert', 'red', 'Повторить'], ['retry', 'square', 'secondary', 'Повторить'],
-    ['', 'running', 'blue', 'Остановка недоступна'], ['stop', 'running', 'blue', 'Остановить'], ['pause', 'clock', 'blue', 'Поставить на паузу'],
-    ['stop', 'clock', 'blue', 'Отменить проверку']
+    ['resume', 'pause', 'secondary', 'Продолжить'], ['pause', 'clock', 'blue', 'Приостановить'],
+    ['pause', 'running', 'blue', 'Приостановить'], ['', 'running', 'yellow', 'Недоступно'],
+    ['retry', 'check', 'green', 'Перезапустить'], ['retry', 'alert', 'red', 'Перезапустить'],
+    ['retry', 'alert', 'orange', 'Перезапустить'], ['retry', 'alert', 'red', 'Перезапустить'],
+    ['retry', 'alert', 'red', 'Перезапустить'], ['retry', 'square', 'secondary', 'Перезапустить'],
+    ['', 'running', 'blue', 'Недоступно'], ['pause', 'running', 'blue', 'Приостановить'], ['pause', 'clock', 'blue', 'Приостановить'],
+    ['pause', 'clock', 'blue', 'Приостановить']
   ];
   for (let i = 0; i < expected.length; i++) {
     const [operation, icon, color, label] = expected[i], button = action(i);
     assert.equal(await button.getAttribute('data-action'), operation);
     assert.equal(await button.getAttribute('data-icon'), icon);
     assert.ok((await button.getAttribute('class')).includes(`text-${color}`));
-    assert.ok((await button.getAttribute('title')).includes(label));
+    assert.equal((await button.getAttribute('title')).split(' · ')[1], label);
     assert.ok((await button.getAttribute('aria-label')).includes(queue.jobs[i].url));
     assert.equal(await button.isDisabled(), !operation);
     assert.equal(await button.innerText(), '', 'status/action has no visible text badge');
-    assert.equal(await button.locator(icon === 'running' ? '.status-dot-animated.bg-blue' : 'svg.icon').count(), 1);
+    assert.equal(await button.locator(icon === 'running' ? `.status-dot-animated.bg-${color}` : 'svg.icon').count(), 1);
+    assert.equal(await button.evaluate(node => getComputedStyle(node).opacity), '1', 'disabled indicators retain full color');
+    if ([2, 3, 5, 10, 11].includes(i)) {
+      const title = await button.getAttribute('title');
+      await button.locator('..').hover();
+      await page.waitForFunction(text => [...document.querySelectorAll('.tooltip.show .tooltip-inner')].some(node => node.textContent === text), title);
+      await page.mouse.move(0, 0);
+    }
   }
   const qaRetry = page.locator(`[data-job-secondary-action="${queue.jobs[5].id}"]`);
-  assert.equal(await qaRetry.getAttribute('data-action'), 'retry');
-  assert.ok((await qaRetry.getAttribute('title')).includes('Повторить захват'));
-  assert.ok((await qaRetry.getAttribute('aria-label')).includes(queue.jobs[5].url));
+  assert.equal(await qaRetry.count(), 0);
+  const output = testOutput(); fs.mkdirSync(output, { recursive: true });
+  for (let index = 0; index < statuses.length; index++) {
+    if (statuses[index] === 'complete') continue;
+    await select(index);
+    assert.equal(await page.locator('#stage-step-2').getAttribute('aria-disabled'), 'true', `step 2 is locked for ${statuses[index]}`);
+    await page.locator('#stage-step-2').evaluate(step => step.click());
+    assert.equal(await page.locator('#stage-two-panel').isHidden(), true);
+  }
+  await select(5);
+  assert.equal(await page.locator('#stage-step-1.step-state-error').count(), 1, 'needs_review colors step 1 red without a separate header badge');
+  assert.equal(await page.locator('#stage-step-2').getAttribute('aria-disabled'), 'true');
+  await page.locator('#stage-step-2').evaluate(step => step.click());
+  assert.equal(await page.locator('#stage-two-panel').isHidden(), true, 'step 2 cannot open before step 1 is complete');
+  await select(11); assert.equal(await page.locator('#stage-step-1.step-state-active').count(), 1, 'active QA colors step 1 gray');
   await page.locator(`[data-job-id="${queue.jobs[2].id}"]`).focus();
   await page.keyboard.press('Enter');
   assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[2].url, 'Enter on a queue row selects its result');
@@ -463,15 +471,127 @@ test('queue icons expose every action, preserve selection, handle races and show
   const initialDuration = await page.locator('#attempt-duration').innerText();
   await page.waitForFunction(value => document.querySelector('#attempt-duration').textContent !== value, initialDuration);
   assert.match(await page.locator('#attempt-duration').innerText(), /^\d{2}:\d{2}:\d{2}$/);
+  const activeBackground = await page.locator('#stage-step-1').evaluate(node => getComputedStyle(node, '::before').backgroundColor);
+  await select(7);
+  const errorBackground = await page.locator('#stage-step-1').evaluate(node => getComputedStyle(node, '::before').backgroundColor);
   await select(4); assert.equal(await page.locator('#attempt-duration').innerText(), '00:00:05');
+  const recapture = page.locator('#recapture-button');
+  assert.equal(await recapture.innerText(), '', 'restart is an icon-only button');
+  assert.equal(await recapture.getAttribute('aria-label'), 'Перезапустить');
+  assert.equal(await recapture.getAttribute('title'), 'Перезапустить');
+  assert.equal(await recapture.locator('svg.icon').count(), 1, 'restart uses one recognizable refresh icon');
+  assert.equal(await recapture.locator('svg').getAttribute('aria-hidden'), 'true');
+  assert.equal(await recapture.locator('path').count(), 2);
+  const recaptureBox = await recapture.evaluate(node => { const box = node.getBoundingClientRect(); return { width: box.width, height: box.height }; });
+  assert.equal(recaptureBox.width, recaptureBox.height, 'restart icon button is square');
+  assert.equal(await page.locator('#detail-status').count(), 0, 'attempt status is absent from the result header');
+  assert.equal(await page.locator('#stage-step-1.step-state-success').count(), 1);
+  assert.equal(await page.locator('#stage-step-2.step-state-active').getAttribute('aria-disabled'), 'false');
+  assert.equal(await page.locator('#stage-step-2').getAttribute('aria-selected'), 'true', 'complete attempt opens the latest available step by default');
+  assert.equal(await page.locator('#stage-two-panel').isVisible(), true);
+  assert.equal(await recapture.isVisible(), true, 'restart remains visible on step 2');
+  assert.equal(await page.locator('#qa-progress').evaluate(node => node.classList.contains('stage-hidden')), true, 'QA progress is hidden outside step 1');
+  assert.deepEqual(await page.locator('.result-steps .step-item').allInnerTexts(), ['Скриншоты', 'HTML и медиа', 'Новая страница', 'Приёмка']);
+  assert.equal(await page.title(), 'АРМ миграции страниц');
+  assert.equal(await page.locator('.navbar-brand').innerText(), 'АРМ миграции страниц · Реестр 35');
+  assert.deepEqual(await page.locator('.result-steps .step-item').evaluateAll(nodes => nodes.map(node => node.getAttribute('title'))), [null, null, null, null]);
+  await page.mouse.move(0, 0); await page.locator('#stage-step-2').hover(); await page.waitForTimeout(100);
+  assert.equal(await page.locator('.tooltip.show').count(), 0, 'steps do not create tooltips');
+  assert.deepEqual(await page.locator('#results-card > *').evaluateAll(nodes => nodes.map(node => node.id)), ['results-header', 'attempt-header', 'gallery-body', 'stage-two-panel']);
+  assert.equal(await page.locator('#results-header > #results-common').count(), 1);
+  assert.equal(await page.locator('#results-header #attempt-controls, #results-header #qa-progress').count(), 0);
+  assert.equal(await page.locator('#attempt-header > #attempt-controls').count(), 1);
+  assert.equal(await page.locator('#attempt-header > #qa-progress').count(), 1);
+  assert.equal(await page.locator('#attempt-controls > #recapture-button').count(), 1);
+  assert.equal(await page.locator('#attempt-controls').evaluate(node => node.firstElementChild.id), 'recapture-button', 'restart is the first attempt control');
+  const attemptControlBoxes = await page.locator('#recapture-button, #attempt-select, #attempt-duration').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right }; }));
+  assert.equal(attemptControlBoxes[0].left, Math.min(...attemptControlBoxes.map(item => item.left)), 'restart is the leftmost attempt control');
+  const attemptControlGaps = [attemptControlBoxes[1].left - attemptControlBoxes[0].right, attemptControlBoxes[2].left - attemptControlBoxes[1].right];
+  assert.ok(Math.abs(attemptControlGaps[0] - attemptControlGaps[1]) <= .5, 'restart-to-select and select-to-duration gaps are equal');
+  assert.equal(await page.locator('#results-card > #stage-two-panel').count(), 1, 'step 2 is an alternate body of the same card');
+  const stepVisuals = await page.locator('.result-steps .step-item').evaluateAll(nodes => nodes.map(node => {
+    const dot = getComputedStyle(node, '::before'), connector = getComputedStyle(node, '::after'), bounds = node.getBoundingClientRect(), range = document.createRange();
+    range.selectNodeContents(node);
+    const label = range.getBoundingClientRect();
+    return { top: bounds.top, width: bounds.width, labelTop: label.top - bounds.top, dotTop: parseFloat(dot.top), dotHeight: parseFloat(dot.height), dotLeft: parseFloat(dot.left), dotBackground: dot.backgroundColor, connectorContent: connector.content, connectorPosition: connector.position, connectorRight: parseFloat(connector.right), connectorTop: parseFloat(connector.top), connectorWidth: parseFloat(connector.width) || 0 };
+  }));
+  assert.ok(Math.max(...stepVisuals.map(step => step.top)) - Math.min(...stepVisuals.map(step => step.top)) <= 1, 'all steps stay on one horizontal line');
+  for (const step of stepVisuals) {
+    assert.ok(step.labelTop >= step.dotTop + step.dotHeight + 4, 'the step label is below its circle and connector line');
+  }
+  assert.ok(Math.max(...stepVisuals.map(step => step.width)) - Math.min(...stepVisuals.map(step => step.width)) < .02, 'all four step cells have equal width');
+  assert.equal(stepVisuals[0].connectorContent, 'none', 'step 1 has only its circle');
+  for (const step of stepVisuals.slice(1)) {
+    assert.equal(step.connectorPosition, 'absolute');
+    assert.ok(Math.abs(step.connectorRight - step.width / 2) <= 1, 'the connector ends at the circle from the left');
+    assert.ok(Math.abs(step.connectorTop - (step.dotTop + step.dotHeight / 2)) <= 1, 'the connector and circles share one horizontal line');
+    assert.ok(Math.abs(step.connectorWidth - step.width) <= 1, 'the connector spans the shrinking distance between circles');
+  }
+  assert.equal(stepVisuals[1].dotBackground, activeBackground, 'step 2 uses the same neutral gray as an active step 1');
+  assert.equal(stepVisuals[2].dotBackground, stepVisuals[3].dotBackground, 'locked steps share the light-gray treatment');
+  assert.equal(new Set([stepVisuals[0].dotBackground, stepVisuals[1].dotBackground, stepVisuals[2].dotBackground, errorBackground]).size, 4, 'steps use exactly distinct success, active, inactive and error colors');
+  assert.equal(await page.locator('#stage-two-panel .empty-subtitle').innerText(), 'Раздел ещё в разработке.');
+  assert.equal(await page.locator('#stage-two-panel img').getAttribute('src'), '/assets/html-media-in-development.png');
+  assert.equal(await page.locator('#stage-two-panel img').evaluate(image => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0), true, 'step 2 illustration is fetched and decoded');
+  await page.screenshot({ path: path.join(output, 'ui-stage-two-1440.png'), fullPage: true });
+  assert.equal(await page.locator('#gallery-body').isHidden(), true);
+  const topGeometry = () => page.locator('#results-header, #result-steps, .result-steps .step-item').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return [node.id || node.className, box.x, box.y, box.width, box.height]; }));
+  const stepTwoGeometry = await topGeometry();
+  const headerGeometry = await page.locator('#results-common > .detail-heading, #result-steps').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right, center: box.top + box.height / 2 }; }));
+  assert.ok(headerGeometry[0].right < headerGeometry[1].left, 'steps are to the right of the result heading');
+  assert.ok(Math.abs(headerGeometry[0].center - headerGeometry[1].center) <= 1, 'result heading and steps share one row');
+  assert.equal(await page.locator('#results-header').evaluate(node => getComputedStyle(node).borderBottomWidth), '0px', 'there is no divider between the main and attempt headers');
+  await page.locator('#back-to-stage-one').click();
+  assert.equal(await page.locator('#gallery-body').isVisible(), true);
+  assert.equal(await page.locator('#stage-two-panel').isHidden(), true);
+  assert.equal(await page.locator('#stage-step-1.step-state-success').count(), 1, 'manual selection does not erase completed step success');
+  assert.equal(await page.locator('#recapture-button').isVisible(), true);
+  const centers = await page.locator('#attempt-select, #attempt-duration, #recapture-button').evaluateAll(nodes => nodes.map(node => { const rect = node.getBoundingClientRect(); return rect.y + rect.height / 2; }));
+  assert.ok(Math.max(...centers) - Math.min(...centers) <= 1, 'attempt controls are vertically centered');
+  assert.deepEqual(await topGeometry(), stepTwoGeometry, 'common header and step geometry remain stable between step bodies');
   await page.waitForResponse(response => response.url() === `${base}/api/state`);
+  assert.equal(await page.locator('#stage-step-1').getAttribute('aria-selected'), 'true', 'polling preserves a manual stage choice');
+  await page.locator('#stage-step-1').focus(); await page.keyboard.press('ArrowRight');
+  assert.equal(await page.locator('#stage-step-2').getAttribute('aria-selected'), 'true', 'arrow keys activate the next available tab');
+  assert.equal(await page.locator('#stage-step-2').evaluate(node => document.activeElement === node), true);
+  assert.equal(await recapture.isVisible(), true, 'keyboard navigation keeps restart visible on step 2');
+  for (const viewportWidth of [320, 360, 375]) {
+    await page.setViewportSize({ width: viewportWidth, height: 844 });
+    const mobileSteps = await page.locator('.result-steps').evaluate(node => {
+      const steps = [...node.querySelectorAll('.step-item')], textRects = steps.map(step => {
+        const range = document.createRange();
+        range.selectNodeContents(step);
+        return [...range.getClientRects()];
+      });
+      return {
+        widths: steps.map(step => step.getBoundingClientRect().width),
+        textLines: textRects.map(rects => new Set(rects.map(rect => Math.round(rect.top * 10))).size),
+        tops: steps.map(step => step.getBoundingClientRect().top),
+        connectorWidths: steps.slice(1).map(step => parseFloat(getComputedStyle(step, '::after').width)),
+        labelsFit: textRects.every((rects, index) => {
+          const bounds = steps[index].getBoundingClientRect();
+          return rects.every(rect => rect.left >= bounds.left - .5 && rect.right <= bounds.right + .5);
+        })
+      };
+    });
+    assert.ok(Math.max(...mobileSteps.tops) - Math.min(...mobileSteps.tops) <= 1, `${viewportWidth}px keeps the steps on one horizontal line`);
+    assert.ok(Math.max(...mobileSteps.widths) - Math.min(...mobileSteps.widths) <= .5, `${viewportWidth}px keeps all four step cells equal within subpixel tolerance`);
+    assert.ok(mobileSteps.textLines.some(lines => lines > 1), `${viewportWidth}px wraps long labels below the marker line`);
+    assert.equal(mobileSteps.labelsFit, true, `${viewportWidth}px keeps labels inside their cells`);
+    assert.ok(Math.max(...mobileSteps.connectorWidths) < 75, `${viewportWidth}px reduces the distances between step circles`);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${viewportWidth}px has no page overflow`);
+    if (viewportWidth !== 360) await page.screenshot({ path: path.join(output, `ui-stage-two-${viewportWidth}.png`), fullPage: true });
+  }
+  const placeholderWidth = await page.locator('#stage-two-panel img').evaluate(node => ({ image: node.getBoundingClientRect().width, card: node.closest('.card').getBoundingClientRect().width }));
+  assert.ok(placeholderWidth.image <= placeholderWidth.card);
+  await page.locator('#back-to-stage-one').click(); await page.setViewportSize({ width: 1440, height: 1000 });
   assert.equal(await page.locator('#attempt-duration').innerText(), '00:00:05');
   await action(5).click();
-  await page.waitForFunction(id => document.querySelector(`[data-job-action="${id}"]`)?.dataset.action === 'retry', queue.jobs[5].id);
-  assert.ok(requests.includes(`/api/jobs/${queue.jobs[5].id}/continue-qa`));
-  assert.equal(queue.jobs[5].attempts.length, 1, 'continue QA keeps the current capture attempt');
-  assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[4].url, 'continue QA does not select its row');
-  const output = testOutput(); fs.mkdirSync(output, { recursive: true });
+  await waitStatus(5, 'queued');
+  assert.ok(requests.includes(`/api/jobs/${queue.jobs[5].id}/retry`));
+  assert.equal(queue.jobs[5].attempts.length, 2, 'restart creates a new attempt');
+  assert.equal(queue.jobs[5].attempts[0].status, 'needs_review', 'history is preserved');
+  assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[4].url, 'restart does not select its row');
   await page.screenshot({ path: path.join(output, 'ui-queue-actions-1440.png'), fullPage: true });
   await action(0).click(); await waitStatus(0, 'queued');
   assert.equal(queue.jobs[0].attempts.length, 1);
@@ -482,27 +602,35 @@ test('queue icons expose every action, preserve selection, handle races and show
   assert.ok(queue.jobs[1].attempts[0].queueOrder > order);
   assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[4].url, 'keyboard action does not select its row');
   for (const i of [3, 10]) { const count = requests.length; await action(i).evaluate(button => button.click()); assert.equal(requests.length, count); }
-  await action(13).click(); await waitStatus(13, 'cancelled');
-  assert.ok(requests.includes(`/api/jobs/${queue.jobs[13].id}/stop`));
-  assert.equal(queue.jobs[13].attempts.length, 1, 'cancelling queued QA keeps the current capture attempt');
-  assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[4].url, 'cancelling queued QA does not select its row');
-  for (const [i, child] of [[2, children[0]], [11, children[1]]]) {
-    await action(i).click(); await waitStatus(i, 'stopping'); assert.equal(await action(i).isDisabled(), true);
-    child.finish(); await waitStatus(i, 'cancelled');
-  }
-  for (const i of [4, 5, 6, 7, 8, 9]) {
-    await action(i).click(); await waitStatus(i, 'queued');
+  await action(13).click(); await waitStatus(13, 'paused');
+  assert.ok(requests.includes(`/api/jobs/${queue.jobs[13].id}/pause`));
+  assert.equal(queue.jobs[13].attempts.length, 1, 'pausing queued QA keeps the current capture attempt');
+  await action(2).click(); await waitStatus(2, 'pausing'); assert.equal(await action(2).isDisabled(), true);
+  children[0].finish(); await waitStatus(2, 'interrupted');
+  await action(11).click(); await waitStatus(11, 'pausing'); assert.equal(await action(11).isDisabled(), true);
+  children[1].finish(); await waitStatus(11, 'interrupted');
+  for (const i of [4, 6, 7, 8, 9]) {
+    const oldStatus = queue.jobs[i].attempts[0].status;
+    await select(i);
+    if (i === 4) assert.equal(await page.locator('#stage-step-2').getAttribute('aria-selected'), 'true', 'complete attempt exposes restart on step 2');
+    await ([4, 9].includes(i) ? page.locator('#recapture-button') : action(i)).click(); await waitStatus(i, 'queued');
     assert.equal(queue.jobs[i].attempts.length, 2);
-    assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[4].url);
+    assert.equal(queue.jobs[i].attempts[0].status, oldStatus, 'terminal and legacy attempts remain history');
+    assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[i].url);
   }
-  assert.equal(await page.locator('#attempt-select').inputValue(), '2', 'retry updates the selected job to its new attempt');
+  await select(4);
+  assert.equal(await page.locator('#attempt-select').inputValue(), '2', 'recapture updates the selected job to its new attempt');
+  assert.equal(await page.locator('#stage-step-1').getAttribute('aria-selected'), 'true', 'retry resets the new attempt to step 1');
   await page.selectOption('#attempt-select', '1');
-  assert.equal(await page.locator('#detail-status').innerText(), 'Готово');
+  assert.equal(await page.locator('#stage-step-1.step-state-success').count(), 1);
+  assert.equal(await page.locator('#stage-step-2').getAttribute('aria-selected'), 'true', 'changing to a complete attempt defaults to step 2');
   assert.equal(await page.locator('#attempt-duration').innerText(), '00:00:05');
   await page.route(`**/api/jobs/${queue.jobs[12].id}/pause`, async route => { queue.launch(queue.jobs[12]); await route.continue(); });
   await action(12).click();
-  await page.waitForFunction(() => document.querySelector('#global-alert').textContent.includes('Пауза доступна только'));
-  assert.equal(queue.jobs[12].attempts[0].status, 'running');
+  await waitStatus(12, 'pausing');
+  assert.equal(await action(12).evaluate(node => node.classList.contains('btn-loading')), false);
+  assert.equal(await action(12).isEnabled(), false, 'running pause stays disabled while checkpoint is pending');
+  assert.equal(queue.jobs[12].attempts[0].status, 'pausing');
   assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[4].url);
   assert.equal(await page.locator('#results-column [data-job-action], #refresh-logs, #detail-actions').count(), 0);
   queue.jobs[0].url = null;
@@ -511,6 +639,76 @@ test('queue icons expose every action, preserve selection, handle races and show
   await select(0);
   assert.equal(await page.locator('#detail-url').innerText(), '—', 'missing URL renders a safe placeholder');
   for (const attribute of ['href', 'target', 'rel']) assert.equal(await page.locator('#detail-url').getAttribute(attribute), null, `missing URL omits ${attribute}`);
+});
+
+test('queue action loading survives a stale poll and waits for the next ordinary snapshot without an eager GET', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-action-poll-race-'));
+  const queue = new Queue({ root, autoStart: false, spawnFn() { throw new Error('UI action race test must not spawn agents'); } });
+  queue.add('https://action-race.reestr35.ru/');
+  const job = queue.jobs[0];
+  job.attempts[0].status = 'needs_review';
+  queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => {
+    await browser.close(); await queue.shutdown();
+    if (server.listening) await new Promise(resolve => server.close(resolve));
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const page = await browser.newPage();
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  let stateRequests = 0, staleRoute, staleResponse, announceStale;
+  const staleStarted = new Promise(resolve => { announceStale = resolve; });
+  await page.route('**/api/state', async route => {
+    stateRequests++;
+    const response = await route.fetch(), snapshot = await response.json();
+    const projected = snapshot.jobs.find(item => item.id === job.id);
+    if (projected) projected.canRecapture = true;
+    if (stateRequests === 2) {
+      staleRoute = route;
+      staleResponse = { response, snapshot };
+      announceStale();
+      return;
+    }
+    await route.fulfill({ response, contentType: 'application/json', body: JSON.stringify(snapshot) });
+  });
+  let actionRoute, announceAction, actionPosts = 0;
+  const actionStarted = new Promise(resolve => { announceAction = resolve; });
+  await page.route(`**/api/jobs/${job.id}/retry`, route => {
+    actionPosts++;
+    actionRoute = route;
+    announceAction();
+  });
+  await page.goto(origin);
+  const primary = page.locator(`[data-job-action="${job.id}"]`);
+  const secondary = page.locator('#recapture-button');
+  await page.waitForFunction(id => document.querySelector(`[data-job-action="${id}"]`)?.dataset.action === 'retry', job.id);
+  await page.locator(`[data-job-id="${job.id}"]`).evaluate(row => row.click());
+  await staleStarted;
+  await primary.click();
+  await actionStarted;
+  assert.equal(await primary.getAttribute('aria-busy'), 'true', 'the clicked action becomes busy before its POST settles');
+  assert.equal(await primary.isDisabled(), true);
+  assert.equal(await primary.evaluate(node => getComputedStyle(node).opacity), '1', 'pending action keeps its indicator opaque');
+  assert.equal(await primary.locator('svg').evaluate(node => getComputedStyle(node).visibility), 'visible');
+  assert.equal((await primary.getAttribute('title')).split(' · ')[1], 'Недоступно');
+  assert.equal(await secondary.isDisabled(), true, 'all actions for the same job are fenced while one is pending');
+  await primary.evaluate(node => { node.click(); node.click(); });
+  assert.equal(actionPosts, 1, 'pending state fences repeated programmatic clicks');
+  const accepted = page.waitForResponse(response => response.url() === `${origin}/api/jobs/${job.id}/retry`);
+  await actionRoute.fulfill({ contentType: 'application/json', body: '{"ok":true}' });
+  await accepted;
+  await page.waitForTimeout(50);
+  await staleRoute.fulfill({ response: staleResponse.response, contentType: 'application/json', body: JSON.stringify(staleResponse.snapshot) });
+  await page.waitForTimeout(250);
+  assert.equal(stateRequests, 2, 'the colliding action does not queue an immediate second state refresh');
+  assert.equal(await primary.getAttribute('aria-busy'), 'true', 'the pre-POST snapshot cannot clear pending action');
+  await page.waitForResponse(response => response.url() === `${origin}/api/state` && stateRequests >= 3);
+  await page.waitForFunction(id => document.querySelector(`[data-job-action="${id}"]`)?.getAttribute('aria-busy') === 'false', job.id);
+  assert.equal(stateRequests, 3, 'the next ordinary poll supplies the single confirming snapshot');
+  assert.equal(await primary.getAttribute('aria-busy'), 'false');
+  assert.equal(await primary.isEnabled(), true);
+  assert.equal(await secondary.isEnabled(), true);
 });
 
 test('Tabler workspace, single URL, gallery, polling and responsive modal', { timeout: 60000 }, async t => {
@@ -603,6 +801,24 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   assert.equal(await qaProgress.getAttribute('role'), 'progressbar');
   assert.deepEqual(await Promise.all(['aria-valuemin', 'aria-valuemax', 'aria-valuenow'].map(name => qaProgress.getAttribute(name))), ['0', '100', '67']);
   assert.match(await qaProgress.getAttribute('aria-label'), /Проверено 2 из 3 PNG: без замечаний 1, с замечаниями 1, ожидают проверки 1/);
+  assert.equal(await page.locator('#qa-progress').evaluate(node => node.parentElement.id), 'attempt-header');
+  const attemptHeaderPositions = await page.locator('#attempt-controls, #qa-progress').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right, center: box.top + box.height / 2 }; }));
+  assert.ok(attemptHeaderPositions[0].right < attemptHeaderPositions[1].left, 'attempt controls stay left of QA progress on desktop');
+  const liveAttemptControlBoxes = await page.locator('#recapture-button, #attempt-select, #attempt-duration').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right }; }));
+  const liveAttemptControlGaps = [liveAttemptControlBoxes[1].left - liveAttemptControlBoxes[0].right, liveAttemptControlBoxes[2].left - liveAttemptControlBoxes[1].right];
+  assert.ok(Math.abs(liveAttemptControlGaps[0] - liveAttemptControlGaps[1]) <= .5, 'the common gap-2 produces equal visible control spacing');
+  await page.locator('#stage-step-1').click();
+  attempt.status = 'complete'; queue.save();
+  await page.waitForFunction(() => document.querySelector('#stage-step-2').getAttribute('aria-disabled') === 'false');
+  assert.equal(await page.locator('#stage-step-1').getAttribute('aria-selected'), 'true', 'manual step 1 survives a poll that unlocks step 2');
+  assert.equal(await page.locator('#qa-progress').isVisible(), true);
+  await page.locator('#stage-step-2').click();
+  assert.equal(await page.locator('#qa-progress').isHidden(), true, 'QA progress is hidden on step 2');
+  assert.equal(await page.locator('#recapture-button').isVisible(), true, 'restart stays visible on step 2');
+  await page.locator('#stage-step-1').click();
+  assert.equal(await page.locator('#qa-progress').isVisible(), true, 'QA progress returns with step 1');
+  attempt.status = 'cancelled'; queue.save();
+  await page.waitForFunction(() => document.querySelector('#stage-step-2').getAttribute('aria-disabled') === 'true');
   await qaSegments.first().hover();
   const tooltip = page.locator('.tooltip.show');
   await tooltip.waitFor({ state: 'visible' });
@@ -633,8 +849,14 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   async function assertGalleryFirst() {
     assert.equal(await page.locator('#job-detail.card').count(), 0);
     assert.equal(await page.locator('#job-detail > div > .card').count(), 4);
-    assert.equal(await page.locator('#results-card').evaluate(node => node.firstElementChild.nextElementSibling.id), 'gallery-body');
-    for (const id of ['attempt-select', 'detail-status', 'attempt-duration']) assert.equal(await page.locator(`#results-header #${id}`).count(), 1);
+    assert.deepEqual(await page.locator('#results-card > *').evaluateAll(nodes => nodes.map(node => node.id)), ['results-header', 'attempt-header', 'gallery-body', 'stage-two-panel']);
+    for (const id of ['attempt-select', 'attempt-duration', 'recapture-button']) assert.equal(await page.locator(`#attempt-header #${id}`).count(), 1);
+    assert.equal(await page.locator('#attempt-controls > #recapture-button').count(), 1);
+    assert.equal(await page.locator('#attempt-controls').evaluate(node => node.firstElementChild.id), 'recapture-button');
+    assert.equal(await page.locator('#results-header #detail-status').count(), 0);
+    assert.equal(await page.locator('#results-common .detail-heading + .result-steps').count(), 1, 'common title, URL and steps are separate from attempt controls');
+    assert.equal(await page.locator('#attempt-header > #qa-progress').count(), 1);
+    assert.equal(await page.locator('#gallery-message').count(), 0);
     assert.equal(await page.locator('#metadata-panel select').count(), 0);
     assert.equal(await page.locator('#detail-actions, #refresh-logs').count(), 0);
     assert.doesNotMatch(await page.locator('#results-column').innerText(), /Галерея PNG|Сведения о попытке/);
@@ -709,7 +931,8 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   assert.match(await page.locator('#json-error').innerText(), /fixture unavailable/);
   await closeJson();
   await page.unroute('**/api/files/**/capture-report.json');
-  await page.waitForFunction(() => document.querySelector('#gallery-message').textContent === '3 PNG');
+  await page.waitForFunction(() => document.querySelectorAll('#png-gallery img').length === 3);
+  assert.doesNotMatch(await page.locator('#results-card').innerText(), /\b\d+ PNG\b|Снимков пока нет/);
   await page.screenshot({ path: path.join(output, 'ui-two-columns-1440.png'), fullPage: true });
 
   const originalTrigger = await page.locator('#png-gallery button').first().elementHandle();

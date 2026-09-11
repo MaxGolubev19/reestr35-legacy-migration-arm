@@ -13,13 +13,38 @@
   overflow: auto;
 }
 
-.detail-heading { min-width: 0; }
+.detail-heading { flex: 0 1 auto; min-width: 0; }
+.queue-status-control { display: inline-flex; align-items: center; }
+.queue-status-button:disabled { opacity: 1; pointer-events: none; }
+#results-header { display: block; border-bottom: 0; }
+.results-common { display: flex; align-items: center; gap: clamp(.75rem, 2vw, 2rem); min-width: 0; }
+.attempt-header { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
+.attempt-controls { flex: 0 0 auto; }
+.result-steps { flex: 1 1 auto; min-width: 0; margin-left: auto; }
+.result-steps .steps { min-width: 34rem; overflow: visible; }
+.result-steps .step-item { flex: 1 1 0; min-width: 0; padding: 2rem .35rem 0; border: 0; background: transparent; font-size: .75rem; line-height: 1.2; white-space: normal; overflow-wrap: anywhere; text-decoration: none; }
+.result-steps .step-item::before { box-sizing: border-box; }
+.result-steps .step-item::after { content: none; }
+.result-steps .step-item:not(:first-child)::after { position: absolute; inset-inline-end: 50%; inset-inline-start: auto; display: block; width: 100%; height: var(--tblr-steps-border-width); content: ""; transform: translateY(-50%); }
+.result-steps .step-item[aria-disabled="true"] { cursor: not-allowed; }
+.result-steps .step-item:focus-visible { outline: 2px solid var(--tblr-secondary); outline-offset: 2px; border-radius: var(--tblr-border-radius); }
+.result-steps .steps .step-item.step-state-inactive { color: var(--tblr-disabled-color); }
+.result-steps .steps .step-item.step-state-inactive::before, .result-steps .steps .step-item.step-state-inactive::after { color: var(--tblr-disabled-color); background: var(--tblr-border-color); }
+.result-steps .steps .step-item.step-state-active { color: var(--tblr-body-color); }
+.result-steps .steps .step-item.step-state-active::before, .result-steps .steps .step-item.step-state-active::after { color: var(--tblr-white); background: var(--tblr-secondary); }
+.result-steps .steps .step-item.step-state-success { color: var(--tblr-body-color); }
+.result-steps .steps .step-item.step-state-success::before, .result-steps .steps .step-item.step-state-success::after { color: var(--tblr-white); background: var(--tblr-green); }
+.result-steps .steps .step-item.step-state-error { color: var(--tblr-body-color); }
+.result-steps .steps .step-item.step-state-error::before, .result-steps .steps .step-item.step-state-error::after { color: var(--tblr-white); background: var(--tblr-red); }
+.stage-placeholder { min-height: 32rem; }
+.stage-placeholder-illustration { width: min(24rem, 86%); height: auto; object-fit: contain; }
 .gallery-thumb { height: 11rem; object-fit: contain; }
 .gallery-viewport { max-height: 70vh; overflow: auto; }
 .gallery-full-image { display: block; max-width: none; }
 .job-table-wrap table { table-layout: fixed; width: 100%; }
 .job-table-wrap td:last-child { width: 7rem; }
-.qa-progress { flex: 1 1 28rem; max-width: 36rem; }
+.qa-progress { flex: 1 1 20rem; max-width: 36rem; min-width: min(100%, 18rem); }
+.qa-progress.stage-hidden { display: none !important; }
 .qa-progress-count { margin-bottom: .25rem; text-align: right; font-variant-numeric: tabular-nums; }
 .qa-progress-segment { flex: 1 1 0; }
 .json-output { max-height: 65vh; overflow: auto; }
@@ -29,6 +54,8 @@
 .connection-control:not(:disabled):hover { background: var(--tblr-bg-surface-secondary); }
 .connection-control:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 2px; }
 .connection-control:disabled { opacity: 1; }
+.navbar > .container-fluid { flex-wrap: wrap; gap: .5rem 1rem; }
+.navbar-brand { min-width: 0; white-space: normal; }
 
 #empty-detail .empty {
   min-height: 28rem;
@@ -43,4 +70,11 @@
   width: min(22rem, 82%);
   height: auto;
   margin: 0 auto 2rem;
+}
+
+@media (max-width: 767.98px) {
+  .attempt-controls, .qa-progress { flex-basis: 100%; min-width: 0; }
+  .attempt-controls { width: 100%; }
+  .qa-progress { margin-left: 0 !important; }
+  .result-steps .steps { min-width: 0; }
 }

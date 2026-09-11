@@ -102,7 +102,7 @@ test('cancellation survives successful close; queued stop; recovery is interrupt
   fixture(root, queue.jobs[0], queue.jobs[0].attempts[0]); await queue.stop(queue.jobs[0].id);
   assert.equal(queue.jobs[0].attempts[0].status, 'cancelled');
   const recovered = new Queue({ root, autoStart: false });
-  assert.equal(recovered.jobs[0].attempts[0].status, 'cancelled'); assert.equal(recovered.jobs[1].attempts[0].status, 'incomplete');
+  assert.equal(recovered.jobs[0].attempts[0].status, 'cancelled'); assert.equal(recovered.jobs[1].attempts[0].status, 'interrupted');
   children[1].finish(1);
 });
 
@@ -166,6 +166,10 @@ test('API origin/CSRF protection, allowlisted files, logs and forbidden fields',
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
   const base = `http://127.0.0.1:${server.address().port}`;
+  const stageAsset = await fetch(base + '/assets/html-media-in-development.png');
+  assert.equal(stageAsset.status, 200);
+  assert.equal(stageAsset.headers.get('content-type'), 'image/png');
+  assert.ok((await stageAsset.arrayBuffer()).byteLength > 0);
   const state = await (await fetch(base + '/api/state')).json();
   assert.equal((await fetch(base + '/api/jobs', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 403);
   const headers = { 'content-type': 'application/json', 'x-csrf-token': state.csrfToken };
@@ -277,11 +281,11 @@ test('pause/resume preserves an unstarted attempt, survives restart and resumes 
   const recovered = new Queue({ root, autoStart: false });
   assert.equal(recovered.jobs[0].attempts[0].status, 'paused');
   assert.equal(recovered.snapshot('').jobs[0].status, 'paused');
-  assert.throws(() => queue.retry(a.id), { statusCode: 409 });
+  assert.equal(queue.snapshot('').jobs[0].canRecapture, true);
   await assert.rejects(queue.stop(a.id), { statusCode: 409 });
   assert.throws(() => queue.pause(a.id), { statusCode: 409 });
   queue.autoStart = true; queue.pump(); assert.equal(b.attempts[0].status, 'running');
-  assert.throws(() => queue.pause(b.id), { statusCode: 409 });
+  assert.equal(queue.snapshot('').jobs[1].canPause, true);
   assert.throws(() => queue.resume(b.id), { statusCode: 409 });
   queue.resume(a.id);
   assert.equal(a.attempts.length, 1); assert.equal(a.attempts[0], attempt);
@@ -289,11 +293,11 @@ test('pause/resume preserves an unstarted attempt, survives restart and resumes 
   assert.notEqual(attempt.queuedAt, '2020-01-01T00:00:00Z');
   children[0].finish(1); assert.equal(c.attempts[0].status, 'running');
   children[1].finish(1); assert.equal(attempt.status, 'running');
-  assert.equal(queue.snapshot('').jobs[0].canStop, true);
-  children[2].finish(1); assert.equal(queue.snapshot('').jobs[0].canStop, false);
+  assert.equal(queue.snapshot('').jobs[0].isActive, true);
+  children[2].finish(1); assert.equal(queue.snapshot('').jobs[0].isActive, false);
   queue.retry(a.id); // launch immediately in the newly available slot
   assert.equal(a.attempts.at(-1).status, 'running');
-  assert.throws(() => queue.pause(a.id), { statusCode: 409 }, 'queued-to-running race must not pause a started worker');
+  queue.pause(a.id); assert.equal(a.attempts.at(-1).status, 'pausing', 'queued-to-running race safely pauses the running worker');
   children[3].finish(1);
   const pending = queue.newAttempt(a); queue.pause(a.id);
   queue.resume(a.id); assert.equal(pending.status, 'running', 'resume pumps immediately'); children[4].finish(1);
@@ -336,10 +340,10 @@ test('pause/resume API has conflict, exact body, CSRF and Origin protection', as
   assert.equal((await post('resume')).status, 409);
   assert.equal((await post('pause')).status, 200);
   assert.equal((await post('pause')).status, 409);
-  assert.equal((await post('stop')).status, 409); assert.equal((await post('retry')).status, 409);
+  assert.equal((await post('stop')).status, 405);
   assert.equal((await post('resume')).status, 200);
   assert.equal((await post('resume')).status, 409);
-  queue.pump(); assert.equal((await post('pause')).status, 409);
+  queue.pump(); assert.equal((await post('pause')).status, 200);
   await queue.shutdown();
 });
 

@@ -59,6 +59,212 @@ function start(t, count = 11, options = {}) { const ctx = setup(t, options); ctx
 function qa(ctx) { ctx.children[0].finish(0); const child = ctx.sessions.at(-1); child.bind(); return child; }
 function pass(child, count = child.config.files.length) { for (const file of child.config.files.slice(0, count)) child.record(file); }
 
+test('QA pause preserves accepted checkpoints across restart and resumes only the unreviewed remainder', async t => {
+  const ctx = start(t, 3), child = qa(ctx); pass(child, 1);
+  assert.equal(ctx.attempt.status, 'validating'); assert.equal(ctx.queue.snapshot('').jobs[0].canPause, true);
+  const accepted = fs.readFileSync(paths(ctx.root, ctx.job, ctx.attempt).progress);
+  let finishPause;
+  child.interrupt = () => new Promise(resolve => { finishPause = () => { child.finish(1); resolve(); }; });
+  ctx.queue.pause(ctx.job.id);
+  assert.equal(ctx.attempt.status, 'pausing'); assert.equal(ctx.queue.active.size, 1);
+  assert.throws(() => child.record(child.config.files[1]), /Stale/);
+  assert.throws(() => ctx.queue.resume(ctx.job.id), { statusCode: 409 });
+  assert.deepEqual(fs.readFileSync(paths(ctx.root, ctx.job, ctx.attempt).progress), accepted);
+  finishPause(); assert.equal(ctx.attempt.status, 'paused'); assert.equal(ctx.queue.active.size, 0);
+  ctx.queue.autoStart = true; ctx.queue.pump(); assert.equal(ctx.sessions.length, 1, 'pause suppresses automatic retries');
+  ctx.queue.closing = true;
+  const recovered = setup(t, { root: ctx.root });
+  const job = recovered.queue.jobs[0];
+  assert.equal(job.attempts[0].status, 'paused'); assert.equal(job.attempts[0].qa.reviewed, 1);
+  recovered.queue.resume(job.id); recovered.queue.pump();
+  const next = recovered.sessions[0]; next.bind();
+  assert.deepEqual(next.config.files.map(file => file.name), child.config.files.slice(1).map(file => file.name));
+  assert.equal(job.attempts.length, 1); assert.equal(recovered.children.length, 0);
+  pass(next); next.finish(); assert.equal(job.attempts[0].status, 'complete');
+  assert.deepEqual(loadQa(ctx.root, job, job.attempts[0]).progress.checkpoints[0], JSON.parse(accepted).checkpoints[0]);
+});
+
+test('restart reconciles a durable pause request after process completion but before paused state save', t => {
+  const ctx = start(t, 3), child = qa(ctx); pass(child, 1); ctx.queue.pause(ctx.job.id);
+  assert.equal(ctx.attempt.status, 'paused');
+  ctx.attempt.status = 'pausing'; ctx.queue.save(); ctx.queue.closing = true;
+  const recovered = setup(t, { root: ctx.root }), attempt = recovered.queue.jobs[0].attempts[0];
+  assert.equal(attempt.status, 'paused'); assert.equal(attempt.phase, 'qa');
+  assert.equal(recovered.queue.snapshot('').jobs[0].canResume, true); assert.equal(attempt.qa.reviewed, 1);
+});
+
+// Count actual PNG buffers read through descriptors and then passed to SHA-256;
+// report/manifest JSON hashing must not inflate the PNG counters.
+function measurePngIO(run) {
+  const original = { open: fs.openSync, close: fs.closeSync, read: fs.readFileSync, hash: crypto.createHash, readdir: fs.readdirSync };
+  const descriptors = new Map(), buffers = new WeakSet();
+  const result = { reads: [], bytes: 0, hashes: 0, hashBytes: 0, jsonReads: [], directories: 0 };
+  fs.openSync = function(file, ...args) {
+    const fd = original.open.call(this, file, ...args); descriptors.set(fd, String(file)); return fd;
+  };
+  fs.closeSync = function(fd) { try { return original.close.call(this, fd); } finally { descriptors.delete(fd); } };
+  fs.readFileSync = function(file, ...args) {
+    const data = original.read.call(this, file, ...args), name = typeof file === 'number' ? descriptors.get(file) : String(file);
+    if (name?.endsWith('.png')) { result.reads.push(path.basename(name)); result.bytes += data.length; if (Buffer.isBuffer(data)) buffers.add(data); }
+    if (name?.endsWith('.json')) result.jsonReads.push(path.basename(name));
+    return data;
+  };
+  fs.readdirSync = function(...args) { result.directories++; return original.readdir.apply(this, args); };
+  crypto.createHash = function(...args) {
+    const digest = original.hash.apply(this, args), update = digest.update;
+    digest.update = function(data, ...rest) {
+      if (Buffer.isBuffer(data) && buffers.has(data)) { result.hashes++; result.hashBytes += data.length; }
+      return update.call(this, data, ...rest);
+    };
+    return digest;
+  };
+  try { result.value = run(); return result; }
+  finally { fs.openSync = original.open; fs.closeSync = original.close; fs.readFileSync = original.read; crypto.createHash = original.hash; fs.readdirSync = original.readdir; }
+}
+
+function completedCapture(t, count = 3) {
+  const ctx = start(t, count), child = qa(ctx); pass(child); child.finish(); return ctx;
+}
+
+test('state snapshots read each PNG once cold and zero times warm while checking JSON and directory membership freshly', t => {
+  const ctx = completedCapture(t);
+  const cold = measurePngIO(() => ctx.queue.snapshot('token'));
+  assert.equal(cold.reads.length, 3); assert.equal(cold.hashes, 3);
+  assert.equal(cold.bytes, PNG.length * 3); assert.equal(cold.hashBytes, cold.bytes);
+  assert.equal(cold.jsonReads.filter(name => name === 'capture-report.json').length, 1);
+  assert.equal(cold.jsonReads.filter(name => name === 'capture-manifest.json').length, 1);
+  assert.equal(cold.directories, 1); assert.equal(cold.value.jobs[0].status, 'complete');
+  for (let i = 0; i < 3; i++) {
+    const warm = measurePngIO(() => ctx.queue.snapshot('token'));
+    assert.deepEqual(warm.value, cold.value);
+    assert.equal(warm.reads.length, 0); assert.equal(warm.bytes, 0); assert.equal(warm.hashes, 0); assert.equal(warm.hashBytes, 0);
+    assert.equal(warm.jsonReads.filter(name => name === 'capture-report.json').length, 1);
+    assert.equal(warm.jsonReads.filter(name => name === 'capture-manifest.json').length, 1);
+    assert.equal(warm.directories, 1);
+  }
+  ctx.queue.save();
+  assert.doesNotMatch(JSON.stringify(cold.value), /snapshotPngCache|mtimeNs|ctimeNs|birthtimeNs/);
+  assert.doesNotMatch(fs.readFileSync(ctx.queue.stateFile, 'utf8'), /snapshotPngCache|mtimeNs|ctimeNs|birthtimeNs/);
+});
+
+test('snapshot cache invalidates only changed PNG after same-size write with restored mtime and after atomic replacement', t => {
+  for (const change of ['write', 'replace']) {
+    const ctx = completedCapture(t), name = '01_tab.png', file = path.join(ctx.p.hostDir, name);
+    const timestamp = new Date('2020-01-02T03:04:05.000Z');
+    fs.utimesSync(file, timestamp, timestamp);
+    ctx.queue.snapshot('');
+    const before = fs.statSync(file, { bigint: true }), modified = Buffer.from(PNG); modified[modified.length - 1] ^= 1;
+    if (change === 'write') { fs.writeFileSync(file, modified); fs.utimesSync(file, timestamp, timestamp); }
+    else {
+      const replacement = path.join(ctx.p.hostDir, 'replacement.tmp');
+      fs.writeFileSync(replacement, modified); fs.utimesSync(replacement, timestamp, timestamp); fs.renameSync(replacement, file);
+    }
+    const after = fs.statSync(file, { bigint: true });
+    assert.equal(after.size, before.size); assert.equal(after.mtimeNs, before.mtimeNs);
+    if (change === 'write') assert.notEqual(after.ctimeNs, before.ctimeNs);
+    else assert.ok(after.ino !== before.ino || after.birthtimeNs !== before.birthtimeNs);
+    const changed = measurePngIO(() => ctx.queue.snapshot(''));
+    assert.deepEqual(changed.reads, [name]); assert.equal(changed.hashes, 1); assert.equal(changed.value.jobs[0].status, 'incomplete');
+    const pngs = changed.value.jobs[0].attempts[0].files.filter(item => item.kind === 'png');
+    assert.equal(pngs.find(item => item.name === name).qaStatus, 'unreviewed');
+    assert.equal(pngs.filter(item => item.name !== name).every(item => item.qaStatus === 'passed'), true);
+    assert.equal(measurePngIO(() => ctx.queue.snapshot('')).reads.length, 0);
+    fs.writeFileSync(file, PNG);
+    const repaired = measurePngIO(() => ctx.queue.snapshot(''));
+    assert.deepEqual(repaired.reads, [name]); assert.equal(repaired.value.jobs[0].status, 'complete');
+  }
+});
+
+test('warm snapshot rejects missing/foreign/non-file PNG and fresh report or manifest corruption; repair recovers', t => {
+  for (const change of ['missing', 'foreign', 'non-file', 'ihdr', 'report', 'report-json', 'manifest']) {
+    const ctx = completedCapture(t), name = '01_tab.png', file = path.join(ctx.p.hostDir, name);
+    const p = paths(ctx.root, ctx.job, ctx.attempt), report = fs.readFileSync(p.report), manifest = fs.readFileSync(p.manifest);
+    ctx.queue.snapshot('');
+    if (change === 'missing' || change === 'non-file') fs.unlinkSync(file);
+    if (change === 'non-file') fs.mkdirSync(file);
+    if (change === 'foreign') fs.writeFileSync(path.join(p.hostDir, 'foreign.png'), PNG);
+    if (change === 'ihdr') { const broken = Buffer.from(PNG); broken.writeUInt32BE(0, 16); fs.writeFileSync(file, broken); }
+    if (change === 'report') atomicJson(p.report, { ...JSON.parse(report), extra: true });
+    if (change === 'report-json') fs.writeFileSync(p.report, '{');
+    if (change === 'manifest') fs.writeFileSync(p.manifest, '{');
+    const invalid = measurePngIO(() => ctx.queue.snapshot(''));
+    assert.equal(invalid.value.jobs[0].status, 'incomplete', change);
+    assert.equal(invalid.value.jobs[0].attempts[0].files.some(item => item.name === 'foreign.png'), false);
+    assert.equal(invalid.reads.length, change === 'ihdr' ? 1 : 0, change);
+    if (change === 'non-file') fs.rmdirSync(file);
+    if (['missing', 'non-file', 'ihdr'].includes(change)) fs.writeFileSync(file, PNG);
+    if (change === 'foreign') fs.unlinkSync(path.join(p.hostDir, 'foreign.png'));
+    if (change.startsWith('report')) fs.writeFileSync(p.report, report);
+    if (change === 'manifest') fs.writeFileSync(p.manifest, manifest);
+    assert.equal(ctx.queue.snapshot('').jobs[0].status, 'complete', change);
+  }
+});
+
+test('warm snapshot rechecks attempt containment after host directory is replaced by a junction', t => {
+  const ctx = completedCapture(t), outside = path.join(ctx.root, 'outside-attempt');
+  ctx.queue.snapshot('');
+  fs.renameSync(ctx.p.hostDir, outside);
+  fs.symlinkSync(outside, ctx.p.hostDir, process.platform === 'win32' ? 'junction' : 'dir');
+  const escaped = measurePngIO(() => ctx.queue.snapshot(''));
+  assert.equal(escaped.value.jobs[0].status, 'incomplete'); assert.equal(escaped.reads.length, 0);
+  fs.unlinkSync(ctx.p.hostDir); fs.renameSync(outside, ctx.p.hostDir);
+  assert.equal(ctx.queue.snapshot('').jobs[0].status, 'complete');
+});
+
+test('strict manifest verification bypasses a warm snapshot cache and rejects changed bytes', t => {
+  const ctx = completedCapture(t), manifest = ctx.queue.qaState(ctx.job, ctx.attempt).manifest;
+  ctx.queue.snapshot('');
+  const checked = measurePngIO(() => checkManifest(ctx.root, ctx.job, ctx.attempt, manifest));
+  assert.equal(checked.reads.length, 3); assert.equal(checked.hashes, 3);
+  const file = path.join(ctx.p.hostDir, '01_tab.png'), modified = Buffer.from(PNG); modified[modified.length - 1] ^= 1;
+  fs.writeFileSync(file, modified);
+  const rejected = measurePngIO(() => assert.throws(() => checkManifest(ctx.root, ctx.job, ctx.attempt, manifest), /Capture изменён/));
+  assert.equal(rejected.reads.length, 3); assert.equal(rejected.hashes, 3);
+});
+
+test('stable PNG reads compare every identity field with the current path before accepting bytes', t => {
+  const ctx = completedCapture(t), file = fs.realpathSync(path.join(ctx.p.hostDir, '01_tab.png'));
+  const { stableReadWithIdentity } = require('../src/infrastructure/files.cjs');
+  for (const field of ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs', 'birthtimeNs']) {
+    const original = fs.statSync;
+    fs.statSync = function(target, options) {
+      const stat = original.call(this, target, options);
+      if (target === file && options?.bigint) stat[field] += 1n;
+      return stat;
+    };
+    try { assert.throws(() => stableReadWithIdentity(file), /Файл изменяется/, field); }
+    finally { fs.statSync = original; }
+  }
+});
+
+test('capture completion queues QA after earlier captures and each pass holds its own FIFO slot until close', t => {
+  const ctx = setup(t);
+  ctx.queue.add('https://first.reestr35.ru/\nhttps://second.reestr35.ru/');
+  const [first, second] = ctx.queue.jobs;
+  ctx.queue.pump();
+  capture(ctx, 1, true, 'complete', first);
+  ctx.children[0].finish(0);
+  assert.equal(ctx.children.length, 2);
+  assert.equal(ctx.sessions.length, 0);
+  assert.equal(first.attempts[0].phase, 'qa');
+  assert.equal(first.attempts[0].status, 'queued');
+  assert.ok(first.attempts[0].queueOrder > second.attempts[0].queueOrder);
+  capture(ctx, 1, true, 'complete', second);
+  ctx.children[1].finish(0);
+  assert.equal(ctx.sessions.length, 1);
+  assert.ok(ctx.queue.active.has(first.id));
+  const firstQa = ctx.sessions[0]; firstQa.bind(); pass(firstQa);
+  ctx.queue.pump();
+  assert.equal(ctx.sessions.length, 1, 'accepted final checkpoint alone does not release the process slot');
+  firstQa.finish();
+  assert.equal(ctx.sessions.length, 2);
+  assert.equal(first.attempts[0].status, 'complete');
+  assert.ok(ctx.queue.active.has(second.id));
+  const secondQa = ctx.sessions[1]; secondQa.bind(); pass(secondQa); secondQa.finish();
+  assert.equal(second.attempts[0].status, 'complete');
+  assert.equal(ctx.children.length, 2, 'QA never re-runs capture');
+});
+
 test('relocated history preserves manifest hashes and checkpoints and resumes only remaining QA', t => {
   const ctx = start(t, 2), child = qa(ctx); pass(child, 1); child.finish(1);
   const migrated = fs.mkdtempSync(path.join(testTempRoot(), 'migrated-history-'));
@@ -92,7 +298,7 @@ test('one capture and one QA turn receive all 11 PNG; each call commits and upda
   assert.deepEqual(snapshot.qa.segments.map(file => file.status), Array(11).fill('pending'));
   for (const [i, file] of child.config.files.entries()) {
     assert.equal(child.record(file).reviewed, i + 1); assert.equal(loadQa(ctx.root, ctx.job, ctx.attempt).progress.checkpoints.length, i + 1);
-    assert.equal(ctx.attempt.files.filter(f => f.qaStatus === 'passed').length, i + 1); assert.equal(ctx.attempt.status, 'running'); assert.equal(ctx.sessions.length, 1);
+    assert.equal(ctx.attempt.files.filter(f => f.qaStatus === 'passed').length, i + 1); assert.equal(ctx.attempt.status, 'validating'); assert.equal(ctx.sessions.length, 1);
     snapshot = ctx.queue.snapshot('').jobs[0].attempts[0];
     assert.deepEqual(snapshot.qa.segments.map(item => item.name), child.config.files.map(item => item.name));
     assert.deepEqual(snapshot.qa.segments.map(item => item.status), [...Array(i + 1).fill('passed'), ...Array(10 - i).fill('pending')]);
@@ -197,7 +403,7 @@ test('finished QA lease write/rename failure releases only proven completion, pr
       assert.equal(readLease(ctx.p.dir, launch).status, 'running');
       assert.equal(loadQa(ctx.root, ctx.job, ctx.attempt).progress.checkpoints.length, 1);
       assert.equal(JSON.parse(fs.readFileSync(ctx.queue.stateFile)).jobs[0].attempts[0].status, 'needs_review');
-      assert.equal(ctx.queue.snapshot('').jobs[0].canStop, false);
+      assert.equal(ctx.queue.snapshot('').jobs[0].isActive, false);
       assert.equal(readLease(ctx.p.dir, launch).status, 'finished'); assert.equal(readLease(ctx.p.dir, launch).proof, proof);
       ctx.queue['continue-qa'](ctx.job.id); ctx.queue.pump(); const next = ctx.sessions[1]; next.bind();
       assert.equal(next.config.files.length, 1); assert.equal(next.config.files[0].name, '01_tab.png');
@@ -213,7 +419,7 @@ test('persistent finished-lease failure blocks continuation without retaining a 
   fs.renameSync = function (...args) { if (String(args[1]) === leasePath) throw Object.assign(new Error('fixture EPERM persistent'), { code: 'EPERM' }); return original.apply(this, args); };
   try {
     child.finish(1); assert.equal(ctx.queue.active.size, 0);
-    const snapshot = ctx.queue.snapshot('').jobs[0]; assert.equal(snapshot.canStop, false); assert.equal(snapshot.canContinueQa, false);
+    const snapshot = ctx.queue.snapshot('').jobs[0]; assert.equal(snapshot.isActive, false); assert.equal(snapshot.canContinueQa, false);
     assert.throws(() => ctx.queue['continue-qa'](ctx.job.id), { statusCode: 409 }); assert.throws(() => ctx.queue.retry(ctx.job.id), { statusCode: 409 });
   } finally { fs.renameSync = original; }
   ctx.queue['continue-qa'](ctx.job.id); ctx.queue.pump(); const next = ctx.sessions[1]; next.bind(); pass(next); next.finish();
@@ -243,9 +449,9 @@ test('idle timeout starts after report sealed and resets on each checkpoint; std
   capture(ctx, 2); const child = qa(ctx); ctx.advance(99); child.record(); ctx.advance(99); await ctx.queue.tick(ctx.job, ctx.attempt, child); assert.equal(child.exitCode, null);
   child.config.onLog('endless logs'); ctx.advance(2); await ctx.queue.tick(ctx.job, ctx.attempt, child); assert.equal(ctx.attempt.timeoutReason, 'idle_timeout'); assert.equal(ctx.attempt.status, 'needs_review'); assert.equal(ctx.attempt.qa.reviewed, 1);
 });
-test('interrupt failure retains slot/canStop and blocks retry; late record rejected', async t => {
+test('interrupt failure retains slot/isActive and blocks retry; late record rejected', async t => {
   const ctx = start(t, 2), child = qa(ctx); child.record(); child.interrupt = async () => { throw new Error('interrupt denied'); }; ctx.advance(101); await ctx.queue.tick(ctx.job, ctx.attempt, child);
-  assert.equal(ctx.queue.active.size, 1); assert.equal(ctx.queue.snapshot('').jobs[0].canStop, true); assert.equal(fs.existsSync(child.config.cwd), true);
+  assert.equal(ctx.queue.active.size, 1); assert.equal(ctx.queue.snapshot('').jobs[0].isActive, true); assert.equal(fs.existsSync(child.config.cwd), true);
   assert.throws(() => ctx.queue['continue-qa'](ctx.job.id), { statusCode: 409 }); assert.throws(() => ctx.queue.retry(ctx.job.id), { statusCode: 409 }); assert.throws(() => child.record(child.config.files[1]), /Stale/); await assert.rejects(ctx.queue.stop(ctx.job.id), /denied/);
   assert.equal(ctx.attempt.cancellationRequested, undefined); child.finish(1); assert.equal(ctx.queue.active.size, 0);
 });
@@ -305,11 +511,12 @@ test('two companies use separate app-server processes; failure and stop retry on
   assert.equal(ctx.queue.active.size, 2);
   assert.deepEqual(passes[2].config.files.map(file => file.name), ['01_tab.png', '02_tab.png']);
   assert.equal(processes[2].turnInput.filter(item => item.type === 'localImage').length, 2);
-  await ctx.queue.stop(ctx.queue.jobs[1].id);
-  assert.equal(ctx.queue.jobs[1].attempts[0].status, 'cancelled'); assert.equal(passes[1].app.child, null);
+  ctx.queue.pause(ctx.queue.jobs[1].id);
+  await until(() => ctx.queue.jobs[1].attempts[0].status === 'paused');
+  assert.equal(passes[1].app.child, null);
   assert.equal(passes[2].session.exitCode, null, 'stopping one company preserves the other process');
   assert.equal(ctx.queue.active.size, 1);
-  ctx.queue['continue-qa'](ctx.queue.jobs[1].id); ctx.queue.pump();
+  ctx.queue.resume(ctx.queue.jobs[1].id); ctx.queue.pump();
   await passes[3].session.ready; await until(() => processes[3].turnInput);
   assert.equal(new Set(processes.map(child => child.pid)).size, 4);
   assert.equal(passes[3].config.files.length, 3, 'stopped company has no accepted checkpoints');

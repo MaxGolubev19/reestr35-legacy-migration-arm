@@ -2,15 +2,14 @@
   "use strict";
 
   const POLL_INTERVAL_MS = 1500;
-  const ACTIVE_STATUSES = new Set(["running", "validating", "stopping"]);
-  const TERMINAL_STATUSES = new Set(["complete", "needs_review", "incomplete", "failed", "cancelled", "interrupted"]);
-  // These are the current-attempt outcomes for which the queue already shows a
-  // red retry action. A user cancellation is intentional, so it is not an error.
+  const ACTIVE_STATUSES = new Set(["running", "pausing", "validating", "stopping"]);
+  // Current-attempt outcomes that need attention in the tab indicator.
   const ERROR_STATUSES = new Set(["needs_review", "incomplete", "failed", "interrupted"]);
   const STATUS_LABELS = {
     paused: "На паузе",
     queued: "В очереди",
     running: "Выполняется",
+    pausing: "Приостанавливается",
     validating: "Проверяется",
     stopping: "Останавливается",
     complete: "Готово",
@@ -19,19 +18,6 @@
     failed: "Ошибка",
     cancelled: "Отменено",
     interrupted: "Прервано"
-  };
-  const STATUS_CLASSES = {
-    paused: "bg-secondary-lt",
-    queued: "bg-blue-lt",
-    running: "bg-blue-lt",
-    validating: "bg-azure-lt",
-    stopping: "bg-yellow-lt",
-    complete: "bg-green-lt",
-    needs_review: "bg-yellow-lt",
-    incomplete: "bg-orange-lt",
-    failed: "bg-red-lt",
-    cancelled: "bg-secondary-lt",
-    interrupted: "bg-red-lt"
   };
 
   const state = {
@@ -54,13 +40,17 @@
     gallery: [],
     galleryIndex: 0,
     galleryTrigger: null,
+    activeStage: 1,
+    stageContextKey: null,
+    stageManuallySelected: false,
     eventSource: null,
     refreshPromise: null,
     refreshQueued: false,
+    refreshGeneration: 0,
     shutdownRequested: false,
     shutdownError: false,
     submitting: false,
-    pendingActions: new Set()
+    pendingActions: new Map()
   };
 
   const el = Object.fromEntries([
@@ -68,10 +58,12 @@
     "batch-form", "url-input", "clear-url", "url-feedback", "submit-button", "batch-result", "progress-label",
     "progress-bar", "jobs-body", "empty-detail", "concurrency-slider", "settings-error",
     "job-detail", "detail-title", "detail-url", "attempt-duration", "detail-id",
-    "detail-status", "detail-created", "attempt-select", "attempt-meta", "files-list",
+    "detail-created", "attempt-select", "attempt-meta", "files-list", "recapture-button",
+    "stage-step-1", "stage-step-2", "stage-step-3", "stage-step-4", "gallery-body",
+    "metadata-panel", "summary-panel", "stage-two-panel", "back-to-stage-one", "attempt-header",
     "summary-output", "issues-output", "logs-card", "stdout-output",
     "stderr-output", "stdout-truncated", "stderr-truncated", "png-gallery",
-    "gallery-message", "qa-progress", "qa-progress-count", "qa-progress-bar",
+    "qa-progress", "qa-progress-count", "qa-progress-bar",
     "png-modal", "png-modal-title", "png-counter", "png-status",
     "png-full", "png-error", "png-prev", "png-next", "png-original",
     "json-modal", "json-modal-title", "json-output", "json-error", "json-original"
@@ -119,11 +111,11 @@
   function renderFavicon() {
     const icon = document.getElementById("dynamic-favicon");
     if (!icon) return;
-    // canStop comes from the server's live child-process map and decides whether
+    // isActive comes from the server's live child-process map and decides whether
     // the blue state is active. Its number is the current workload: each live or
     // queued job once, including the unlikely overlap of both signals.
-    const active = state.jobs.some((job) => job.canStop === true);
-    const workload = state.jobs.filter((job) => job.canStop === true || effectiveStatus(job) === "queued").length;
+    const active = state.jobs.some((job) => job.isActive === true);
+    const workload = state.jobs.filter((job) => job.isActive === true || effectiveStatus(job) === "queued").length;
     const errors = state.jobs.filter((job) => ERROR_STATUSES.has(effectiveStatus(job))).length;
     const pausedOrCancelled = state.jobs.filter((job) => ["paused", "cancelled"].includes(effectiveStatus(job))).length;
     const count = active ? workload : errors || pausedOrCancelled;
@@ -135,14 +127,6 @@
       : '<path d="M9 16.5l4.5 4.5L23 11" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>';
     const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="15" fill="${color}"/>${mark}</svg>`;
     icon.setAttribute("href", `data:image/svg+xml,${encodeURIComponent(svg)}`);
-  }
-
-  function badge(status) {
-    const normalized = String(status || "unknown").toLowerCase();
-    const span = document.createElement("span");
-    span.className = `badge ${STATUS_CLASSES[normalized] || "bg-secondary-lt"}`;
-    span.textContent = STATUS_LABELS[normalized] || normalized;
-    return span;
   }
 
   function clear(node) {
@@ -232,47 +216,62 @@
 
   function actionButton(job, action, label, icon, color, secondary = false) {
     const status = effectiveStatus(job);
+    const pending = state.pendingActions.get(job.id);
+    const pendingAction = Boolean(action && pending?.action === action);
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `btn btn-icon btn-ghost-secondary text-${color}`;
+    button.className = `btn btn-icon btn-ghost-secondary queue-status-button text-${color}`;
     button.dataset[secondary ? "jobSecondaryAction" : "jobAction"] = job.id;
     button.dataset.action = action || "";
     button.dataset.status = status;
     button.dataset.icon = icon;
-    button.title = `${STATUS_LABELS[status] || status} · ${label}`;
-    button.setAttribute("aria-label", `${button.title} · ${job.url}`);
-    button.disabled = !action;
-    button.setAttribute("aria-busy", String(state.pendingActions.has(job.id)));
-    button.setAttribute("aria-disabled", String(!action || state.pendingActions.has(job.id)));
-    button.append(actionIcon(icon));
+    button.dataset.actionLabel = label;
+    button.dataset.jobUrl = job.url;
+    button.disabled = !action || Boolean(pending);
+    button.setAttribute("aria-busy", String(pendingAction));
+    button.setAttribute("aria-disabled", String(button.disabled));
+    const graphic = actionIcon(icon);
+    if (icon === "running") graphic.className = `status-dot status-dot-animated bg-${color}`;
+    button.append(graphic);
     button.addEventListener("click", event => {
       event.stopPropagation();
       if (action && !state.pendingActions.has(job.id)) writeAction(job.id, action, button);
     });
     button.addEventListener("keydown", event => event.stopPropagation());
-    return button;
+    const wrapper = document.createElement("span");
+    wrapper.className = "queue-status-control";
+    wrapper.append(button);
+    wrapper.addEventListener("click", event => { if (button.disabled) event.stopPropagation(); });
+    updateActionTooltip(button);
+    return wrapper;
+  }
+
+  function updateActionTooltip(button) {
+    const title = `${STATUS_LABELS[button.dataset.status] || button.dataset.status} · ${button.disabled ? "Недоступно" : button.dataset.actionLabel}`;
+    button.title = title;
+    button.setAttribute("aria-label", `${title} · ${button.dataset.jobUrl}`);
+    const wrapper = button.parentElement;
+    window.tabler.Tooltip.getInstance(wrapper)?.dispose();
+    new window.tabler.Tooltip(wrapper, { trigger: "hover", title, html: false });
   }
 
   function queueActions(job) {
     const status = effectiveStatus(job);
-    const attempt = currentAttempt(job);
-    if (job.canStop === true && TERMINAL_STATUSES.has(status)) return [actionButton(job, "stop", "Повторить остановку", "square", "yellow")];
     const mapping = {
-      paused: ["resume", "Возобновить", "pause", "secondary"],
-      queued: attempt?.phase === "qa" ? ["stop", "Отменить проверку", "clock", "blue"] : ["pause", "Поставить на паузу", "clock", "blue"],
-      running: [job.canStop ? "stop" : null, job.canStop ? "Остановить" : "Остановка недоступна: нет работающего процесса", "running", "blue"],
-      validating: [job.canStop ? "stop" : null, job.canStop ? "Остановить" : "Остановка недоступна: процесс завершён", "running", "blue"],
-      stopping: [null, "Остановка уже выполняется", "square", "yellow"],
-      complete: ["retry", "Повторить", "check", "green"],
-      cancelled: ["retry", "Повторить", "square", "secondary"]
+      paused: [job.canResume ? "resume" : null, "Продолжить", "pause", "secondary"],
+      queued: ["pause", "Приостановить", "clock", "blue"],
+      running: [job.canPause ? "pause" : null, "Приостановить", "running", "blue"],
+      pausing: [null, "Недоступно", "running", "yellow"],
+      validating: [job.canPause ? "pause" : null, "Приостановить", "running", "blue"],
+      stopping: [null, "Недоступно", "square", "yellow"],
+      complete: [job.canRecapture ? "retry" : null, "Перезапустить", "check", "green"],
+      needs_review: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
+      incomplete: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "orange"],
+      failed: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
+      interrupted: [job.canResume ? "resume" : job.canRecapture ? "retry" : null, job.canResume ? "Продолжить" : "Перезапустить", "alert", "red"],
+      cancelled: [job.canRecapture ? "retry" : null, "Перезапустить", "square", "secondary"]
     };
-    if (job.canContinueQa === true) {
-      return [
-        actionButton(job, "continue-qa", "Продолжить проверку", "check", "blue"),
-        actionButton(job, "retry", "Повторить захват", "alert", "red", true)
-      ];
-    }
-    const action = mapping[status] || (TERMINAL_STATUSES.has(status) ? ["retry", "Повторить", "alert", "red"] : [null, "Действие недоступно", "alert", "secondary"]);
+    const action = mapping[status] || [null, "Недоступно", "alert", "secondary"];
     return [actionButton(job, ...action)];
   }
 
@@ -281,6 +280,7 @@
     const focusedId = focused?.dataset.jobAction || focused?.dataset.jobSecondaryAction || focused?.dataset.jobSelect;
     const focusedAction = Boolean(focused?.dataset.jobAction || focused?.dataset.jobSecondaryAction);
     const focusedOperation = focused?.dataset.action;
+    el["jobs-body"].querySelectorAll(".queue-status-control").forEach(wrapper => window.tabler.Tooltip.getInstance(wrapper)?.dispose());
     clear(el["jobs-body"]);
     if (!state.jobs.length) {
       const row = document.createElement("tr");
@@ -409,8 +409,55 @@
       });
     }
 
-    el["logs-card"].classList.remove("d-none");
+    el["logs-card"].classList.toggle("d-none", state.activeStage !== 1);
     renderGallery(job, attempt);
+  }
+
+  const STAGE_ERROR_STATUSES = new Set(["needs_review", "incomplete", "failed", "interrupted"]);
+  const defaultStage = attempt => attempt?.status === "complete" ? 2 : 1;
+
+  function renderStages(job, attempt) {
+    const secondAvailable = attempt?.status === "complete";
+    const contextKey = job && attempt ? `${job.id}:${attempt.number}` : null;
+    if (state.stageContextKey !== contextKey) {
+      state.stageContextKey = contextKey;
+      state.stageManuallySelected = false;
+      state.activeStage = defaultStage(attempt);
+    } else if (!state.stageManuallySelected) state.activeStage = defaultStage(attempt);
+    if (state.activeStage === 2 && !secondAvailable) {
+      state.activeStage = 1;
+      state.stageManuallySelected = false;
+    }
+    const steps = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"], el["stage-step-4"]];
+    const firstState = secondAvailable ? "success" : STAGE_ERROR_STATUSES.has(attempt?.status) ? "error" : "active";
+    const colors = [firstState, secondAvailable ? "active" : "inactive", "inactive", "inactive"];
+    steps.forEach((step, index) => {
+      const stage = index + 1, available = stage === 1 || (stage === 2 && secondAvailable), selected = state.activeStage === stage;
+      step.classList.toggle("active", selected);
+      for (const color of ["inactive", "active", "success", "error"]) step.classList.toggle(`step-state-${color}`, colors[index] === color);
+      step.setAttribute("aria-selected", String(selected));
+      step.setAttribute("aria-disabled", String(!available));
+      step.tabIndex = selected ? 0 : -1;
+      if (available) step.href = stage === 1 ? "#gallery-body" : "#stage-two-panel";
+      else step.removeAttribute("href");
+    });
+    const firstStage = state.activeStage === 1;
+    el["gallery-body"].classList.toggle("d-none", !firstStage);
+    el["metadata-panel"].classList.toggle("d-none", !firstStage);
+    el["summary-panel"].classList.toggle("d-none", !firstStage);
+    el["logs-card"].classList.toggle("d-none", !firstStage || !attempt);
+    el["stage-two-panel"].classList.toggle("d-none", firstStage);
+    el["qa-progress"].classList.toggle("stage-hidden", !firstStage);
+  }
+
+  function selectStage(stage, { focus = false } = {}) {
+    const job = state.jobs.find(candidate => candidate.id === state.selectedJobId), attempt = job && selectedAttempt(job);
+    if (stage === 2 && attempt?.status !== "complete") return;
+    if (stage !== 1 && stage !== 2) return;
+    state.activeStage = stage;
+    state.stageManuallySelected = true;
+    renderStages(job, attempt);
+    if (focus) el[`stage-step-${stage}`].focus({ preventScroll: true });
   }
 
   function formatDuration(attempt, timestamp = Date.now()) {
@@ -463,6 +510,8 @@
     const attempts = Array.isArray(job.attempts) ? job.attempts : [];
     if (attempts.length && !attempts.some((attempt) => String(attempt.number) === String(state.selectedAttemptNumber))) {
       state.selectedAttemptNumber = attempts[attempts.length - 1].number;
+      state.stageContextKey = null;
+      state.stageManuallySelected = false;
       state.logsKey = null;
     }
     clear(el["attempt-select"]);
@@ -474,16 +523,29 @@
       el["attempt-select"].append(option);
     });
     el["attempt-select"].disabled = !attempts.length;
-    el["detail-status"].replaceChildren(badge(selectedAttempt(job)?.status));
+    const recapture = el["recapture-button"];
+    recapture.disabled = !job.canRecapture || state.pendingActions.has(job.id);
+    recapture.classList.toggle("btn-loading", state.pendingActions.get(job.id)?.action === "retry");
+    recapture.setAttribute("aria-busy", String(state.pendingActions.get(job.id)?.action === "retry"));
+    recapture.title = "Перезапустить";
+    recapture.setAttribute("aria-label", "Перезапустить");
     renderDuration();
-    renderAttempt(job, selectedAttempt(job));
+    const attempt = selectedAttempt(job);
+    renderAttempt(job, attempt);
+    renderStages(job, attempt);
   }
 
-  function renderState(data) {
+  function renderState(data, generation = state.refreshGeneration) {
     state.csrfToken = typeof data.csrfToken === "string" ? data.csrfToken : "";
     const jobs = Array.isArray(data.jobs) ? data.jobs : [];
     const fingerprint = JSON.stringify(jobs);
     const changed = fingerprint !== state.jobsFingerprint;
+    let confirmedAction = false;
+    for (const [id, pending] of state.pendingActions) {
+      if (generation < pending.confirmAfterGeneration) continue;
+      state.pendingActions.delete(id);
+      confirmedAction = true;
+    }
     state.jobs = jobs;
     state.jobsFingerprint = fingerprint;
     // Refresh the tab signal for every state response, even when the queue
@@ -492,7 +554,7 @@
     if (Number.isInteger(data.concurrency)) state.concurrency = data.concurrency;
     if (!state.settingsPending && document.activeElement !== el["concurrency-slider"]) renderSettings();
     renderProgress();
-    if (changed) {
+    if (changed || confirmedAction) {
       renderJobs();
       renderDetail();
     }
@@ -504,6 +566,8 @@
     const job = state.jobs.find((candidate) => candidate.id === id);
     const attempt = job && currentAttempt(job);
     state.selectedAttemptNumber = attempt ? attempt.number : null;
+    state.stageContextKey = null;
+    state.stageManuallySelected = false;
     state.logsKey = null;
     renderJobs();
     renderDetail();
@@ -511,22 +575,43 @@
   }
 
   async function writeAction(id, action, button) {
-    state.pendingActions.add(id);
-    button.setAttribute("aria-busy", "true");
-    button.setAttribute("aria-disabled", "true");
+    if (!id || state.pendingActions.has(id)) return;
+    const pending = { action, confirmAfterGeneration: Number.POSITIVE_INFINITY };
+    state.pendingActions.set(id, pending);
+    if (state.selectedJobId === id) {
+      const recapture = document.getElementById("recapture-button");
+      if (recapture) { recapture.disabled = true; recapture.classList.toggle("btn-loading", recapture === button); recapture.setAttribute("aria-busy", String(recapture === button)); }
+    }
+    for (const control of el["jobs-body"].querySelectorAll("[data-job-action], [data-job-secondary-action]")) {
+      if ((control.dataset.jobAction || control.dataset.jobSecondaryAction) !== id) continue;
+      control.disabled = true;
+      control.setAttribute("aria-disabled", "true");
+      const clicked = control === button;
+      control.setAttribute("aria-busy", String(clicked));
+      updateActionTooltip(control);
+    }
     showGlobalError("");
+    let accepted = false;
     try {
       await api(`/api/jobs/${encodeURIComponent(id)}/${action}`, {
         method: "POST",
         body: "{}"
       });
-      if (action === "retry" && state.selectedJobId === id) state.selectedAttemptNumber = null;
-      await refreshState();
+      accepted = true;
+      if (action === "retry" && state.selectedJobId === id) {
+        state.selectedAttemptNumber = null; state.activeStage = 1; state.stageContextKey = null; state.stageManuallySelected = false;
+      }
+      // A state request that began before this POST succeeded may contain the
+      // old action. Keep loading until a later snapshot confirms it.
+      pending.confirmAfterGeneration = state.refreshGeneration + 1;
+      if (!state.refreshPromise) await refreshState();
     } catch (error) {
       showGlobalError(error instanceof Error ? error.message : String(error));
-    } finally {
-      state.pendingActions.delete(id);
-      renderJobs();
+      if (!accepted) {
+        state.pendingActions.delete(id);
+        renderJobs();
+        renderDetail();
+      }
     }
   }
 
@@ -792,7 +877,6 @@
     const selectedName = changedAttempt ? null : state.gallery[state.galleryIndex]?.name;
     state.gallery = files.filter(file => file.kind === "png" && safeFileHref(file.url)).map(file => ({ ...file, href: safeFileHref(file.url) }));
     state.galleryIndex = Math.max(0, state.gallery.findIndex(file => file.name === selectedName));
-    el["gallery-message"].textContent = state.gallery.length ? `${state.gallery.length} PNG` : "Снимков пока нет";
     drawGallery();
   }
 
@@ -837,8 +921,9 @@
     state.refreshPromise = (async () => {
       do {
         state.refreshQueued = false;
+        const generation = ++state.refreshGeneration;
         const data = await api("/api/state");
-        renderState(data || {});
+        renderState(data || {}, generation);
         if (!state.shutdownRequested) {
           setConnection(true, "Подключено");
           if (!state.shutdownError) showGlobalError("");
@@ -961,10 +1046,25 @@
   });
   el["attempt-select"].addEventListener("change", () => {
     state.selectedAttemptNumber = el["attempt-select"].value;
+    state.stageContextKey = null;
+    state.stageManuallySelected = false;
     state.logsKey = null;
     renderDetail();
     refreshSelectedLogs(true);
   });
+  el["recapture-button"].addEventListener("click", () => writeAction(state.selectedJobId, "retry", el["recapture-button"]));
+  el["stage-step-1"].addEventListener("click", event => { event.preventDefault(); selectStage(1, { focus: false }); });
+  el["stage-step-2"].addEventListener("click", event => { event.preventDefault(); selectStage(2, { focus: false }); });
+  for (const id of ["stage-step-3", "stage-step-4"]) el[id].addEventListener("click", event => event.preventDefault());
+  for (const id of ["stage-step-1", "stage-step-2", "stage-step-3", "stage-step-4"]) el[id].addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const available = [el["stage-step-1"], el["stage-step-2"]].filter(step => step.getAttribute("aria-disabled") !== "true");
+    const current = Math.max(0, available.indexOf(event.currentTarget));
+    const index = event.key === "Home" ? 0 : event.key === "End" ? available.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + available.length) % available.length;
+    event.preventDefault();
+    selectStage(Number(available[index].id.at(-1)), { focus: true });
+  });
+  el["back-to-stage-one"].addEventListener("click", () => selectStage(1, { focus: true }));
   window.addEventListener("beforeunload", () => {
     state.stopped = true;
     if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);

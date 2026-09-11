@@ -13,7 +13,37 @@ for (const [name, source] of Object.entries(licenseSources)) {
   assert.equal(createHash('sha256').update(content).digest('hex'), source.sha256, `complete pinned license: ${name}`);
 }
 assert.match(fs.readFileSync(path.join(licenseRoot,'SHARP-LIBVIPS-NOTICE.txt'),'utf8'), /libvips 8\.18\.6/);
-for (const file of ['src/server.cjs','src/capture.cjs','src/qa.cjs','src/qa-instructions.txt','src/qa-models.json','public/index.html','runtime/node.exe','runtime/NODE-LICENSE.txt','runtime/ARM-LICENSE.txt','runtime/GO-LICENSE.txt','runtime/node_modules/playwright/LICENSE','runtime/node_modules/sharp/LICENSE']) assert(fs.statSync(path.join(root,file)).isFile(), file);
+for (const file of ['src/server.cjs','src/capture.cjs','src/qa.cjs','src/qa-instructions.txt','src/qa-models.json','public/index.html','public/assets/html-media-in-development.png','runtime/node.exe','runtime/NODE-LICENSE.txt','runtime/ARM-LICENSE.txt','runtime/GO-LICENSE.txt','runtime/node_modules/playwright/LICENSE','runtime/node_modules/sharp/LICENSE']) assert(fs.statSync(path.join(root,file)).isFile(), file);
+const moduleFiles = [
+  "src/compat/legacy-v1.cjs",
+  "src/http/server.cjs",
+  "src/infrastructure/files.cjs",
+  "src/infrastructure/hash.cjs",
+  "src/infrastructure/launcher.cjs",
+  "src/infrastructure/process.cjs",
+  "src/infrastructure/runtime.cjs",
+  "src/infrastructure/server-lifecycle.cjs",
+  "src/pipeline/paths.cjs",
+  "src/pipeline/queue.cjs",
+  "src/pipeline/registry.cjs",
+  "src/pipeline/status.cjs",
+  "src/pipeline/url.cjs",
+  "src/stages/capture-qa/capture/artifacts.cjs",
+  "src/stages/capture-qa/capture/helper.cjs",
+  "src/stages/capture-qa/capture/manifest.cjs",
+  "src/stages/capture-qa/capture/naming.cjs",
+  "src/stages/capture-qa/capture/png.cjs",
+  "src/stages/capture-qa/capture/runner.cjs",
+  "src/stages/capture-qa/index.cjs",
+  "src/stages/capture-qa/paths.cjs",
+  "src/stages/capture-qa/qa/app-server.cjs",
+  "src/stages/capture-qa/qa/config.cjs",
+  "src/stages/capture-qa/qa/policy.cjs",
+  "src/stages/capture-qa/qa/progress.cjs",
+  "src/stages/capture-qa/qa/runner.cjs",
+  "src/stages/capture-qa/qa/staging.cjs"
+];
+for (const file of moduleFiles) assert(fs.statSync(path.join(root, file)).isFile(), file);
 const exe = fs.readFileSync(path.join(root,'Reestr35 ARM.exe')), pe = exe.readUInt32LE(0x3c);
 assert.equal(exe.readUInt16LE(pe + 4), 0x8664, 'x64');
 assert.equal(exe.readUInt16LE(pe + 24 + 68), 2, 'Windows GUI subsystem');

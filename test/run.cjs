@@ -5,9 +5,9 @@ const { dataRoot, dataSubdir } = require('../src/data-dir.cjs');
 const { resolveRuntime } = require('../src/lib.cjs');
 
 const suites = {
-  full: ['arm', 'qa', 'app-server', 'ui', 'capture', 'portability', 'cli-isolation'],
-  backend: ['arm', 'qa', 'app-server'],
-  ui: ['ui'], capture: ['capture'], portability: ['portability'], cli: ['cli-isolation'],
+  full: ['architecture', 'arm', 'qa', 'app-server', 'ui', 'capture', 'capture-resume', 'portability', 'cli-isolation'],
+  backend: ['architecture', 'arm', 'qa', 'app-server'],
+  ui: ['ui'], capture: ['capture', 'capture-resume'], portability: ['portability'], cli: ['cli-isolation'],
 };
 function configuration(suite = 'full', environment = process.env) {
   if (!Object.hasOwn(suites, suite)) throw new Error(`Unknown test suite: ${suite}`);
