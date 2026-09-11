@@ -1,0 +1,41 @@
+.job-table-wrap {
+  max-height: 42rem;
+  overflow: auto;
+}
+
+.raw-output {
+  max-height: 18rem;
+  overflow: auto;
+}
+
+.raw-log {
+  height: 16rem;
+  overflow: auto;
+}
+
+.detail-heading { min-width: 0; }
+.gallery-thumb { height: 11rem; object-fit: contain; }
+.gallery-viewport { max-height: 70vh; overflow: auto; }
+.gallery-full-image { display: block; max-width: none; }
+.job-table-wrap table { table-layout: fixed; width: 100%; }
+.job-table-wrap td:last-child { width: 7rem; }
+.qa-progress { flex: 1 1 28rem; max-width: 36rem; }
+.qa-progress-count { margin-bottom: .25rem; text-align: right; font-variant-numeric: tabular-nums; }
+.qa-progress-segment { flex: 1 1 0; }
+.json-output { max-height: 65vh; overflow: auto; }
+.raw-output { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+#empty-detail .empty {
+  min-height: 28rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+}
+
+.empty-detail-illustration {
+  display: block;
+  width: min(22rem, 82%);
+  height: auto;
+  margin: 0 auto 2rem;
+}

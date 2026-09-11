@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Снимки страниц — Реестр 35</title>
+  <link id="dynamic-favicon" rel="icon" type="image/svg+xml">
+  <link rel="stylesheet" href="/vendor/css/tabler.css"><link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="page">
+  <header class="navbar d-print-none"><div class="container-fluid">
+    <h1 class="navbar-brand">Снимки страниц · Реестр 35</h1>
+    <div class="d-flex align-items-center gap-2"><span id="connection-dot" class="status-dot bg-secondary" aria-hidden="true"></span><span id="connection-label">Подключение…</span></div>
+  </div></header>
+  <div class="page-wrapper">
+    <div class="page-body"><div class="container-fluid">
+      <div id="global-alert" class="alert alert-danger d-none" role="alert"></div>
+      <div class="row row-cards align-items-start" id="workspace">
+        <section class="col-12 col-xl-4" id="left-column" aria-label="Добавление URL и очередь"><div id="queue-card" class="card">
+          <form id="batch-form" class="card-body" novalidate>
+              <div class="d-flex gap-2 align-items-start" id="url-controls">
+                <input id="url-input" type="url" class="form-control" placeholder="https://example.reestr35.ru/" aria-label="URL страницы" aria-describedby="url-feedback" autocomplete="url">
+                <button id="clear-url" type="button" class="btn btn-outline-secondary btn-icon flex-shrink-0" aria-label="Очистить URL" title="Очистить URL"><svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+                <button id="submit-button" type="submit" class="btn btn-primary btn-icon flex-shrink-0" aria-label="Запустить" title="Запустить"><svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 4 14 8-14 8z"/></svg></button>
+              </div>
+              <div id="url-feedback" class="d-none" aria-live="polite"></div>
+              <div id="batch-result" class="mt-3 d-none" aria-live="polite"></div>
+          </form>
+          <div class="card-body border-top" id="queue-progress">
+            <div id="progress-label" class="h3 mb-2" aria-live="polite">0 / 0</div>
+            <div class="progress progress-sm" role="progressbar" aria-label="Общий прогресс" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-bar" class="progress-bar bg-primary" style="width:0%"></div></div>
+            <div class="d-flex justify-content-between align-items-center mt-3 mb-2"><label for="concurrency-slider" class="form-label mb-0">Параллельность</label><output id="concurrency-value" for="concurrency-slider" class="badge bg-blue-lt">2</output></div>
+            <input id="concurrency-slider" type="range" class="form-range" min="1" max="8" step="1" value="2" disabled>
+            <div id="settings-error" class="alert alert-danger mt-3 mb-0 d-none" role="alert"></div>
+          </div>
+            <div class="table-responsive job-table-wrap border-top"><table class="table table-vcenter card-table table-hover" aria-label="Страницы и состояние обработки"><tbody id="jobs-body"><tr><td colspan="2" class="text-secondary text-center py-5">Загрузка…</td></tr></tbody></table></div>
+        </div></section>
+        <section class="col-12 col-xl-8" id="results-column" aria-label="Результаты выбранной страницы">
+          <div id="empty-detail" class="card"><div class="empty"><img class="empty-img empty-detail-illustration" src="/assets/astronaut.png" width="2000" height="2000" alt=""><p class="empty-title">Выберите страницу</p><p class="empty-subtitle text-secondary">Здесь появятся галерея снимков, отчёт и попытки.</p></div></div>
+          <div id="job-detail" class="row row-cards d-none">
+            <div class="col-12" id="gallery-panel"><div class="card" id="results-card">
+            <div class="card-header flex-wrap gap-3" id="results-header">
+              <div class="detail-heading me-auto"><h3 id="detail-title" class="card-title">Результаты страницы</h3><a id="detail-url" class="text-break"></a></div>
+              <div class="d-flex flex-wrap align-items-center gap-2">
+                <select id="attempt-select" class="form-select w-auto" aria-label="Попытка"></select>
+                <span id="detail-status"></span><span id="attempt-duration" class="text-secondary font-monospace" aria-label="Длительность попытки">—</span>
+              </div>
+            </div>
+            <div class="card-body" id="gallery-body">
+              <div class="d-flex flex-wrap justify-content-between gap-2 mb-3"><div id="gallery-message" class="text-secondary" aria-live="polite"></div><div id="qa-progress" class="qa-progress d-none"><div id="qa-progress-count" class="qa-progress-count text-secondary" aria-hidden="true">0/0</div><div id="qa-progress-bar" class="progress progress-sm" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Проверено 0 из 0 PNG"></div></div></div>
+              <div id="png-gallery" class="row g-3"></div>
+            </div>
+            </div></div>
+              <div class="col-12 col-xxl-6" id="metadata-panel"><div class="card h-100">
+                <div class="card-header"><h3 class="card-title">Детали запуска</h3></div>
+                <div class="card-body">
+                  <dl class="row mb-3"><dt class="col-4">ID</dt><dd id="detail-id" class="col-8 font-monospace text-break"></dd><dt class="col-4">Создано</dt><dd id="detail-created" class="col-8"></dd></dl>
+                  <div id="attempt-meta"></div><div id="files-list" class="mt-3"></div>
+                </div>
+              </div></div>
+              <div class="col-12 col-xxl-6" id="summary-panel"><div class="card h-100">
+                <div class="card-header"><h3 class="card-title">Сводка и замечания</h3></div>
+                <div class="card-body"><h4>Сводка</h4><pre id="summary-output" class="bg-body-secondary text-body rounded p-3 raw-output"></pre><h4 class="mt-3">Замечания</h4><pre id="issues-output" class="bg-body-secondary text-body rounded p-3 raw-output"></pre></div>
+              </div></div>
+              <div id="logs-card" class="col-12 d-none"><div class="card">
+                <div class="card-header"><h3 class="card-title">Журналы выбранной попытки</h3></div>
+                <div class="card-body"><div class="row g-3">
+                  <div class="col-12 col-md-6"><div class="d-flex align-items-center mb-2"><h4 class="mb-0">stdout · JSONL</h4><span id="stdout-truncated" class="badge bg-yellow-lt ms-auto d-none">Обрезан</span></div><pre id="stdout-output" class="bg-dark text-light rounded p-3 raw-log mb-0">Загрузка…</pre></div>
+                  <div class="col-12 col-md-6"><div class="d-flex align-items-center mb-2"><h4 class="mb-0">stderr</h4><span id="stderr-truncated" class="badge bg-yellow-lt ms-auto d-none">Обрезан</span></div><pre id="stderr-output" class="bg-dark text-light rounded p-3 raw-log mb-0">Загрузка…</pre></div>
+                </div></div>
+              </div></div>
+          </div>
+        </section>
+      </div>
+    </div></div>
+  </div>
+</div>
+<div class="modal fade" id="png-modal" tabindex="-1" aria-labelledby="png-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
+  <div class="modal-header"><div class="detail-heading"><h3 class="modal-title text-break" id="png-modal-title">Снимок</h3><div class="d-flex flex-wrap gap-2 mt-2"><span id="png-counter" class="text-secondary"></span><span id="png-status" class="d-flex flex-wrap gap-2"></span></div></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button></div>
+  <div class="modal-body gallery-viewport"><div id="png-error" class="alert alert-warning d-none" role="alert">Не удалось загрузить PNG. Попробуйте открыть оригинал.</div><img id="png-full" class="gallery-full-image" alt=""></div>
+  <div class="modal-footer justify-content-between gap-2"><div class="btn-list"><button id="png-prev" type="button" class="btn btn-outline-secondary">Предыдущий</button><button id="png-next" type="button" class="btn btn-outline-secondary">Следующий</button></div><a id="png-original" class="btn btn-primary" target="_blank" rel="noopener noreferrer">Оригинал PNG</a></div>
+</div></div></div>
+<div class="modal fade" id="json-modal" tabindex="-1" aria-labelledby="json-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
+  <div class="modal-header"><h3 class="modal-title text-break" id="json-modal-title">capture-report.json</h3><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть JSON"></button></div>
+  <div class="modal-body"><div id="json-error" class="alert alert-danger d-none" role="alert"></div><pre id="json-output" class="bg-body-secondary text-body rounded p-3 json-output mb-0" aria-live="polite"></pre></div>
+  <div class="modal-footer"><a id="json-original" class="btn btn-primary" target="_blank" rel="noopener noreferrer">Оригинал JSON</a></div>
+</div></div></div>
+<script src="/vendor/js/tabler.js"></script><script src="/app.js"></script>
+</body>
+</html>

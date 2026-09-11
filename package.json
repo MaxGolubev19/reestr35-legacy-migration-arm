@@ -1,0 +1,18 @@
+{
+  "name": "reestr35-capture-arm",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Local capture queue with one app-server process per company QA pass and per-image checkpoints",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.cjs",
+    "test": "node test/run.cjs",
+    "test:backend": "node test/run.cjs backend",
+    "test:ui": "node test/run.cjs ui",
+    "test:capture": "node test/run.cjs capture",
+    "test:portability": "node test/run.cjs portability",
+    "test:cli": "node test/run.cjs cli"
+  }
+}

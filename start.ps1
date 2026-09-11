@@ -1,0 +1,39 @@
+param(
+    [ValidateRange(1, 65535)][int]$Port = 4318,
+    [ValidateRange(1, 8)][int]$Concurrency = 2,
+    [string]$DataDir = $env:ARM_DATA_DIR
+)
+$ErrorActionPreference = 'Stop'
+$runtimeRoot = Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\node'
+$runtimeNode = Join-Path $runtimeRoot 'bin\node.exe'
+$runtimeModules = Join-Path $runtimeRoot 'node_modules'
+$oldPort = $env:ARM_PORT
+$oldConcurrency = $env:ARM_CONCURRENCY
+$oldNodePath = $env:NODE_PATH
+$oldDataDir = $env:ARM_DATA_DIR
+try {
+    $env:ARM_PORT = [string]$Port
+    $env:ARM_CONCURRENCY = [string]$Concurrency
+    $selectedDataDir = if ([string]::IsNullOrWhiteSpace($DataDir)) { 'local' } else { $DataDir }
+    if (-not [IO.Path]::IsPathRooted($selectedDataDir)) { $selectedDataDir = Join-Path $PSScriptRoot $selectedDataDir }
+    $selectedDataDir = [IO.Path]::GetFullPath($selectedDataDir)
+    $env:ARM_DATA_DIR = $selectedDataDir
+    New-Item -ItemType Directory -Path $selectedDataDir -Force | Out-Null
+    $logsDir = Join-Path $selectedDataDir 'logs'
+    New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+    if ((Test-Path -LiteralPath $runtimeNode) -and (Test-Path -LiteralPath $runtimeModules)) {
+        $env:NODE_PATH = $runtimeModules
+    } else {
+        $runtimeNode = (Get-Command node -ErrorAction Stop).Source
+    }
+    & $runtimeNode -e "require.resolve('playwright'); require.resolve('sharp');"
+    if ($LASTEXITCODE -ne 0) { throw 'Нужен существующий Node с playwright и sharp. Укажите NODE_PATH; зависимости автоматически не устанавливаются.' }
+    if (-not $env:ARM_CODEX_EXE) { Get-Command codex -ErrorAction Stop | Out-Null }
+    $serverLog = Join-Path $logsDir ('server-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log')
+    & $runtimeNode (Join-Path $PSScriptRoot 'src\server.cjs') 2>&1 | Tee-Object -FilePath $serverLog
+} finally {
+    $env:ARM_PORT = $oldPort
+    $env:ARM_CONCURRENCY = $oldConcurrency
+    $env:NODE_PATH = $oldNodePath
+    $env:ARM_DATA_DIR = $oldDataDir
+}
