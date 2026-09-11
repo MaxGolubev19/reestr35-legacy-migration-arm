@@ -1,0 +1,50 @@
+name: Windows portable release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Install locked dependencies and test
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm test
+      - name: Build portable package
+        shell: pwsh
+        run: ./build/build-release.ps1 -Version ('${{ github.ref_name }}'.Substring(1))
+      - name: Extract and smoke test release artifact
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $zip = "dist/Reestr35-ARM-${{ github.ref_name }}-win-x64.zip"
+          $out = Join-Path $env:RUNNER_TEMP 'Portable ARM Кириллица'
+          Expand-Archive -LiteralPath $zip -DestinationPath $out
+          & (Join-Path $out 'runtime/node.exe') build/validate-package.cjs $out
+          & (Join-Path $out 'runtime/node.exe') build/smoke-package.cjs $out
+      - name: Publish ZIP with checksum in release notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $asset = "dist/Reestr35-ARM-${{ github.ref_name }}-win-x64.zip"
+          $checksum = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          [IO.File]::WriteAllText($notes, "Windows x64 portable package.`n`nSHA256 ($([IO.Path]::GetFileName($asset))):`n$checksum`n", [Text.UTF8Encoding]::new($false))
+          gh release create '${{ github.ref_name }}' $asset --verify-tag --title 'Reestr35 ARM ${{ github.ref_name }}' --notes (Get-Content -LiteralPath $notes -Raw) --generate-notes

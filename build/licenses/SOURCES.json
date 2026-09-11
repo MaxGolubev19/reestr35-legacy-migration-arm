@@ -1,0 +1,14 @@
+{
+  "GPL-3.0.txt": {
+    "source": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/GPL-3.0-only.txt",
+    "sha256": "fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0"
+  },
+  "LGPL-3.0.txt": {
+    "source": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/LGPL-3.0-only.txt",
+    "sha256": "996af0513df21f7496288951c41428a03c174e9e4a9d63665c57d670f845ccb1"
+  },
+  "MPL-2.0.txt": {
+    "source": "https://raw.githubusercontent.com/spdx/license-list-data/v3.27.0/text/MPL-2.0.txt",
+    "sha256": "66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172"
+  }
+}

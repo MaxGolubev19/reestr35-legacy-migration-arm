@@ -57,12 +57,14 @@
     eventSource: null,
     refreshPromise: null,
     refreshQueued: false,
+    shutdownRequested: false,
+    shutdownError: false,
     submitting: false,
     pendingActions: new Set()
   };
 
   const el = Object.fromEntries([
-    "connection-dot", "connection-label", "concurrency-value", "global-alert",
+    "connection-control", "connection-dot", "connection-label", "concurrency-value", "global-alert",
     "batch-form", "url-input", "clear-url", "url-feedback", "submit-button", "batch-result", "progress-label",
     "progress-bar", "jobs-body", "empty-detail", "concurrency-slider", "settings-error",
     "job-detail", "detail-title", "detail-url", "attempt-duration", "detail-id",
@@ -75,12 +77,15 @@
     "json-modal", "json-modal-title", "json-output", "json-error", "json-original"
   ].map((id) => [id, document.getElementById(id)]));
 
-  function setConnection(connected, message) {
+  function setConnection(connected, message, phase = connected ? "connected" : "reconnecting") {
     el["connection-label"].textContent = message;
-    el["connection-dot"].className = `status-dot ${connected ? "bg-green" : "status-dot-animated bg-red"}`;
+    const dotClass = phase === "connected" ? "bg-green" : phase === "stopping" ? "status-dot-animated bg-yellow" : phase === "disconnected" ? "bg-red" : "status-dot-animated bg-red";
+    el["connection-dot"].className = `status-dot ${dotClass}`;
+    el["connection-control"].disabled = phase !== "connected";
   }
 
   function showGlobalError(message) {
+    if (!message) state.shutdownError = false;
     el["global-alert"].textContent = message;
     el["global-alert"].classList.toggle("d-none", !message);
   }
@@ -181,7 +186,7 @@
       }
       if (!response.ok) {
         const message = data && typeof data.error === "string" ? data.error : `HTTP ${response.status}`;
-        throw new Error(message);
+        throw Object.assign(new Error(message), { status: response.status });
       }
       return data;
     } finally {
@@ -254,7 +259,7 @@
     if (job.canStop === true && TERMINAL_STATUSES.has(status)) return [actionButton(job, "stop", "Повторить остановку", "square", "yellow")];
     const mapping = {
       paused: ["resume", "Возобновить", "pause", "secondary"],
-      queued: attempt?.phase === "qa" ? ["stop", "Отменить проверку", "square", "blue"] : ["pause", "Поставить на паузу", "clock", "blue"],
+      queued: attempt?.phase === "qa" ? ["stop", "Отменить проверку", "clock", "blue"] : ["pause", "Поставить на паузу", "clock", "blue"],
       running: [job.canStop ? "stop" : null, job.canStop ? "Остановить" : "Остановка недоступна: нет работающего процесса", "running", "blue"],
       validating: [job.canStop ? "stop" : null, job.canStop ? "Остановить" : "Остановка недоступна: процесс завершён", "running", "blue"],
       stopping: [null, "Остановка уже выполняется", "square", "yellow"],
@@ -834,8 +839,10 @@
         state.refreshQueued = false;
         const data = await api("/api/state");
         renderState(data || {});
-        setConnection(true, "Подключено");
-        showGlobalError("");
+        if (!state.shutdownRequested) {
+          setConnection(true, "Подключено");
+          if (!state.shutdownError) showGlobalError("");
+        }
         await refreshSelectedLogs();
       } while (state.refreshQueued && !state.stopped);
     })();
@@ -850,19 +857,69 @@
     });
   }
 
+  function disconnected() {
+    state.stopped = true;
+    if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);
+    state.eventSource?.close();
+    setConnection(false, "Отключено", "disconnected");
+  }
+
+  async function waitForDisconnect() {
+    while (state.shutdownRequested && !state.stopped) {
+      await new Promise(resolve => window.setTimeout(resolve, 100));
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 1000);
+      try {
+        await fetch("/api/state", { headers: { Accept: "application/json" }, signal: controller.signal, cache: "no-store" });
+      } catch (error) {
+        if (error?.name === "AbortError") continue;
+        disconnected();
+        return;
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    }
+  }
+
+  async function requestShutdown() {
+    if (state.shutdownRequested || state.stopped) return;
+    state.shutdownRequested = true;
+    if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);
+    state.eventSource?.close();
+    setConnection(false, "Отключение…", "stopping");
+    showGlobalError("");
+    try {
+      await api("/api/shutdown", { method: "POST", body: "{}" });
+    } catch (error) {
+      if (!error.status) { void waitForDisconnect(); return; }
+      if (error.status === 409) { void waitForDisconnect(); return; }
+      state.shutdownRequested = false;
+      setConnection(true, "Подключено");
+      showGlobalError(`Не удалось выключить backend: ${error.message}`);
+      state.shutdownError = true;
+      connectEvents();
+      void poll();
+      return;
+    }
+    void waitForDisconnect();
+  }
+
   async function poll() {
     if (state.stopped) return;
     try {
       await refreshState();
     } catch (error) {
-      setConnection(false, "Переподключение…");
-      showGlobalError(`Сервер недоступен: ${error instanceof Error ? error.message : String(error)}`);
+      if (!state.shutdownRequested) {
+        setConnection(false, "Переподключение…");
+        showGlobalError(`Сервер недоступен: ${error instanceof Error ? error.message : String(error)}`);
+      }
     } finally {
-      if (!state.stopped) state.pollTimer = window.setTimeout(poll, POLL_INTERVAL_MS);
+      if (!state.stopped && !state.shutdownRequested) state.pollTimer = window.setTimeout(poll, POLL_INTERVAL_MS);
     }
   }
 
   el["batch-form"].addEventListener("submit", submitUrl);
+  el["connection-control"].addEventListener("click", requestShutdown);
   el["url-input"].addEventListener("input", () => {
     rowFeedback({ input: el["url-input"], feedback: el["url-feedback"] }, "", "");
     el["batch-result"].classList.add("d-none");

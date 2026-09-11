@@ -1,0 +1,32 @@
+Reestr35 ARM: sharp / libvips third-party notices
+
+This distribution includes unmodified sharp 0.35.4 and the native Windows x64
+package @img/sharp-win32-x64 0.35.4, including libvips 8.18.6 and its supporting
+libraries. These are third-party components, not original Reestr35 ARM code.
+
+sharp is Copyright 2013 Lovell Fuller and others, licensed under Apache-2.0.
+Its complete license and the native package license remain in:
+  ../node_modules/sharp/LICENSE
+  ../node_modules/@img/sharp-win32-x64/LICENSE
+Source: https://github.com/lovell/sharp/tree/v0.35.4
+
+libvips is Copyright 1991-2005 The National Gallery, Copyright 2005-2012
+The British Museum, and its respective contributors. It is licensed under
+LGPL-2.1-or-later. LGPL version 3 is included here, together with the GPL
+version 3 text that the LGPL supplements. These licenses apply to their
+respective third-party libraries; they do not change the license of the
+independent application. Library modification and reverse engineering for
+debugging such modifications are permitted as provided by those licenses.
+Source and build instructions:
+  https://github.com/libvips/libvips/tree/v8.18.6
+  https://github.com/lovell/sharp-libvips
+
+The native bundle contains additional libraries under their own licenses.
+The exact compiled component/version inventory is retained at:
+  ../node_modules/@img/sharp-win32-x64/versions.json
+The MPL-2.0 text is supplied for components using that license. Complete
+LGPL-3.0, GPL-3.0, and MPL-2.0 texts are stored beside this notice; their
+versioned source URLs and SHA256 values are recorded in SOURCES.json.
+
+No sharp, libvips or supporting-library source changes were made for this
+application. Existing license files throughout node_modules are preserved.

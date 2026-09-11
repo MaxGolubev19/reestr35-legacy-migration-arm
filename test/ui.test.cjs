@@ -10,6 +10,183 @@ const { Queue, createServer } = require('../src/server.cjs');
 const { layout, normalizeUrl } = require('../src/lib.cjs');
 const { publishLease } = require('../src/launcher.cjs');
 
+test('connected indicator sends one protected shutdown POST and reaches disconnected only after server loss', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-shutdown-ui-'));
+  let spawns = 0, shutdownCalls = 0, server;
+  const queue = new Queue({ root, autoStart: false, spawnFn() { spawns++; throw new Error('shutdown must not launch a backend'); } });
+  server = createServer(queue, { async onShutdown() {
+    shutdownCalls++;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    await queue.shutdown();
+    await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+  } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => {
+    await browser.close();
+    await queue.shutdown();
+    if (server.listening) await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const page = await browser.newPage(), posts = [], dialogs = [];
+  page.on('dialog', dialog => { dialogs.push(dialog.type()); void dialog.dismiss(); });
+  page.on('request', request => {
+    if (request.method() === 'POST') posts.push({ path: new URL(request.url()).pathname, body: request.postData(), headers: request.allHeaders() });
+  });
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  await page.goto(origin);
+  const indicator = page.locator('#connection-control');
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  assert.equal(await indicator.evaluate(node => node.tagName), 'BUTTON');
+  assert.equal(await indicator.getAttribute('type'), 'button');
+  assert.equal(await indicator.getAttribute('title'), 'Отключить');
+  assert.equal(await indicator.isEnabled(), true);
+  await indicator.click();
+  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…', 'the click changes state synchronously');
+  assert.equal(server.listening, true, 'the UI does not claim disconnection while the server is still reachable');
+  assert.equal(await indicator.isDisabled(), true, 'shutdown immediately fences repeated clicks');
+  await indicator.evaluate(node => { node.click(); node.click(); });
+  assert.equal(await page.locator('[role="menu"]').count(), 0);
+  assert.deepEqual(dialogs, [], 'shutdown has no confirmation dialog');
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Отключено');
+  assert.equal(server.listening, false, 'disconnected is shown only after the HTTP server has closed');
+  assert.equal(await page.locator('#connection-dot').evaluate(node => node.classList.contains('bg-red') && !node.classList.contains('status-dot-animated')), true);
+  assert.equal(posts.length, 1); assert.equal(posts[0].path, '/api/shutdown'); assert.equal(posts[0].body, '{}');
+  const requestHeaders = await posts[0].headers;
+  assert.match(requestHeaders['x-csrf-token'], /^[a-f0-9]{64}$/);
+  assert.equal(requestHeaders.origin, origin); assert.equal(requestHeaders['sec-fetch-site'], 'same-origin');
+  assert.deepEqual(dialogs, []); assert.equal(shutdownCalls, 1); assert.equal(spawns, 0); assert.equal(queue.jobs.length, 0);
+});
+
+test('shutdown probe timeout keeps the live server in shutting-down state', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-shutdown-slow-probe-'));
+  const queue = new Queue({ root, autoStart: false });
+  let shutdownCalls = 0, slowState = false;
+  const server = createServer(queue, { onShutdown() { shutdownCalls++; } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => {
+    await browser.close(); await queue.shutdown();
+    if (server.listening) await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const page = await browser.newPage();
+  await page.route('**/api/state', async route => {
+    if (!slowState) { await route.continue(); return; }
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    try { await route.continue(); } catch {}
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  slowState = true;
+  await page.locator('#connection-control').click();
+  await page.waitForTimeout(1400);
+  assert.equal(server.listening, true); assert.equal(shutdownCalls, 1);
+  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…');
+  assert.equal(await page.locator('#connection-control').isDisabled(), true);
+});
+
+test('an in-flight polling failure cannot claim disconnect while shutdown probes still reach the server', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-shutdown-held-poll-'));
+  const queue = new Queue({ root, autoStart: false });
+  let shutdownCalls = 0;
+  const server = createServer(queue, { onShutdown() { shutdownCalls++; } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => {
+    await browser.close(); await queue.shutdown();
+    if (server.listening) await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const page = await browser.newPage();
+  let stateRequests = 0, heldRoute, announceHeld;
+  const held = new Promise(resolve => { announceHeld = resolve; });
+  await page.route('**/api/state', async route => {
+    stateRequests++;
+    if (stateRequests === 2) { heldRoute = route; announceHeld(); return; }
+    try { await route.continue(); } catch {}
+  });
+  await page.route('**/api/shutdown', route => route.abort('connectionrefused'));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  await page.goto(origin);
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  await held;
+  await page.locator('#connection-control').click();
+  while (stateRequests < 3) await page.waitForTimeout(25);
+  assert.equal((await fetch(origin + '/api/state')).status, 200, 'a fresh state request proves the server is still live');
+  await heldRoute.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"held poll failed"}' });
+  await page.waitForTimeout(250);
+  assert.equal(server.listening, true);
+  assert.equal(shutdownCalls, 0, 'the simulated network failure never reaches the shutdown endpoint');
+  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…');
+  assert.equal(await page.locator('#connection-control').isDisabled(), true);
+  await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Отключено');
+  assert.equal(server.listening, false);
+});
+
+test('shutdown HTTP refusal restores SSE and polling while preserving the error', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-shutdown-refusal-'));
+  const queue = new Queue({ root, autoStart: false });
+  const server = createServer(queue, { onShutdown() { throw new Error('refused request must not start shutdown'); } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => {
+    await browser.close(); await queue.shutdown();
+    if (server.listening) await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const page = await browser.newPage(); let eventRequests = 0, stateRequests = 0;
+  page.on('request', request => {
+    const pathname = new URL(request.url()).pathname;
+    if (pathname === '/api/events') eventRequests++;
+    if (pathname === '/api/state') stateRequests++;
+  });
+  await page.route('**/api/shutdown', route => route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"fixture denied"}' }));
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  const beforeStates = stateRequests;
+  await page.locator('#connection-control').click();
+  await page.waitForFunction(() => document.querySelector('#global-alert').textContent.includes('fixture denied'));
+  await page.waitForTimeout(250);
+  assert.equal(await page.locator('#connection-label').innerText(), 'Подключено');
+  assert.equal(await page.locator('#connection-control').isEnabled(), true);
+  assert.match(await page.locator('#global-alert').innerText(), /Не удалось выключить backend: fixture denied/);
+  assert.ok(eventRequests >= 2, 'EventSource reconnects after the rejected POST');
+  assert.ok(stateRequests > beforeStates, 'polling resumes after the rejected POST');
+});
+
+test('shutdown 409 keeps the click fenced and waits for the in-progress server shutdown', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-shutdown-conflict-'));
+  const queue = new Queue({ root, autoStart: false });
+  let shutdownCalls = 0, server;
+  server = createServer(queue, { async onShutdown() {
+    shutdownCalls++; await new Promise(resolve => setTimeout(resolve, 500)); await queue.shutdown();
+    await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
+  } });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => {
+    await browser.close(); await queue.shutdown();
+    if (server.listening) await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); });
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const page = await browser.newPage(), origin = `http://127.0.0.1:${server.address().port}`;
+  await page.goto(origin);
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  const snapshot = await (await fetch(origin + '/api/state')).json();
+  const primed = await fetch(origin + '/api/shutdown', { method: 'POST', headers: {
+    'Content-Type': 'application/json', 'x-csrf-token': snapshot.csrfToken, Origin: origin, 'sec-fetch-site': 'same-origin'
+  }, body: '{}' });
+  assert.equal(primed.status, 200);
+  await page.locator('#connection-control').click();
+  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…');
+  assert.equal(await page.locator('#connection-control').isDisabled(), true);
+  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Отключено');
+  assert.equal(shutdownCalls, 1); assert.equal(server.listening, false);
+  assert.equal(await page.locator('#global-alert').isVisible(), false);
+});
+
 test('empty detail renders the bundled astronaut responsively without changing its copy', { timeout: 30000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-empty-detail-'));
   const queue = new Queue({ root, autoStart: false, spawnFn() { throw new Error('empty detail test must not spawn agents'); } });
@@ -54,8 +231,10 @@ test('terminal idle result retains an effective retry-stop action through the pr
   queue.add('https://idle-stop.reestr35.ru/'); queue.pump();
   const job = queue.jobs[0], attempt = job.attempts[0], loc = layout(root, job, attempt);
   fs.mkdirSync(loc.hostDir, { recursive: true });
-  fs.writeFileSync(path.join(loc.hostDir, '00.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9WQAAAAASUVORK5CYII=', 'base64'));
-  fs.writeFileSync(loc.report, JSON.stringify({ url: job.url, finalUrl: job.url, status: 'complete', errors: [], finished: '2026-09-10T10:00:00Z', segments: [{ file: '00.png', status: 'ok' }] }));
+  fs.writeFileSync(path.join(loc.hostDir, '00_страница.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9WQAAAAASUVORK5CYII=', 'base64'));
+  fs.writeFileSync(loc.report, JSON.stringify({ url: job.url, finalUrl: job.url, status: 'complete', errors: [], finished: '2026-09-10T10:00:00Z',
+    model: { layout: 'plain', root: null, groups: [] },
+    segments: [{ file: '00_страница.png', status: 'ok', spec: { kind: 'page' }, chain: [], box: { x: 0, y: 0, width: 1, height: 1 }, png: { width: 1, height: 1, strips: 1 } }] }));
   attempt.qaAutoRetries = 3; // After the automatic budget, the UI must offer manual continuation.
   queue.snapshot(''); timestamp = 101; await queue.tick(job, attempt, child);
   assert.equal(attempt.status, 'needs_review'); assert.equal(queue.active.size, 1);
@@ -257,7 +436,7 @@ test('queue icons expose every action, preserve selection, handle races and show
     ['retry', 'alert', 'red', 'Повторить'], ['retry', 'alert', 'red', 'Повторить'],
     ['retry', 'alert', 'red', 'Повторить'], ['retry', 'square', 'secondary', 'Повторить'],
     ['', 'running', 'blue', 'Остановка недоступна'], ['stop', 'running', 'blue', 'Остановить'], ['pause', 'clock', 'blue', 'Поставить на паузу'],
-    ['stop', 'square', 'blue', 'Отменить проверку']
+    ['stop', 'clock', 'blue', 'Отменить проверку']
   ];
   for (let i = 0; i < expected.length; i++) {
     const [operation, icon, color, label] = expected[i], button = action(i);

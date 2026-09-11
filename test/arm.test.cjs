@@ -7,7 +7,7 @@ const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
 const { spawn } = require('node:child_process');
-const { Queue, createServer } = require('../src/server.cjs');
+const { Queue, createServer, acquireLock, createShutdownController } = require('../src/server.cjs');
 const { normalizeUrl, layout, buildArgs, buildPrompt, validateResult, stopTree, safeFile } = require('../src/lib.cjs');
 const { publishLease } = require('../src/launcher.cjs');
 
@@ -41,7 +41,7 @@ function fixture(root, job, attempt, options = {}) {
   fs.mkdirSync(locations.hostDir, { recursive: true });
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9WQAAAAASUVORK5CYII=', 'base64');
   fs.writeFileSync(path.join(locations.hostDir, '00_страница.png'), options.badPng ? 'bad png' : png);
-  const report = { url: job.url, finalUrl: job.url, status: 'complete', segments: [{ file: '00_страница.png', status: 'ok' }], errors: [], ...options.report };
+  const report = { url: job.url, finalUrl: job.url, status: 'complete', segments: [{ file: '00_страница.png', status: 'ok', box: { width: 1, height: 1 }, png: { width: 1, height: 1 } }], errors: [], ...options.report };
   fs.writeFileSync(locations.report, JSON.stringify(report));
   fs.writeFileSync(locations.final, JSON.stringify({ reportStatus: 'complete', inspectedPngs: ['00_страница.png'], issues: [], summary: 'Осмотрено', ...options.final }));
 }
@@ -182,6 +182,89 @@ test('API origin/CSRF protection, allowlisted files, logs and forbidden fields',
   assert.equal((await fetch(base + `/api/logs/${job.id}/1?stream=other`)).status, 400);
   fs.writeFileSync(path.join(layout(root, job, attempt).dir, 'stderr.log'), 'x'.repeat(140 * 1024));
   const log = await (await fetch(base + `/api/logs/${job.id}/1?stream=stderr`)).json(); assert.equal(log.truncated, true); assert.equal(log.text.length, 128 * 1024);
+});
+
+test('shutdown API is exact, protected, one-shot, and flushes success before teardown callback', async t => {
+  const { queue } = setup(t), events = [];
+  const server = createServer(queue, { onShutdown: () => { events.push('callback'); } });
+  server.prependListener('request', (request, response) => {
+    if (request.url === '/api/shutdown') response.once('finish', () => { if (response.statusCode === 200) events.push('finish'); });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const state = await (await fetch(base + '/api/state')).json();
+  const headers = { 'Content-Type': 'application/json', 'x-csrf-token': state.csrfToken };
+  const trustedHeaders = { ...headers, Origin: base, 'sec-fetch-site': 'same-origin' };
+  const post = (data, extra = {}) => fetch(base + '/api/shutdown', { method: 'POST', headers: { ...trustedHeaders, ...extra }, body: JSON.stringify(data) });
+  assert.equal((await fetch(base + '/api/shutdown', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
+  assert.equal((await fetch(base + '/api/shutdown', { method: 'POST', headers, body: '{}' })).status, 403, 'Origin and sec-fetch-site are mandatory');
+  assert.equal((await fetch(base + '/api/shutdown', { method: 'POST', headers: { ...headers, Origin: base }, body: '{}' })).status, 403, 'sec-fetch-site is mandatory');
+  assert.equal((await fetch(base + '/api/shutdown', { method: 'POST', headers: { ...headers, 'sec-fetch-site': 'same-origin' }, body: '{}' })).status, 403, 'Origin is mandatory');
+  assert.equal((await post({}, { Origin: 'https://evil.test' })).status, 403);
+  for (const site of ['cross-site', 'same-site', 'none', '']) assert.equal((await post({}, { 'sec-fetch-site': site })).status, 403);
+  const badHostStatus = await new Promise((resolve, reject) => {
+    const request = require('node:http').request(base + '/api/shutdown', { method: 'POST', headers: { ...trustedHeaders, Host: 'evil.test' } }, response => { response.resume(); resolve(response.statusCode); });
+    request.on('error', reject); request.end('{}');
+  });
+  assert.equal(badHostStatus, 403);
+  for (const data of [null, [], false, '', { force: true }]) assert.equal((await post(data)).status, 400, JSON.stringify(data));
+  const response = await post({});
+  assert.equal(response.status, 200); assert.deepEqual(await response.json(), { ok: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(events, ['finish', 'callback'], 'teardown begins only after the complete 200 response');
+  assert.equal((await post({})).status, 409);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(events, ['finish', 'callback'], 'later requests cannot launch teardown again');
+});
+
+test('shutdown controller preserves Queue.shutdown, releases lock, then closes HTTP once without process exit', async t => {
+  const events = [], { root, queue, children } = setup(t, { stopFn: async child => {
+    events.push('capture.stop'); child.finish(0); return { treeStopped: true };
+  } });
+  queue.add('https://queued.reestr35.ru/'); queue.pump();
+  assert.equal(queue.active.size, 1); assert.equal(children.length, 1);
+  let qaShutdowns = 0;
+  queue.qaServers.add({ async shutdown() { qaShutdowns++; events.push('qa.shutdown'); } });
+  const lockFile = path.join(root, 'server.lock'), release = acquireLock(root);
+  const originalShutdown = queue.shutdown.bind(queue);
+  queue.shutdown = async () => { events.push('queue.shutdown'); await originalShutdown(); };
+  const server = {
+    listening: true,
+    close(callback) { events.push('server.close'); this.listening = false; setImmediate(() => { events.push('server.closed'); callback(); }); },
+    closeAllConnections() { events.push('connections.closed'); }
+  };
+  const stop = createShutdownController({
+    queue, server,
+    unlock() { assert.equal(fs.existsSync(lockFile), true); release(); events.push('lock.released'); },
+    exitFn(code) { events.push(`exit:${code}`); }
+  });
+  const first = stop(), second = stop();
+  assert.equal(first, second, 'all shutdown triggers share one lifecycle');
+  assert.equal(await first, 0);
+  assert.deepEqual(events, ['queue.shutdown', 'capture.stop', 'qa.shutdown', 'lock.released', 'server.close', 'connections.closed', 'server.closed', 'exit:0']);
+  assert.equal(qaShutdowns, 1); assert.equal(queue.active.size, 0);
+  assert.equal(fs.existsSync(lockFile), false);
+  assert.equal(queue.closing, true);
+  const recovered = new Queue({ root, autoStart: false });
+  t.after(() => recovered.shutdown());
+  assert.equal(recovered.jobs.length, 1); assert.equal(recovered.jobs[0].url, 'https://queued.reestr35.ru/');
+  assert.equal(recovered.jobs[0].attempts[0].status, 'cancelled');
+});
+
+test('shutdown controller bounds a stuck Queue.shutdown before releasing lock and HTTP server', async t => {
+  const root = temp(t), lockFile = path.join(root, 'server.lock'), release = acquireLock(root), events = [];
+  const queue = { active: new Map(), shutdown() { events.push('queue.shutdown'); return new Promise(() => {}); } };
+  const server = {
+    listening: true,
+    close(callback) { events.push('server.close'); this.listening = false; setImmediate(callback); },
+    closeAllConnections() { events.push('connections.closed'); }
+  };
+  const stop = createShutdownController({ queue, server, timeoutMs: 20,
+    unlock() { release(); events.push('lock.released'); }, exitFn(code) { events.push(`exit:${code}`); } });
+  assert.equal(await stop(), 1);
+  assert.equal(fs.existsSync(lockFile), false);
+  assert.deepEqual(events, ['queue.shutdown', 'lock.released', 'server.close', 'connections.closed', 'exit:1']);
 });
 
 test('pause/resume preserves an unstarted attempt, survives restart and resumes at the FIFO tail', async t => {

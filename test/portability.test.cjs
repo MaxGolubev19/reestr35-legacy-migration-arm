@@ -23,7 +23,7 @@ test('data root is anchored to the application and supports an optional override
 test('start.ps1 creates logs under relative and absolute data roots from a foreign cwd', t => {
   const sandbox = fs.mkdtempSync(path.join(testTempRoot(), 'portable-start-'));
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
-  const app = path.join(sandbox, 'app'), foreign = path.join(sandbox, 'foreign');
+  const app = path.join(sandbox, 'Приложение ARM'), foreign = path.join(sandbox, 'Рабочий каталог');
   fs.mkdirSync(path.join(app, 'src'), { recursive: true });
   fs.mkdirSync(foreign);
   fs.copyFileSync(path.join(__dirname, '..', 'start.ps1'), path.join(app, 'start.ps1'));
@@ -55,8 +55,7 @@ test('standalone application starts clean and captures with its bundled helper f
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));
   const app = path.join(sandbox, 'app'), foreign = path.join(sandbox, 'foreign');
   fs.mkdirSync(app); fs.mkdirSync(foreign);
-  for (const name of fs.readdirSync(path.join(__dirname, '..'))) {
-    if (name === 'local' || name === 'test' || name === '.git') continue;
+  for (const name of ['src', 'public', 'start.ps1']) {
     fs.cpSync(path.join(__dirname, '..', name), path.join(app, name), { recursive: true });
   }
   assert.equal(fs.existsSync(path.join(app, 'local')), false);
@@ -84,6 +83,21 @@ test('standalone application starts clean and captures with its bundled helper f
     assert.equal(state.status, 'failed');
   }
   assert.deepEqual(fs.readdirSync(foreign), []);
+});
+
+test('explicit packaged runtime wins over developer modules and Codex cache', t => {
+  const { resolveRuntime } = require('../src/lib.cjs');
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'runtime-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'node.exe'), 'fixture'); fs.mkdirSync(path.join(root, 'node_modules'));
+  const previous = process.env.ARM_RUNTIME_DIR;
+  try {
+    process.env.ARM_RUNTIME_DIR = root;
+    const runtime = resolveRuntime();
+    assert.equal(runtime.node, path.join(root, 'node.exe')); assert.equal(runtime.modules, path.join(root, 'node_modules'));
+    process.env.ARM_RUNTIME_DIR = path.join(root, 'missing');
+    assert.throws(resolveRuntime, /Invalid ARM_RUNTIME_DIR/);
+  } finally { if (previous === undefined) delete process.env.ARM_RUNTIME_DIR; else process.env.ARM_RUNTIME_DIR = previous; }
 });
 
 test('lock acquisition creates a missing data directory and rejects a live owner', t => {

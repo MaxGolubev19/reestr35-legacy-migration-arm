@@ -1,1 +1,6 @@
 /local/
+/node_modules/
+/dist/
+/build/launcher/*.syso
+/build/launcher/winres/icon*.png
+/build/launcher/winres/icon.ico

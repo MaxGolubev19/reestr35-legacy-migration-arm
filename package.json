@@ -4,7 +4,11 @@
   "private": true,
   "description": "Local capture queue with one app-server process per company QA pass and per-image checkpoints",
   "engines": {
-    "node": ">=20"
+    "node": ">=24.21.0"
+  },
+  "dependencies": {
+    "playwright": "1.62.1",
+    "sharp": "0.35.4"
   },
   "scripts": {
     "start": "node src/server.cjs",

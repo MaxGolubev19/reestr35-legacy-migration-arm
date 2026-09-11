@@ -5,7 +5,7 @@ const http = require('node:http');
 const crypto = require('node:crypto');
 const { APP_ROOT, dataRoot, dataSubdir } = require('./data-dir.cjs');
 const { ACTIVE, TERMINAL, normalizeUrl, safeFile, layout, resolveRuntime, inspectArtifacts, stopTree } = require('./lib.cjs');
-const { atomicJson, paths, sealedManifest, checkManifest, effectiveManifest, stageBatch, loadQa, reviews, counts, nextReview, validateReview, buildQaPrompt } = require('./qa.cjs');
+const { atomicJson, paths, sealedManifest, checkManifest, effectiveManifest, stageBatch, loadQa, reviews, counts, nextReview, validateReview, buildQaPrompt, isCurrentPolicy } = require('./qa.cjs');
 const { AppServer } = require('./app-server.cjs');
 const { readLaunch, readLease, publishLease, recoverLease, launchWorker } = require('./launcher.cjs');
 const pidAlive = pid => { if (!Number.isInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
@@ -65,6 +65,7 @@ class Queue {
         if (attempt.workflow === 2) {
           try {
             this.refreshArtifacts(job, attempt);
+            if (attempt.captureSealed && ['complete', 'needs_review', 'incomplete'].includes(attempt.status)) attempt.status = this.outcome(job, attempt);
             if (attempt.status === 'interrupted' || (attempt.status === 'queued' && attempt.phase === 'capture' && attempt.captureStarted)) {
               attempt.status = attempt.captureSealed ? this.outcome(job, attempt) : 'incomplete';
               attempt.error = 'Backend перезапущен; принятые QA checkpoints сохранены. Продолжение требует завершённого launch lease; отсутствие PID само по себе не доказывает завершение.';
@@ -225,12 +226,14 @@ class Queue {
       attempt.issues = [...(artifacts.issues || []), ...(artifacts.error ? [artifacts.error] : [])];
       return artifacts.report || attempt.exitCode === 2 ? 'incomplete' : 'failed';
     }
-    try { checkManifest(this.root, job, attempt, qa.manifest); delete attempt.manifestError; }
+    let evidence;
+    try { evidence = checkManifest(this.root, job, attempt, qa.manifest); delete attempt.manifestError; }
     catch (error) { attempt.manifestError = error.message; attempt.issues = [error.message]; return 'incomplete'; }
     attempt.qa = counts(qa.manifest, qa.progress);
     const effective = effectiveManifest(qa.manifest);
-    attempt.issues = [...effective.summary.issues, ...[...reviews(qa.progress).values()].flatMap(file => file.issues.map(issue => `${file.name}: ${issue}`))];
-    if (!effective.technicalComplete || attempt.qa.issues) return 'incomplete';
+    attempt.coverage = evidence.coverage;
+    attempt.issues = [...new Set([...effective.summary.issues, ...evidence.issues, ...evidence.coverage.issues]), ...[...reviews(qa.progress).values()].flatMap(file => file.issues.map(issue => `${file.name}: ${issue}`))];
+    if (!effective.technicalComplete || !evidence.technicalComplete || !evidence.coverage.valid || attempt.qa.issues) return 'incomplete';
     return attempt.qa.unreviewed ? 'needs_review' : 'complete';
   }
   canContinueQa(job) {
@@ -376,10 +379,10 @@ class Queue {
     const p = paths(this.root, job, attempt), qa = this.qaState(job, attempt);
     let session, qaDir, launch, appServer;
     try {
-      checkManifest(this.root, job, attempt, qa.manifest);
+      const evidence = checkManifest(this.root, job, attempt, qa.manifest);
       session = nextReview(qa.manifest, qa.progress);
       if (!session) { attempt.status = this.outcome(job, attempt); this.save(); return; }
-      const progress = { ...qa.progress, generation: session.generation };
+      const progress = { ...qa.progress, generation: session.generation, policy: session.policy };
       atomicJson(p.progress, progress); qa.progress = progress;
       qaDir = stageBatch(p.hostDir, session, this.root);
       const previous = readLaunch(p.dir);
@@ -389,7 +392,7 @@ class Queue {
       attempt.launch = launch; delete attempt.pid; delete attempt.orphanPid; delete attempt.qaIdentity;
       Object.assign(attempt, { status: 'running', lastMeaningfulAt: this.clock() }); delete attempt.finishedAt;
       this.save();
-      const prompt = buildQaPrompt(qa.manifest, session);
+      const prompt = buildQaPrompt(qa.manifest, session, evidence);
       fs.writeFileSync(path.join(p.dir, `qa-${session.generation}-prompt.txt`), prompt);
       let identity = {}, child;
       appServer = this.appServerFactory(); this.qaServers.add(appServer);
@@ -402,12 +405,12 @@ class Queue {
         },
         onReview: (review, incoming) => {
           if (this.active.get(job.id) !== child || last(job) !== attempt || !this.ownsLaunch(job, attempt, launch) || attempt.status !== 'running' || attempt.cancellationRequested || attempt.timeoutReason ||
-              incoming.generation !== session.generation || incoming.generation !== qa.progress.generation || incoming.threadId !== identity.threadId || incoming.turnId !== identity.turnId || !identity.threadId || !identity.turnId) throw new Error('Stale generation/thread/turn');
+              incoming.generation !== session.generation || incoming.generation !== qa.progress.generation || !isCurrentPolicy(session.policy) || !isCurrentPolicy(qa.progress.policy) || incoming.threadId !== identity.threadId || incoming.turnId !== identity.turnId || !identity.threadId || !identity.turnId) throw new Error('Stale generation/thread/turn/policy');
           checkManifest(this.root, job, attempt, qa.manifest);
           validateReview(review);
           const accepted = reviews(qa.progress), expected = session.files.find(file => !accepted.has(file.name));
           if (!expected || expected.name !== review.name || expected.sha256 !== review.sha256 || accepted.has(review.name)) throw new Error('record_review outside manifest/order or duplicate/hash mismatch');
-          const checkpoint = { generation: session.generation, manifestHash: qa.manifest.hash, threadId: identity.threadId, turnId: identity.turnId,
+          const checkpoint = { generation: session.generation, policy: session.policy, manifestHash: qa.manifest.hash, threadId: identity.threadId, turnId: identity.turnId,
             review: JSON.parse(JSON.stringify(review)), acceptedAt: now() };
           const updated = { ...qa.progress, checkpoints: [...qa.progress.checkpoints, checkpoint] };
           // Commit before acknowledging the tool; state is a recoverable projection.
@@ -519,8 +522,9 @@ async function body(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-function createServer(queue) {
+function createServer(queue, { onShutdown = async () => {} } = {}) {
   const csrfToken = crypto.randomBytes(32).toString('hex');
+  let shutdownRequested = false;
   const assets = new Map([
     ['/', ['index.html', 'text/html; charset=utf-8']], ['/app.js', ['app.js', 'text/javascript; charset=utf-8']], ['/app.css', ['app.css', 'text/css; charset=utf-8']],
     ['/vendor/css/tabler.css', ['vendor/css/tabler.css', 'text/css; charset=utf-8']], ['/vendor/js/tabler.js', ['vendor/js/tabler.js', 'text/javascript; charset=utf-8']],
@@ -537,7 +541,21 @@ function createServer(queue) {
       const url = new URL(req.url, `http://${host}`);
       if (req.method === 'POST') {
         if (req.headers['x-csrf-token'] !== csrfToken) return json(res, 403, { error: 'Неверный CSRF token; обновите страницу' });
+        if (url.pathname === '/api/shutdown' && (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin')) {
+          return json(res, 403, { error: 'Отключение разрешено только из локального интерфейса' });
+        }
         const data = await body(req);
+        if (url.pathname === '/api/shutdown') {
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length) throw new Error('Этот запрос принимает только пустой JSON-объект');
+          if (shutdownRequested) throw conflict('Отключение уже выполняется');
+          shutdownRequested = true;
+          // Do not begin teardown until Node has completely flushed the success
+          // response. The next turn also lets the client consume the final bytes.
+          res.once('finish', () => setImmediate(() => {
+            Promise.resolve().then(onShutdown).catch(error => console.error('Shutdown:', error.message));
+          }));
+          return json(res, 200, { ok: true });
+        }
         if (url.pathname === '/api/settings') {
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length !== 1 || !Object.hasOwn(data, 'concurrency')) throw new Error('Разрешено только поле concurrency');
           return json(res, 200, queue.setConcurrency(data.concurrency));
@@ -553,6 +571,7 @@ function createServer(queue) {
         }
       }
       if (req.method !== 'GET') return json(res, 405, { error: 'Метод не поддерживается' });
+      if (url.pathname === '/api/health') return json(res, 200, { app: 'Reestr35 ARM', version: '3.0.0', instance: process.env.ARM_INSTANCE_ID || '', pid: process.pid });
       if (url.pathname === '/api/events') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
         res.write(': connected\n\n');
@@ -605,6 +624,46 @@ function createServer(queue) {
   return server;
 }
 
+function createShutdownController({ queue, server, unlock, exitFn = code => process.exit(code),
+  waitFn = ms => new Promise(resolve => setTimeout(resolve, ms)), clock = Date.now, timeoutMs = 5000,
+  setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+  let shutdownPromise;
+  return (requestedCode = 0) => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      let exitCode = requestedCode;
+      try {
+        let shutdownTimer;
+        try {
+          await Promise.race([
+            queue.shutdown(),
+            new Promise((_, reject) => {
+              shutdownTimer = setTimeoutFn(() => reject(new Error(`Queue.shutdown превысил ${timeoutMs} ms`)), timeoutMs);
+            })
+          ]);
+        } finally { clearTimeoutFn(shutdownTimer); }
+        const deadline = clock() + timeoutMs;
+        while (queue.active.size && clock() < deadline) await waitFn(100);
+        if (queue.active.size) exitCode = 1;
+      } catch (error) { console.error('Queue shutdown:', error.message); exitCode = 1; }
+      try { unlock(); } catch (error) { console.error('Unlock:', error.message); exitCode = 1; }
+      try {
+        if (server.listening) {
+          await new Promise((resolve, reject) => {
+            server.close(error => error ? reject(error) : resolve());
+            // EventSource is intentionally long-lived; after queue teardown and
+            // lock release, close it and every remaining local HTTP connection.
+            server.closeAllConnections?.();
+          });
+        }
+      } catch (error) { console.error('HTTP shutdown:', error.message); exitCode = 1; }
+      exitFn(exitCode);
+      return exitCode;
+    })();
+    return shutdownPromise;
+  };
+}
+
 function acquireLock(root) {
   fs.mkdirSync(root, { recursive: true });
   const lock = path.join(root, 'server.lock');
@@ -630,21 +689,15 @@ if (require.main === module) {
     const port = Number(process.env.ARM_PORT || 4318);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('ARM_PORT должен быть 1–65535');
     const queue = new Queue({ root, concurrency: Number(process.env.ARM_CONCURRENCY || 2), codex: process.env.ARM_CODEX_EXE || 'codex', autoStart: false });
-    const server = createServer(queue);
-    server.on('error', error => { console.error(error.message); queue.shutdown().finally(() => { unlock(); process.exit(1); }); });
+    let stop;
+    const server = createServer(queue, { onShutdown: () => stop() });
+    stop = createShutdownController({ queue, server, unlock });
+    server.on('error', error => { console.error(error.message); void stop(1); });
     server.listen(port, '127.0.0.1', () => {
       console.log(`АРМ: http://127.0.0.1:${port} (параллельность ${queue.concurrency})`);
       queue.autoStart = true; queue.pump();
     });
-    let stopping = false;
-    const stop = async () => {
-      if (stopping) return; stopping = true;
-      server.close(); await queue.shutdown();
-      const deadline = Date.now() + 5000;
-      while (queue.active.size && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
-      unlock(); process.exit(queue.active.size ? 1 : 0);
-    };
-    process.on('SIGINT', stop); process.on('SIGTERM', stop); process.on('exit', unlock);
+    process.on('SIGINT', () => { void stop(); }); process.on('SIGTERM', () => { void stop(); }); process.on('exit', unlock);
   } catch (error) { console.error(error.message); if (unlock) unlock(); process.exitCode = 1; }
 }
-module.exports = { Queue, createServer, acquireLock };
+module.exports = { Queue, createServer, acquireLock, createShutdownController };

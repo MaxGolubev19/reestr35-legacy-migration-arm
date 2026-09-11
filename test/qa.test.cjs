@@ -10,8 +10,8 @@ const { Writable } = require('node:stream');
 const { spawn } = require('node:child_process');
 const { AppServer } = require('../src/app-server.cjs');
 const { Queue, createServer } = require('../src/server.cjs');
-const { layout } = require('../src/lib.cjs');
-const { atomicJson, paths, loadQa } = require('../src/qa.cjs');
+const { layout, captureInventory, captureCoverage, inspectArtifacts } = require('../src/lib.cjs');
+const { atomicJson, paths, loadQa, hash, QA_POLICY, counts, checkManifest } = require('../src/qa.cjs');
 const { publishLease, readLaunch, readLease, recoverLease, launchWorker } = require('../src/launcher.cjs');
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9WQAAAAASUVORK5CYII=', 'base64');
 function setup(t, options = {}) {
@@ -41,9 +41,18 @@ function setup(t, options = {}) {
 function capture(ctx, count, finished = true, status = 'complete', job = ctx.queue.jobs[0]) {
   const attempt = job.attempts[0], p = layout(ctx.root, job, attempt);
   fs.mkdirSync(p.hostDir, { recursive: true });
-  const segments = Array.from({ length: count }, (_, i) => ({ file: `${String(i).padStart(2, '0')}_tab.png`, status: 'ok', resources: { giantPayload: 'NOT_IN_QA_PROMPT'.repeat(1000) } }));
+  const first = [{ group: 0, index: 0 }];
+  const model = count === 1 ? { layout: 'plain', root: null, groups: [] } : { layout: 'tabs', root: 0, groups: [{ id: 0, labels: Array(count - 1).fill('tab'), children: Array.from({ length: count - 1 }, () => []), items: Array.from({ length: count - 1 }, () => ({ mode: 'pane', empty: false })) }] };
+  const segments = Array.from({ length: count }, (_, i) => ({
+    file: count === 1 ? '00_страница.png' : i === 0 ? '00_header.png' : `${String(i).padStart(2, '0')}_tab.png`,
+    spec: count === 1 ? { kind: 'page' } : i === 0 ? { kind: 'header' } : { kind: 'tab', group: 0, index: i - 1 },
+    chain: count === 1 ? [] : i === 0 ? first : [{ group: 0, index: i - 1 }],
+    box: { x: 0, y: i, width: 1, height: 1 }, png: { width: 1, height: 1, strips: 1 },
+    status: 'ok', resources: { giantPayload: 'NOT_IN_QA_PROMPT'.repeat(1000) },
+  }));
   for (const segment of segments) fs.writeFileSync(path.join(p.hostDir, segment.file), PNG);
-  atomicJson(p.report, { url: job.url, finalUrl: job.url, status, errors: [], segments, ...(finished ? { finished: '2026-09-10T10:00:00Z' } : {}) });
+  if (count > 1) segments.push({ spec: { kind: 'footer' }, chain: first, status: 'absent', absent: true, meaningful: 0 });
+  atomicJson(p.report, { url: job.url, finalUrl: job.url, model, status, errors: [], segments, ...(finished ? { finished: '2026-09-10T10:00:00Z' } : {}) });
   return { job, attempt, p };
 }
 function start(t, count = 11, options = {}) { const ctx = setup(t, options); ctx.queue.add('https://a.reestr35.ru'); ctx.queue.pump(); Object.assign(ctx, capture(ctx, count)); return ctx; }
@@ -331,10 +340,11 @@ test('SSE review subscription disconnects cleanly; polling state remains indepen
   assert.equal(ctx.queue.reviewListeners.size, 0);
   assert.equal((await fetch(base + '/api/state')).status, 200, 'polling fallback does not depend on SSE');
 });
-test('legacy accepted batch checkpoint remains readable; new turn gets only remainder', t => {
+test('legacy accepted batch checkpoint remains history; current policy starts all images', t => {
   const ctx = start(t, 6), child = qa(ctx); child.finish(1); const state = ctx.queue.qaState(ctx.job, ctx.attempt), files = state.manifest.files.slice(0, 5), batch = { batchId: crypto.randomUUID(), generation: 1, manifestHash: state.manifest.hash, files };
   atomicJson(paths(ctx.root, ctx.job, ctx.attempt).progress, { version: 2, generation: 1, manifestHash: state.manifest.hash, checkpoints: [{ batch, result: { ...batch, files: files.map(f => ({ name: f.name, sha256: f.sha256, status: 'passed', issues: [] })), summary: 'old' } }] });
-  const resumed = setup(t, { root: ctx.root }); resumed.queue['continue-qa'](ctx.job.id); resumed.queue.pump(); const next = resumed.sessions[0]; next.bind(); assert.equal(next.config.files[0].name, '05_tab.png'); pass(next); next.finish(); assert.equal(resumed.queue.jobs[0].attempts[0].status, 'complete');
+  const resumed = setup(t, { root: ctx.root }); resumed.queue['continue-qa'](ctx.job.id); resumed.queue.pump(); const next = resumed.sessions[0]; next.bind(); assert.equal(next.config.files[0].name, '00_header.png'); assert.equal(next.config.files.length, 6); pass(next); next.finish(); assert.equal(resumed.queue.jobs[0].attempts[0].status, 'complete');
+  const restored = loadQa(ctx.root, ctx.job, ctx.attempt); assert.equal(restored.progress.checkpoints.length, 7); assert.equal(counts(restored.manifest, restored.progress).historicalReviews, 5);
 });
 test('trusted capture launcher identity and completion; recovery never trusts heartbeat alone', async t => {
   const ctx = setup(t), dir = ctx.root, launch = { token: crypto.randomUUID(), generation: 1, phase: 'capture', status: 'launch-pending', leaseProtocol: 2, createdAtMs: 0 }, descriptor = path.join(dir, `launch-${launch.token}.json`);
@@ -349,4 +359,352 @@ test('capture recovery exclusive claim, foreign/corrupt lease and both PID guard
     if (kind === 'foreign') atomicJson(path.join(dir, `launch-${launch.token}-lease.json`), { token: 'foreign', generation: 1, status: 'finished' }); if (kind === 'corrupt') fs.writeFileSync(path.join(dir, `launch-${launch.token}-lease.json`), '{');
     const recover = () => recoverLease(dir, launch, { timestamp: 10000, graceMs: 5000, isPidAlive: pid => kind === 'live' || (kind === 'one-live' && pid === 2) }); if (['foreign', 'corrupt'].includes(kind)) assert.throws(recover); else assert.equal(recover(), ['missing', 'dead'].includes(kind));
   }
+});
+
+function nestedReport() {
+  const pane = () => ({ mode: 'pane', empty: false });
+  const root = [{ group: 0, index: 0 }], child = [...root, { group: 1, index: 0 }], leaf = [...child, { group: 2, index: 0 }];
+  const saved = (file, spec, chain, extra = {}) => ({ file, spec, chain, status: 'ok', box: { x: 1, y: 1, width: 1, height: 1 }, png: { width: 1, height: 1, strips: 1 }, ...extra });
+  return { model: { layout: 'tabs', root: 0, groups: [
+    { id: 0, labels: ['Parent', 'Empty'], children: [[1], []], items: [pane(), { mode: 'empty', empty: true }] },
+    { id: 1, labels: ['Child'], children: [[2]], items: [pane()] },
+    { id: 2, labels: ['Leaf'], children: [[]], items: [pane()] },
+  ] }, errors: [], segments: [
+    saved('00_header.png', { kind: 'header' }, root),
+    saved('01_parent.png', { kind: 'tab', group: 0, index: 0 }, root),
+    saved('01.01_parent__child.png', { kind: 'tab', group: 1, index: 0 }, child),
+    saved('01.01.01_parent__child__leaf.png', { kind: 'tab', group: 2, index: 0 }, leaf),
+    { spec: { kind: 'tail', group: 1, index: 0 }, chain: child, status: 'absent', absent: true, meaningful: 0 },
+    saved('01_parent__продолжение.png', { kind: 'tail', group: 0, index: 0 }, root),
+    saved('02_empty.png', { kind: 'tab', group: 0, index: 1 }, [{ group: 0, index: 1 }], { empty: true }),
+    { spec: { kind: 'footer' }, chain: root, status: 'absent', absent: true, meaningful: 0 },
+  ] };
+}
+const reportFiles = report => report.segments.filter(segment => segment?.file).map(segment => ({ name: segment.file, kind: 'png' }));
+test('coverage independently enumerates recursive tabs, tails, footer and empty PNG', () => {
+  const report = nestedReport(), result = captureCoverage(captureInventory(report), reportFiles(report));
+  assert.equal(result.valid, true, result.issues.join('; '));
+  assert.deepEqual(result.expected.map(item => item.name), [
+    '00_header.png', '01_parent.png', '01.01_parent__child.png', '01.01.01_parent__child__leaf.png',
+    '01.01_parent__child__продолжение.png', '01_parent__продолжение.png', '02_empty.png', '99_footer.png',
+  ]);
+  assert.equal(result.expected[6].empty, true); assert.equal(result.expected[6].optional, false);
+});
+test('coverage rejects malformed model ownership, root, indices, shape and cycles', () => {
+  const mutations = {
+    noModel: report => { delete report.model; },
+    noGroups: report => { delete report.model.groups; },
+    noRoot: report => { delete report.model.root; },
+    wrongRoot: report => { report.model.root = 99; },
+    stringRoot: report => { report.model.root = '0'; },
+    duplicateGroup: report => { report.model.groups[1].id = 0; },
+    negativeGroup: report => { report.model.groups[1].id = -1; },
+    reorderedGroups: report => { report.model.groups.reverse(); },
+    labelsMismatch: report => { report.model.groups[0].labels.pop(); },
+    childShape: report => { report.model.groups[0].children[0] = 1; },
+    unknownChild: report => { report.model.groups[0].children[0] = [99]; },
+    stringChild: report => { report.model.groups[0].children[0] = ['1']; },
+    sharedChild: report => { report.model.groups[2].children[0] = [1]; },
+    rootCycle: report => { report.model.groups[2].children[0] = [0]; },
+    selfCycle: report => { report.model.groups[0].children[0] = []; report.model.groups[1].children[0] = [1]; },
+    disconnectedCycle: report => { report.model.groups[0].children[0] = []; report.model.groups[2].children[0] = [1]; },
+    unreachable: report => { report.model.groups[0].children[0] = []; },
+    emptyOwnsChild: report => { report.model.groups[0].children[1] = [2]; },
+    emptyMismatch: report => { report.model.groups[0].items[1].empty = false; },
+    unsupportedMode: report => { report.model.groups[0].items[1].mode = 'guess'; },
+    nonTrailingUnmatched: report => { report.model.groups[0].items.reverse(); },
+    plainWithTabs: report => { report.model.layout = 'plain'; },
+  };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    const report = nestedReport(); mutate(report);
+    const result = captureCoverage(captureInventory(report), reportFiles(report));
+    assert.equal(result.valid, false, name); assert.ok(result.issues.length, name);
+  }
+});
+test('coverage rejects missing/duplicate/extra segments, wrong chains and illegal absent', () => {
+  const mutations = {
+    missingHeader: report => report.segments.shift(),
+    missingTab: report => report.segments.splice(3, 1),
+    missingTail: report => report.segments.splice(4, 1),
+    missingFooter: report => report.segments.pop(),
+    duplicateTab: report => report.segments.splice(3, 0, structuredClone(report.segments[2])),
+    extraPage: report => report.segments.push({ ...report.segments[0], file: '00_страница.png', spec: { kind: 'page' }, chain: [] }),
+    wrongIndex: report => { report.segments[2].spec.index = 1; },
+    stringIndex: report => { report.segments[2].spec.index = '0'; },
+    wrongChain: report => { report.segments[2].chain = [{ group: 1, index: 0 }]; },
+    reordered: report => { [report.segments[1], report.segments[2]] = [report.segments[2], report.segments[1]]; },
+    incorrectName: report => { report.segments[3].file = 'wrong.png'; },
+    aliasName: report => { report.segments[3].file = report.segments[2].file; },
+    missingPng: report => { delete report.segments[3].file; },
+    absentHeader: report => { report.segments[0] = { spec: { kind: 'header' }, chain: [{ group: 0, index: 0 }], status: 'absent', absent: true }; },
+    absentEmpty: report => { report.segments[6] = { spec: { kind: 'tab', group: 0, index: 1 }, chain: [{ group: 0, index: 1 }], status: 'absent', absent: true }; },
+    contradictoryAbsent: report => { report.segments[7].file = '99_footer.png'; },
+    notRequested: report => { report.segments[3].status = 'not-requested'; },
+    unknownStatus: report => { report.segments[3].status = 'success'; },
+    nullSegment: report => { report.segments[3] = null; },
+  };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    const report = nestedReport(); mutate(report);
+    assert.equal(captureCoverage(captureInventory(report), reportFiles(report)).valid, false, name);
+  }
+  const report = nestedReport(), files = reportFiles(report);
+  assert.equal(captureCoverage(captureInventory(report), files.slice(1)).valid, false, 'missing physical PNG');
+  assert.equal(captureCoverage(captureInventory(report), [...files, { name: 'foreign.png', kind: 'png' }]).valid, false, 'foreign physical PNG');
+});
+test('absent tail/footer require proven zero content, no file/png and valid optional empty-space box', () => {
+  for (const index of [4, 7]) {
+    const report = nestedReport(), segment = report.segments[index];
+    const inspect = value => captureCoverage(captureInventory(value), reportFiles(value));
+    assert.equal(inspect(report).valid, true, 'zero geometry may omit box');
+    segment.box = { x: 10, y: 20, width: 100, height: 40 };
+    assert.equal(inspect(report).valid, true, 'positive empty-space rectangle is allowed by helper');
+    for (const meaningful of [1, -1, '0', null, undefined, false]) {
+      const changed = structuredClone(report); changed.segments[index].meaningful = meaningful;
+      assert.equal(inspect(changed).valid, false, `meaningful=${String(meaningful)}`);
+    }
+    for (const field of ['file', 'png']) {
+      const changed = structuredClone(report); changed.segments[index][field] = null;
+      assert.equal(inspect(changed).valid, false, `${field} must be absent, not null`);
+    }
+    for (const box of [null, {}, { x: 0, y: 0, width: 0, height: 40 }, { x: 0, y: 0, width: 10, height: -1 }, { x: 0, y: 0, width: '100', height: 40 }]) {
+      const changed = structuredClone(report); changed.segments[index].box = box;
+      assert.equal(inspect(changed).valid, false, 'malformed absent rectangle');
+    }
+  }
+});
+test('plain needs exactly its one whole-page PNG and no tab model or absent exception', t => {
+  const ctx = start(t, 1), report = JSON.parse(fs.readFileSync(ctx.p.report));
+  const inspect = value => captureCoverage(captureInventory(value), reportFiles(value));
+  assert.equal(inspect(report).valid, true);
+  for (const mutate of [v => { v.model.root = 0; }, v => { delete v.model.root; }, v => { v.segments[0].status = 'absent'; delete v.segments[0].file; delete v.segments[0].png; }, v => { v.segments[0].chain = [{ group: 0, index: 0 }]; }, v => { v.segments.push({ ...v.segments[0], spec: { kind: 'footer' } }); }]) {
+    const value = structuredClone(report); mutate(value); assert.equal(inspect(value).valid, false);
+  }
+});
+test('full inventory and compact failed-resource diagnostics survive every remainder prompt', t => {
+  const ctx = start(t, 3), report = JSON.parse(fs.readFileSync(ctx.p.report));
+  report.segments[0].resources = { fonts: 'loading', images: [{ src: 'https://x/ok.png', ok: true, payload: 'DROP_OK_PAYLOAD' }, { src: 'https://x/bad.png', original: 'https://x/original.png', ok: false, naturalWidth: 0, complete: false }], frames: [{ src: 'https://x/frame', ok: false, reason: 'blank document', requiresVisualReview: true }] };
+  report.segments[0].issues = Array.from({ length: 25 }, (_, i) => `issue ${i}`);
+  report.segments[0].error = 'Segment error\n    at STACK_NOT_FOR_MODEL';
+  report.errors = ['Capture problem\n    at STACK_NOT_FOR_MODEL']; report.status = 'incomplete';
+  atomicJson(ctx.p.report, report);
+  const child = qa(ctx), state = ctx.queue.qaState(ctx.job, ctx.attempt);
+  assert.equal(state.manifest.version, 3); assert.equal(state.manifest.inventory.segments.length, 4);
+  assert.equal(state.manifest.inventory.segments[3].status, 'absent');
+  assert.equal(state.manifest.inventory.segments[0].diagnostics.issues.length, 25);
+  child.record(); child.finish(1); ctx.queue['continue-qa'](ctx.job.id); ctx.queue.pump();
+  const next = ctx.sessions[1]; next.bind();
+  assert.equal(next.config.files.length, 2);
+  for (const prompt of [child.config.prompt, next.config.prompt]) {
+    for (const text of ['00_header.png', '99_footer', 'issue 24', 'https://x/original.png', 'blank document', 'Capture problem', 'Segment error', 'requiresVisualReview', '__продолжение', 'Image-only', 'стыках полос', 'нельзя осмотреть']) assert.ok(prompt.includes(text), text);
+    assert.ok(!prompt.includes('DROP_OK_PAYLOAD')); assert.ok(!prompt.includes('STACK_NOT_FOR_MODEL')); assert.ok(!prompt.includes('NOT_IN_QA_PROMPT'));
+  }
+  pass(next); next.finish(); assert.equal(ctx.attempt.status, 'incomplete');
+});
+test('complete cannot bypass coverage or IHDR size gates with passed reviews', t => {
+  const mutations = {
+    missingTab: report => { report.model.groups[0].labels.push('missing'); report.model.groups[0].children.push([]); report.model.groups[0].items.push({ mode: 'pane', empty: false }); },
+    illegalAbsent: report => { report.segments.at(-1).spec = { kind: 'tab', group: 0, index: 1 }; },
+    wrongBoxWidth: report => { report.segments[0].box.width = 2; },
+    wrongPngHeight: report => { report.segments[0].png.height = 2; },
+    noDimensions: report => { delete report.segments[0].png; },
+    fractionalDimensions: report => { report.segments[0].box.height = 1.5; },
+  };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    const ctx = start(t, 2), report = JSON.parse(fs.readFileSync(ctx.p.report)); mutate(report); atomicJson(ctx.p.report, report);
+    const child = qa(ctx); pass(child); child.finish();
+    assert.equal(ctx.attempt.qa.passed, 2); assert.equal(ctx.attempt.status, 'incomplete', name);
+    assert.ok(ctx.attempt.issues.length, name);
+    if (/Dimensions|Width|Height/.test(name)) assert.ok(inspectArtifacts(ctx.root, ctx.job, ctx.attempt).issues.some(issue => issue.includes('IHDR')));
+  }
+});
+test('old-policy per-image history cannot pass; immutable legacy capture survives migration, restart and remainder', t => {
+  for (const policy of [undefined, { version: 1, hash: '1'.repeat(64) }, { version: QA_POLICY.version, hash: '2'.repeat(64) }]) {
+    const ctx = start(t, 3), child = qa(ctx); pass(child); child.finish();
+    const p = paths(ctx.root, ctx.job, ctx.attempt), current = loadQa(ctx.root, ctx.job, ctx.attempt);
+    // An actual v2 capture manifest, without richer inventory, remains immutable.
+    const { hash: previousHash, inventory, ...data } = current.manifest;
+    data.version = 2; const legacy = { ...data, hash: hash(data) };
+    const progress = structuredClone(current.progress); progress.manifestHash = legacy.hash;
+    if (policy) progress.policy = policy; else delete progress.policy;
+    for (const checkpoint of progress.checkpoints) {
+      checkpoint.manifestHash = legacy.hash;
+      if (policy) checkpoint.policy = policy; else delete checkpoint.policy;
+    }
+    atomicJson(p.manifest, legacy); atomicJson(p.progress, progress);
+    const manifestBytes = fs.readFileSync(p.manifest), originalHistory = structuredClone(progress.checkpoints);
+    const firstRestart = setup(t, { root: ctx.root }), job = firstRestart.queue.get(ctx.job.id), attempt = job.attempts[0];
+    assert.equal(attempt.status, 'needs_review'); assert.equal(attempt.qa.passed, 0); assert.equal(attempt.qa.historicalReviews, 3);
+    assert.equal(checkManifest(ctx.root, job, attempt, legacy).coverage.valid, true);
+    firstRestart.queue['continue-qa'](job.id); firstRestart.queue.pump(); const first = firstRestart.sessions[0]; first.bind();
+    assert.equal(first.config.files.length, 3); assert.equal(first.config.generation, 2); assert.deepEqual(first.config.policy, QA_POLICY);
+    first.record(); first.finish(1);
+    const secondRestart = setup(t, { root: ctx.root }), resumedJob = secondRestart.queue.get(job.id);
+    secondRestart.queue['continue-qa'](job.id); secondRestart.queue.pump(); const next = secondRestart.sessions[0]; next.bind();
+    assert.deepEqual(next.config.files.map(file => file.name), ['01_tab.png', '02_tab.png']);
+    assert.ok(next.config.prompt.includes('00_header.png')); assert.ok(next.config.prompt.includes('99_footer'));
+    pass(next); next.finish(); assert.equal(resumedJob.attempts[0].status, 'complete');
+    const restored = loadQa(ctx.root, resumedJob, resumedJob.attempts[0]);
+    assert.deepEqual(restored.progress.checkpoints.slice(0, 3), originalHistory);
+    assert.equal(restored.progress.checkpoints.length, 6); assert.equal(counts(restored.manifest, restored.progress).passed, 3);
+    assert.deepEqual(fs.readFileSync(p.manifest), manifestBytes); assert.equal(secondRestart.children.length, 0);
+  }
+});
+test('policy checkpoint corruption, duplicates and returning to a previous policy remain rejected', t => {
+  const ctx = start(t, 2), child = qa(ctx); pass(child); child.finish(); const p = paths(ctx.root, ctx.job, ctx.attempt), original = JSON.parse(fs.readFileSync(p.progress));
+  for (const mutate of [
+    v => { v.policy = null; },
+    v => { delete v.policy; },
+    v => { v.policy = { version: 1, hash: '1'.repeat(64) }; },
+    v => { v.checkpoints[0].policy.hash = 'bad'; },
+    v => { v.checkpoints[1].policy = { version: 1, hash: '1'.repeat(64) }; },
+    v => { v.checkpoints.push(structuredClone(v.checkpoints[0])); },
+    v => { const old = { ...structuredClone(v.checkpoints[0]), policy: { version: 1, hash: '1'.repeat(64) }, generation: 2 }; const current = { ...structuredClone(v.checkpoints[0]), generation: 3 }; v.generation = 3; v.checkpoints.push(old, current); },
+  ]) {
+    const changed = structuredClone(original); mutate(changed); atomicJson(p.progress, changed); assert.throws(() => loadQa(ctx.root, ctx.job, ctx.attempt));
+  }
+  atomicJson(p.progress, original);
+});
+
+test('current policy prompt accepts source emptiness and image text quality without excusing capture defects', t => {
+  const ctx = start(t, 2), report = JSON.parse(fs.readFileSync(ctx.p.report));
+  // A normal pane may be visually empty without the helper's unmatched-tab flag.
+  report.segments[1].empty = false; report.segments[1].resources = { images: [], frames: [], fonts: 'loaded' };
+  report.segments[1].issues = []; atomicJson(ctx.p.report, report);
+  const child = qa(ctx), prompt = child.config.prompt, instructions = fs.readFileSync(path.join(__dirname, '../src/qa-instructions.txt'), 'utf8');
+  assert.equal(QA_POLICY.version, 5); assert.equal(ctx.queue.qaState(ctx.job, ctx.attempt).manifest.inventory.segments[1].empty, false);
+  for (const text of [
+    'оценивай только доказуемые дефекты захвата, не дизайн/UX/доступность', 'Пустая или визуально пустая вкладка',
+    'segment.status=ok', 'корректном coverage', 'diagnostics unloaded/loader/failed iframe',
+    'Не требуй inventory empty=true', 'Само отсутствие текста/картинок под панелью не issue',
+    'Мелкий, бледный, низкоконтрастный или неразборчивый текст', 'чтение, распознавание и транскрипция текста на картинке не требуются',
+    'Маленький масштаб просмотра сам по себе не запрещает passed', 'именно для оценки целостности и дефектов захвата',
+    'missing/crop/placeholder/loading/corruption/seam/overlay/wrong boundary',
+    'Технические ошибки ресурсов, iframe или coverage не списывай', 'Событие load и техническое ok не доказывают отрисовку',
+  ]) assert.ok(prompt.includes(text), text);
+  assert.ok(!prompt.includes('PNG: читаемость,'), 'no standalone source-legibility criterion');
+  assert.match(instructions, /Reading or transcribing text embedded in source content images, scans,\s+certificates or banners is not required/);
+  assert.match(instructions, /Read visible tab\s+labels, loading\/error messages and other UI cues when needed to verify capture/);
+  assert.ok(!instructions.includes('Do not read or transcribe text inside images'));
+  assert.match(instructions, /explicit empty flag is not required/);
+  assert.match(instructions, /Never excuse placeholders, failed resources, blank\/error\/loading iframes/);
+  pass(child); child.finish(); assert.equal(ctx.attempt.status, 'complete');
+});
+
+test('v2 false visual issues remain history while current policy reviews all immutable PNGs afresh', t => {
+  const ctx = start(t, 2), child = qa(ctx), falseIssues = [
+    'Активная вкладка «Аренда помещений» полностью пустая: под вкладками отображается только белая область без текста, изображений или иного содержимого.',
+    'Несколько изображений сертификатов в нижней части страницы отображаются чрезмерно мелко и бледно: текст документов визуально не читается в представленном размере.',
+  ];
+  for (const [index, file] of child.config.files.entries()) child.record(file, { status: 'issues', issues: [falseIssues[index]] });
+  child.finish(); assert.equal(ctx.attempt.status, 'incomplete');
+  const p = paths(ctx.root, ctx.job, ctx.attempt), manifestBytes = fs.readFileSync(p.manifest), reportBytes = fs.readFileSync(p.report);
+  const progress = JSON.parse(fs.readFileSync(p.progress)), oldPolicy = { version: 2, hash: hash('previous source-legibility policy') };
+  progress.policy = oldPolicy; for (const checkpoint of progress.checkpoints) checkpoint.policy = oldPolicy;
+  atomicJson(p.progress, progress);
+  const history = structuredClone(progress.checkpoints), restarted = setup(t, { root: ctx.root }), job = restarted.queue.get(ctx.job.id), attempt = job.attempts[0];
+  assert.equal(attempt.status, 'needs_review'); assert.equal(attempt.qa.issues, 0); assert.equal(attempt.qa.passed, 0);
+  assert.equal(attempt.qa.historicalReviews, 2); assert.equal(attempt.qa.unreviewed, 2);
+  restarted.queue['continue-qa'](job.id); restarted.queue.pump(); const next = restarted.sessions[0]; next.bind();
+  assert.equal(next.config.files.length, 2); assert.equal(next.config.policy.version, 5);
+  pass(next); next.finish(); assert.equal(attempt.status, 'complete');
+  const updated = loadQa(ctx.root, job, attempt);
+  assert.deepEqual(updated.progress.checkpoints.slice(0, 2), history); assert.equal(updated.progress.checkpoints.length, 4);
+  assert.deepEqual(fs.readFileSync(p.manifest), manifestBytes); assert.deepEqual(fs.readFileSync(p.report), reportBytes);
+  assert.equal(restarted.children.length, 0, 'policy migration never repeats capture');
+});
+
+test('current policy retains v4 rejection of edge-only crop reasoning and migrates exact v3 Promelteh issues without changing capture identity', t => {
+  const ctx = start(t, 2), child = qa(ctx);
+  // Exact edge-only claims from Promelteh attempt-007, generation 2, policy v3.
+  const falseIssues = [
+    'crop/wrong boundary: нижний баннер «Наша продукция и услуги» обрезан нижней границей PNG — видны только его верхняя часть и начало содержимого, а боковые рамки уходят в край без нижней границы.',
+    'crop: в нижнем левом столбце начинается ещё один документ/сертификат, но он пересечён нижней границей PNG и виден лишь частично.',
+  ];
+  for (const [index, file] of child.config.files.entries()) child.record(file, { status: 'issues', issues: [falseIssues[index]] });
+  child.finish();
+  const p = paths(ctx.root, ctx.job, ctx.attempt), manifestBytes = fs.readFileSync(p.manifest), reportBytes = fs.readFileSync(p.report);
+  const progress = JSON.parse(fs.readFileSync(p.progress));
+  const previousPolicy = { version: 3, hash: 'd01671f99e16cccb99e77589e7dd835f71ed71b9fc49050029e2311e2dc295bd' };
+  progress.policy = previousPolicy; for (const checkpoint of progress.checkpoints) checkpoint.policy = previousPolicy;
+  atomicJson(p.progress, progress); const history = structuredClone(progress.checkpoints);
+  const restarted = setup(t, { root: ctx.root }), job = restarted.queue.get(ctx.job.id), attempt = job.attempts[0];
+  assert.equal(attempt.status, 'needs_review'); assert.equal(attempt.qa.issues, 0); assert.equal(attempt.qa.passed, 0);
+  assert.equal(attempt.qa.historicalReviews, 2); assert.equal(attempt.qa.unreviewed, 2);
+  restarted.queue['continue-qa'](job.id); restarted.queue.pump(); const next = restarted.sessions[0]; next.bind();
+  assert.equal(next.config.policy.version, 5); assert.notEqual(next.config.policy.hash, previousPolicy.hash);
+  assert.equal(next.config.files.length, 2);
+  for (const prompt of [child.config.prompt, next.config.prompt]) {
+    for (const required of [
+      'касание или пересечение края PNG', 'рамкой, картинкой, документом или блоком',
+      'отсутствие видимой нижней границы сами по себе НЕ доказывают crop/missing/wrong-boundary',
+      'Не воображай продолжение за кадром', 'доверяй рассчитанной semantic box',
+      'source clipping и странности исходной вёрстки допустимы',
+      'только при подтверждающих inventory/report diagnostics (geometry changed, overflow, overlay, resource failure)',
+      'явном внутреннем шве/повторе/разрыве сборки', 'фактически неверной панели/сегменте относительно полного inventory',
+      'Реальные unloaded/placeholder/failed iframe', 'внутренний seam/duplicate и wrong active tab остаются issues',
+      'Назови конкретное подтверждение, относящееся к заявленному дефекту, а не только внешний край',
+    ]) assert.ok(prompt.includes(required), required);
+  }
+  const instructions = fs.readFileSync(path.join(__dirname, '../src/qa-instructions.txt'), 'utf8');
+  assert.match(instructions, /touching\/crossing a PNG edge[\s\S]*is not evidence of crop/);
+  assert.match(instructions, /Never imagine\s+continuation outside the frame/);
+  assert.match(instructions, /requires relevant inventory\/report diagnostics/);
+  assert.match(instructions, /wrong active tab remain defects even with\s+technical OK/);
+  pass(next); next.finish(); assert.equal(attempt.status, 'complete');
+  const updated = loadQa(ctx.root, job, attempt);
+  assert.deepEqual(updated.progress.checkpoints.slice(0, 2), history);
+  assert.deepEqual(updated.progress.checkpoints.slice(0, 2).map(c => c.review.issues[0]), falseIssues);
+  assert.deepEqual(fs.readFileSync(p.manifest), manifestBytes); assert.deepEqual(fs.readFileSync(p.report), reportBytes);
+  assert.equal(restarted.children.length, 0);
+});
+
+test('v5 rejects exact edge-chrome header claims and migrates v4 reviews without recapture', t => {
+  // Exact v4 false issues for the unchanged TSK and Ivan-chay header PNGs.
+  const falseIssues = [
+    '00_header.png: wrong boundary: в нижней части 00_header.png уже видны верхняя рамка и заголовок следующей панели «Наша продукция и услуги», хотя header должен заканчиваться перед первой панелью.',
+    '00_header.png: wrong boundary: внизу header захвачена верхняя часть первой панели «Наша продукция и услуги» (линия/заголовок панели и элементы со стрелкой), хотя сегмент должен заканчиваться перед первой панелью',
+  ];
+  for (const falseIssue of falseIssues) {
+    const ctx = start(t, 2), child = qa(ctx);
+    child.record(child.config.files[0], { status: 'issues', issues: [falseIssue] });
+    child.record(child.config.files[1]); child.finish();
+    const p = paths(ctx.root, ctx.job, ctx.attempt);
+    const manifestBytes = fs.readFileSync(p.manifest), reportBytes = fs.readFileSync(p.report);
+    const beforeFiles = child.config.files.map(file => ({ name: file.name, sha256: file.sha256 }));
+    const progress = JSON.parse(fs.readFileSync(p.progress));
+    const previousPolicy = { version: 4, hash: '5efc9bd55bedd2c91f001b446898901757ba18e939025607410455d682fec04d' };
+    progress.policy = previousPolicy;
+    for (const checkpoint of progress.checkpoints) checkpoint.policy = previousPolicy;
+    atomicJson(p.progress, progress); const history = structuredClone(progress.checkpoints);
+    const restarted = setup(t, { root: ctx.root }), job = restarted.queue.get(ctx.job.id), attempt = job.attempts[0];
+    assert.equal(attempt.status, 'needs_review'); assert.equal(attempt.qa.issues, 0);
+    assert.equal(attempt.qa.passed, 0); assert.equal(attempt.qa.historicalReviews, 2); assert.equal(attempt.qa.unreviewed, 2);
+    restarted.queue['continue-qa'](job.id); restarted.queue.pump();
+    const next = restarted.sessions[0]; next.bind();
+    assert.equal(next.config.policy.version, 5); assert.notEqual(next.config.policy.hash, previousPolicy.hash);
+    assert.deepEqual(next.config.files.map(file => ({ name: file.name, sha256: file.sha256 })), beforeFiles);
+    for (const required of [
+      'конец перед первой строкой/списком кнопок вкладок (ul.tabs)',
+      'сама кнопочная панель и её содержимое не входят',
+      'Предшествующие section title/chrome (заголовок секции, рамка, legend, стрелка) принадлежат header',
+      'граница — начало ul.tabs, а не начало этого контейнера',
+      'Видимые на краю header заголовок «Наша продукция и услуги», рамка или стрелка',
+      'сами по себе не являются wrong boundary при segment.status=ok, корректном coverage и чистых diagnostics',
+      'фактическая кнопочная панель или её содержимое в header',
+      'фактически неверная содержательная панель или дублированный контент остаются issues',
+      'Реальные unloaded/placeholder/failed iframe', 'внутренний seam/duplicate и wrong active tab остаются issues',
+    ]) assert.ok(next.config.prompt.includes(required), required);
+    pass(next); next.finish(); assert.equal(attempt.status, 'complete');
+    const updated = loadQa(ctx.root, job, attempt);
+    assert.deepEqual(updated.progress.checkpoints.slice(0, 2), history);
+    assert.equal(updated.progress.checkpoints[0].review.issues[0], falseIssue);
+    assert.deepEqual(fs.readFileSync(p.manifest), manifestBytes); assert.deepEqual(fs.readFileSync(p.report), reportBytes);
+    assert.equal(restarted.children.length, 0); assert.equal(job.attempts.length, 1);
+  }
+  const instructions = fs.readFileSync(path.join(__dirname, '../src/qa-instructions.txt'), 'utf8');
+  assert.match(instructions, /Header ends before the first row\/list of tab buttons \(ul.tabs\), not before the\s+enclosing main_block\/tbody container/);
+  assert.match(instructions, /Preceding section title\/chrome[\s\S]*belongs to header/);
+  assert.match(instructions, /segment.status=ok, coverage is valid and\s+diagnostics are clean/);
+  assert.match(instructions, /actual tab-button panel and its content must not\s+enter header/i);
+  assert.match(instructions, /Actual wrong substantive panels or duplicated\s+content remain defects/);
 });

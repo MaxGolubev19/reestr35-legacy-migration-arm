@@ -11,7 +11,11 @@ $oldPort = $env:ARM_PORT
 $oldConcurrency = $env:ARM_CONCURRENCY
 $oldNodePath = $env:NODE_PATH
 $oldDataDir = $env:ARM_DATA_DIR
+$oldConsoleEncoding = [Console]::OutputEncoding
 try {
+    # Node writes UTF-8 even when Windows uses a legacy console code page.
+    # PowerShell decodes native output before Tee-Object writes the log.
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
     $env:ARM_PORT = [string]$Port
     $env:ARM_CONCURRENCY = [string]$Concurrency
     $selectedDataDir = if ([string]::IsNullOrWhiteSpace($DataDir)) { 'local' } else { $DataDir }
@@ -21,7 +25,13 @@ try {
     New-Item -ItemType Directory -Path $selectedDataDir -Force | Out-Null
     $logsDir = Join-Path $selectedDataDir 'logs'
     New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
-    if ((Test-Path -LiteralPath $runtimeNode) -and (Test-Path -LiteralPath $runtimeModules)) {
+    if ($env:ARM_RUNTIME_DIR) {
+        $runtimeNode = Join-Path $env:ARM_RUNTIME_DIR 'node.exe'
+        $env:NODE_PATH = Join-Path $env:ARM_RUNTIME_DIR 'node_modules'
+    } elseif (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'node_modules')) {
+        if (-not (Test-Path -LiteralPath $runtimeNode)) { $runtimeNode = (Get-Command node -ErrorAction Stop).Source }
+        $env:NODE_PATH = Join-Path $PSScriptRoot 'node_modules'
+    } elseif ((Test-Path -LiteralPath $runtimeNode) -and (Test-Path -LiteralPath $runtimeModules)) {
         $env:NODE_PATH = $runtimeModules
     } else {
         $runtimeNode = (Get-Command node -ErrorAction Stop).Source
@@ -32,6 +42,7 @@ try {
     $serverLog = Join-Path $logsDir ('server-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log')
     & $runtimeNode (Join-Path $PSScriptRoot 'src\server.cjs') 2>&1 | Tee-Object -FilePath $serverLog
 } finally {
+    [Console]::OutputEncoding = $oldConsoleEncoding
     $env:ARM_PORT = $oldPort
     $env:ARM_CONCURRENCY = $oldConcurrency
     $env:NODE_PATH = $oldNodePath

@@ -24,6 +24,11 @@
 .qa-progress-segment { flex: 1 1 0; }
 .json-output { max-height: 65vh; overflow: auto; }
 .raw-output { white-space: pre-wrap; overflow-wrap: anywhere; }
+.connection-control { padding: .25rem; border: 0; color: inherit; background: transparent; border-radius: var(--tblr-border-radius); }
+.connection-control:not(:disabled) { cursor: pointer; }
+.connection-control:not(:disabled):hover { background: var(--tblr-bg-surface-secondary); }
+.connection-control:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 2px; }
+.connection-control:disabled { opacity: 1; }
 
 #empty-detail .empty {
   min-height: 28rem;
