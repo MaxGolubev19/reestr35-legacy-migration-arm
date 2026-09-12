@@ -578,6 +578,7 @@ test('real offline editors, simplified read-only trees/folding, neutral actions,
       const collapsedChevron = await summary.evaluate(node => { const style = getComputedStyle(node, '::after'); return { content: style.content, width: parseFloat(style.width), height: parseFloat(style.height), borderRight: style.borderRightWidth, transform: style.transform }; });
       assert.equal(collapsedChevron.content, '""'); assert.ok(collapsedChevron.width > 0 && collapsedChevron.height > 0); assert.equal(collapsedChevron.borderRight, '2px'); await summary.click();
       assert.equal(await imageSection.evaluate(node => node.open), true); assert.equal(await imageSection.locator('.accordion-body').isVisible(), true);
+      await page.waitForFunction(({ selector, transform }) => getComputedStyle(document.querySelector(selector), '::after').transform !== transform, { selector: '#html-media-accordion > .html-media-section:first-child summary', transform: collapsedChevron.transform });
       const openChevron = await summary.evaluate(node => getComputedStyle(node, '::after').transform); assert.notEqual(openChevron, collapsedChevron.transform, 'the visible chevron rotates with the section state');
       const mediaBox = await page.locator('#media-progress').evaluate(node => { const style = getComputedStyle(node); return { maxWidth: style.maxWidth, minWidth: style.minWidth, flexBasis: style.flexBasis, transform: style.transform }; });
       assert.deepEqual(mediaBox, qaProgressStyle, 'both stages use the same raised progress geometry');
