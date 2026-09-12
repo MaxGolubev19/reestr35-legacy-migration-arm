@@ -352,11 +352,11 @@ test('attempt duration advances only for active attempts and terminal durations 
   const code = source.match(/function formatDuration\(attempt, timestamp = Date.now\(\)\) \{[\s\S]*?(?=\n  function renderDuration)/)?.[0];
   assert.ok(code);
   const duration = require('node:vm').runInNewContext(`${code}; formatDuration`, { ACTIVE_STATUSES: new Set(['running', 'validating', 'stopping']) });
-  const startedAt = '2026-01-01T00:00:00Z';
-  assert.equal(duration({ startedAt, status: 'running' }, Date.parse(startedAt) + 3661000), '01:01:01');
-  assert.equal(duration({ startedAt, finishedAt: '2026-01-01T00:00:42Z', status: 'complete' }, Date.now()), '00:00:42');
-  for (const status of ['queued', 'paused', 'complete', 'cancelled']) assert.equal(duration({ startedAt, status }), '—');
-  assert.equal(duration({ status: 'running' }), '—');
+  const startedAt = '2026-01-01T00:00:00Z', activeSince = Date.parse(startedAt);
+  assert.equal(duration({ startedAt, activeDurationMs: 3600000, activeSince, status: 'running' }, activeSince + 61000), '01:01:01');
+  assert.equal(duration({ startedAt, activeDurationMs: 42000, finishedAt: '2026-02-01T00:00:42Z', status: 'complete' }, Date.now()), '00:00:42');
+  for (const status of ['queued', 'paused', 'complete', 'cancelled']) assert.equal(duration({ activeDurationMs: 12000, activeSince, status }), '00:00:12');
+  assert.equal(duration({ status: 'running', activeDurationMs: 0 }), '00:00:00');
 });
 
 test('concurrency setting persists, pumps immediately, and lowering does not stop active children', t => {

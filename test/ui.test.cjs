@@ -402,7 +402,7 @@ test('queue icons expose every action, preserve selection, handle races and show
   queue.launch(queue.jobs[2]); queue.launch(queue.jobs[11]); queue.closing = true;
   statuses.forEach((status, i) => { queue.jobs[i].attempts[0].status = status; });
   queue.jobs[2].attempts[0].startedAt = new Date(Date.now() - 5000).toISOString();
-  Object.assign(queue.jobs[4].attempts[0], { startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:05Z' });
+  Object.assign(queue.jobs[4].attempts[0], { startedAt: '2026-01-01T00:00:00Z', finishedAt: '2026-01-01T00:00:05Z', activeDurationMs: 5000 });
   Object.assign(queue.jobs[13].attempts[0], { phase: 'qa', startedAt: '2026-01-01T00:00:00Z' });
   queue.save();
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -497,13 +497,16 @@ test('queue icons expose every action, preserve selection, handle races and show
   assert.deepEqual(await page.locator('.result-steps .step-item').evaluateAll(nodes => nodes.map(node => node.getAttribute('title'))), [null, null, null, null]);
   await page.mouse.move(0, 0); await page.locator('#stage-step-2').hover(); await page.waitForTimeout(100);
   assert.equal(await page.locator('.tooltip.show').count(), 0, 'steps do not create tooltips');
-  assert.deepEqual(await page.locator('#results-card > *').evaluateAll(nodes => nodes.map(node => node.id)), ['results-header', 'attempt-header', 'gallery-body', 'stage-two-panel']);
+  assert.deepEqual(await page.locator('#results-card > *').evaluateAll(nodes => nodes.map(node => node.id)), ['results-header', 'attempt-header', 'gallery-body', 'stage-two-panel', 'stage-three-panel', 'stage-four-panel']);
   assert.equal(await page.locator('#results-header > #results-common').count(), 1);
   assert.equal(await page.locator('#results-header #attempt-controls, #results-header #qa-progress').count(), 0);
   assert.equal(await page.locator('#attempt-header > #attempt-controls').count(), 1);
   assert.equal(await page.locator('#attempt-header > #qa-progress').count(), 1);
   assert.equal(await page.locator('#attempt-controls > #recapture-button').count(), 1);
   assert.equal(await page.locator('#attempt-controls').evaluate(node => node.firstElementChild.id), 'recapture-button', 'restart is the first attempt control');
+  assert.deepEqual(await page.locator('#attempt-controls > *').evaluateAll(nodes => nodes.map(node => node.id)), ['recapture-button', 'attempt-duration', 'attempt-select']);
+  const controlStyles = await page.locator('#attempt-duration, #attempt-select').evaluateAll(nodes => nodes.map(node => { const style = getComputedStyle(node); return { fontFamily: style.fontFamily, fontSize: style.fontSize, fontWeight: style.fontWeight, lineHeight: style.lineHeight, border: style.border, height: node.getBoundingClientRect().height }; }));
+  assert.deepEqual(controlStyles[0], controlStyles[1], 'active time matches the attempt selector font, frame and height');
   const attemptControlBoxes = await page.locator('#recapture-button, #attempt-select, #attempt-duration').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right }; }));
   assert.equal(attemptControlBoxes[0].left, Math.min(...attemptControlBoxes.map(item => item.left)), 'restart is the leftmost attempt control');
   const attemptControlGaps = [attemptControlBoxes[1].left - attemptControlBoxes[0].right, attemptControlBoxes[2].left - attemptControlBoxes[1].right];
@@ -519,30 +522,50 @@ test('queue icons expose every action, preserve selection, handle races and show
   for (const step of stepVisuals) {
     assert.ok(step.labelTop >= step.dotTop + step.dotHeight + 4, 'the step label is below its circle and connector line');
   }
-  assert.ok(Math.max(...stepVisuals.map(step => step.width)) - Math.min(...stepVisuals.map(step => step.width)) < .02, 'all four step cells have equal width');
+  const markerGaps = stepVisuals.slice(1).map((step, index) => step.dotLeft - stepVisuals[index].dotLeft);
+  assert.ok(Math.max(...markerGaps) - Math.min(...markerGaps) < .5, `all four desktop markers are evenly distributed: ${markerGaps}`);
   assert.equal(stepVisuals[0].connectorContent, 'none', 'step 1 has only its circle');
   for (const step of stepVisuals.slice(1)) {
     assert.equal(step.connectorPosition, 'absolute');
-    assert.ok(Math.abs(step.connectorRight - step.width / 2) <= 1, 'the connector ends at the circle from the left');
+    assert.ok(Math.abs(step.connectorRight + step.dotLeft - stepVisuals.at(-1).dotLeft - stepVisuals[0].dotLeft) <= 1, 'the connector ends at its marker');
     assert.ok(Math.abs(step.connectorTop - (step.dotTop + step.dotHeight / 2)) <= 1, 'the connector and circles share one horizontal line');
-    assert.ok(Math.abs(step.connectorWidth - step.width) <= 1, 'the connector spans the shrinking distance between circles');
+    assert.ok(Math.abs(step.connectorWidth - markerGaps[0]) <= 1, 'the connector spans the distance between circles');
   }
   assert.equal(stepVisuals[1].dotBackground, activeBackground, 'step 2 uses the same neutral gray as an active step 1');
   assert.equal(stepVisuals[2].dotBackground, stepVisuals[3].dotBackground, 'locked steps share the light-gray treatment');
   assert.equal(new Set([stepVisuals[0].dotBackground, stepVisuals[1].dotBackground, stepVisuals[2].dotBackground, errorBackground]).size, 4, 'steps use exactly distinct success, active, inactive and error colors');
-  assert.equal(await page.locator('#stage-two-panel .empty-subtitle').innerText(), 'Раздел ещё в разработке.');
-  assert.equal(await page.locator('#stage-two-panel img').getAttribute('src'), '/assets/html-media-in-development.png');
-  assert.equal(await page.locator('#stage-two-panel img').evaluate(image => image.complete && image.naturalWidth > 0 && image.naturalHeight > 0), true, 'step 2 illustration is fetched and decoded');
+  assert.equal(await page.locator('#stage-two-panel .html-source-card').innerText(), 'HTML не найден — выбрать файл');
+  assert.equal(await page.locator('#stage-three-panel .empty-subtitle').textContent(), 'Раздел ещё в разработке.');
+  assert.equal(await page.locator('#stage-four-panel .empty-subtitle').textContent(), 'Раздел ещё в разработке.');
   await page.screenshot({ path: path.join(output, 'ui-stage-two-1440.png'), fullPage: true });
   assert.equal(await page.locator('#gallery-body').isHidden(), true);
   const topGeometry = () => page.locator('#results-header, #result-steps, .result-steps .step-item').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return [node.id || node.className, box.x, box.y, box.width, box.height]; }));
   const stepTwoGeometry = await topGeometry();
   const headerGeometry = await page.locator('#results-common > .detail-heading, #result-steps').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right, center: box.top + box.height / 2 }; }));
   assert.ok(headerGeometry[0].right < headerGeometry[1].left, 'steps are to the right of the result heading');
-  assert.ok(Math.abs(headerGeometry[0].center - headerGeometry[1].center) <= 1, 'result heading and steps share one row');
+  assert.equal(await page.locator('#result-steps').evaluate(node => { const box = node.getBoundingClientRect(), parent = node.parentElement.getBoundingClientRect(); return Math.abs(box.right - parent.right) <= 1 && box.width > 544; }), true, 'desktop steps use the free width up to the right header edge');
+  assert.ok(Math.abs(headerGeometry[1].center - headerGeometry[0].center - 4) <= 1, 'steps sit four pixels below the heading center');
   assert.equal(await page.locator('#results-header').evaluate(node => getComputedStyle(node).borderBottomWidth), '0px', 'there is no divider between the main and attempt headers');
-  await page.locator('#back-to-stage-one').click();
+  await page.locator('#stage-step-1').click();
   assert.equal(await page.locator('#gallery-body').isVisible(), true);
+  const alignment = await page.evaluate(() => {
+    const steps = document.querySelector('#result-steps .steps').getBoundingClientRect(), items = [...document.querySelectorAll('.result-steps .step-item')];
+    const markers = items.map(item => steps.left + parseFloat(getComputedStyle(item, '::before').left));
+    const lines = items.slice(1).map(item => { const style = getComputedStyle(item, '::after'), right = steps.right - parseFloat(style.right); return { left: right - parseFloat(style.width), right }; });
+    const labels = items.map(item => { const range = document.createRange(); range.selectNodeContents(item); const box = range.getBoundingClientRect(); return { left: box.left, right: box.right, center: box.left + box.width / 2, bottom: box.bottom }; });
+    const labelsBottom = Math.max(...labels.map(label => label.bottom));
+    const progress = document.querySelector('#qa-progress-bar').getBoundingClientRect(), controls = document.querySelector('#attempt-controls').getBoundingClientRect();
+    const header = document.querySelector('#results-common').getBoundingClientRect();
+    return { markers, lines, labels, header: { left: header.left, right: header.right }, progress: { left: progress.left, right: progress.right }, rowGap: controls.top - labelsBottom, width: steps.width };
+  });
+  const labelClearance = alignment.header.right - alignment.labels.at(-1).right, leftLead = alignment.progress.left - alignment.markers[0];
+  assert.ok(labelClearance >= 1 && labelClearance <= 4, `last centered caption keeps only a safe edge clearance: ${labelClearance}`);
+  assert.ok(Math.abs(alignment.lines.at(-1).right - alignment.markers.at(-1)) <= 1, 'connector line ends at the last marker');
+  assert.ok(leftLead >= -1 && leftLead <= 15 && Math.abs(alignment.lines[0].left - alignment.markers[0]) <= 1, 'first marker starts at or just left of the progressbar');
+  alignment.labels.forEach((label, index) => { assert.ok(Math.abs(label.center - alignment.markers[index]) <= 1, `caption ${index + 1} is centered under its marker`); assert.ok(label.left >= alignment.header.left && label.right <= alignment.header.right, `caption ${index + 1} stays inside the header`); });
+  assert.ok(Math.abs(alignment.rowGap - 15.39) <= 1, `compact header preserves its clear row gap: ${alignment.rowGap}`);
+  fs.writeFileSync(path.join(output, 'ui-steps-alignment-1440.json'), JSON.stringify(alignment, null, 2));
+  await page.screenshot({ path: path.join(output, 'ui-steps-wide-1440.png'), fullPage: true });
   assert.equal(await page.locator('#stage-two-panel').isHidden(), true);
   assert.equal(await page.locator('#stage-step-1.step-state-success').count(), 1, 'manual selection does not erase completed step success');
   assert.equal(await page.locator('#recapture-button').isVisible(), true);
@@ -582,9 +605,9 @@ test('queue icons expose every action, preserve selection, handle races and show
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${viewportWidth}px has no page overflow`);
     if (viewportWidth !== 360) await page.screenshot({ path: path.join(output, `ui-stage-two-${viewportWidth}.png`), fullPage: true });
   }
-  const placeholderWidth = await page.locator('#stage-two-panel img').evaluate(node => ({ image: node.getBoundingClientRect().width, card: node.closest('.card').getBoundingClientRect().width }));
-  assert.ok(placeholderWidth.image <= placeholderWidth.card);
-  await page.locator('#back-to-stage-one').click(); await page.setViewportSize({ width: 1440, height: 1000 });
+  const sourceCardWidth = await page.locator('#stage-two-panel .html-source-card').evaluate(node => ({ source: node.getBoundingClientRect().width, card: node.closest('.card').getBoundingClientRect().width }));
+  assert.ok(sourceCardWidth.source <= sourceCardWidth.card);
+  await page.locator('#stage-step-1').click(); await page.setViewportSize({ width: 1440, height: 1000 });
   assert.equal(await page.locator('#attempt-duration').innerText(), '00:00:05');
   await action(5).click();
   await waitStatus(5, 'queued');
@@ -750,7 +773,7 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const errors = [];
   let reportRequests = 0;
-  page.on('pageerror', error => { errors.push(error.message); console.error(error.message); });
+  page.on('pageerror', error => { errors.push(error.message); console.error(error.stack); });
   page.on('request', request => { if (request.method() === 'GET' && request.url().endsWith('/capture-report.json')) reportRequests++; });
   const origin = `http://127.0.0.1:${server.address().port}`;
   async function openFirstPng(keyboard = false) {
@@ -764,6 +787,7 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
     } else await page.locator('#png-gallery button').first().click();
     await shown;
   }
+  await page.addInitScript(() => { window.copied = null; Object.defineProperty(navigator, 'clipboard', { value: { writeText: async text => { window.copied = text; }, write: async items => { const blob = await items[0].getType('image/png'); window.copied = { type: blob.type, size: blob.size }; } } }); });
   async function closePng() {
     const hidden = page.evaluate(() => new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`Modal hide timeout: ${document.querySelector('#png-modal').className}, focus=${document.activeElement.id}`)), 5000);
@@ -772,22 +796,34 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
     await page.keyboard.press('Escape');
     await hidden;
   }
+  fs.unlinkSync(path.join(fixture.loc.hostDir, names[0]));
   await page.goto(origin);
   await page.locator(`[data-job-id="${job.id}"]`).evaluate(row => row.click());
-  await page.waitForFunction(() => document.querySelectorAll('#png-gallery img').length === 1);
-  assert.equal(await page.locator('#png-gallery .image-status').innerText(), 'Не проверено', 'an early PNG is visible before capture finishes');
-  assert.equal(await page.locator('#qa-progress').isHidden(), true, 'QA indicator waits for the immutable manifest projection');
+  assert.equal(await page.locator('#qa-progress').isVisible(), true, 'step 1 starts with a visible empty progress bar');
   assert.equal(await page.locator('#qa-progress-count').innerText(), '0/0');
+  fs.writeFileSync(path.join(fixture.loc.hostDir, names[0]), tinyPng);
+  await page.waitForFunction(() => document.querySelectorAll('#png-gallery img').length === 1);
+  assert.equal(await page.locator('#png-gallery .image-status').getAttribute('aria-label'), 'Не проверено', 'an early PNG is visible before capture finishes');
+  assert.equal(await page.locator('#qa-progress').isVisible(), true, 'QA indicator includes PNGs before the immutable manifest exists');
+  assert.equal(await page.locator('#qa-progress-count').innerText(), '0/1');
   assert.equal(await page.locator('#qa-progress-count').getAttribute('aria-hidden'), 'true');
   assert.equal(await page.locator('#files-list button').count(), 1);
   assert.equal(reportRequests, 0, 'gallery never reads the QA report in the background');
+  fs.writeFileSync(path.join(fixture.loc.hostDir, names[1]), tinyPng);
+  fixture.report.segments.push({ file: names[1], status: 'ok' });
+  fs.writeFileSync(fixture.loc.report, JSON.stringify(fixture.report));
+  await page.waitForFunction(() => document.querySelector('#qa-progress-count').textContent === '0/2');
+  assert.equal(await page.locator('#qa-progress-bar').getAttribute('aria-valuenow'), '0', 'new captures increase the denominator without claiming QA completion');
   fixture = artifacts(attempt, names, { qaStatuses: ['passed', 'issues', 'unreviewed'] });
   attempt.workflow = 1;
   queue.save();
   await page.waitForFunction(() => document.querySelectorAll('#png-gallery .image-status').length === 3);
   assert.equal(await page.locator('#png-gallery img').count(), 3);
-  assert.deepEqual(await page.locator('#png-gallery .image-status').allInnerTexts(), ['Проверено', 'Есть замечания', 'Не проверено']);
-  assert.equal(await page.locator('#png-gallery .badge').count(), 3, 'each PNG has exactly one common status');
+  assert.deepEqual(await page.locator('#png-gallery .image-status').evaluateAll(nodes => nodes.map(node => node.getAttribute('aria-label'))), ['Проверено', 'Есть замечания', 'Не проверено']);
+  assert.deepEqual(await page.locator('#png-gallery .image-status').allInnerTexts(), ['', '', '']);
+  assert.equal(await page.locator('#png-gallery .badge').count(), 0, 'statuses are compact icons, not body badges');
+  const statusGeometry = await page.locator('#png-gallery .image-status').first().evaluate(node => { const circle = node.getBoundingClientRect(), card = node.closest('.card').getBoundingClientRect(), style = getComputedStyle(node); return { width: circle.width, height: circle.height, top: circle.top - card.top, right: card.right - circle.right, color: style.color, background: style.backgroundColor, radius: style.borderRadius }; });
+  assert.deepEqual(statusGeometry, { width: 24, height: 24, top: 9, right: 9, color: 'rgb(255, 255, 255)', background: 'color(srgb 0.184314 0.701961 0.266667)', radius: '50%' });
   const qaProgress = page.locator('#qa-progress-bar');
   const qaSegments = qaProgress.locator('.qa-progress-segment');
   const tooltipTexts = names.map((name, index) => `${index + 1} — ${name}`);
@@ -849,7 +885,7 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   async function assertGalleryFirst() {
     assert.equal(await page.locator('#job-detail.card').count(), 0);
     assert.equal(await page.locator('#job-detail > div > .card').count(), 4);
-    assert.deepEqual(await page.locator('#results-card > *').evaluateAll(nodes => nodes.map(node => node.id)), ['results-header', 'attempt-header', 'gallery-body', 'stage-two-panel']);
+    assert.deepEqual(await page.locator('#results-card > *').evaluateAll(nodes => nodes.map(node => node.id)), ['results-header', 'attempt-header', 'gallery-body', 'stage-two-panel', 'stage-three-panel', 'stage-four-panel']);
     for (const id of ['attempt-select', 'attempt-duration', 'recapture-button']) assert.equal(await page.locator(`#attempt-header #${id}`).count(), 1);
     assert.equal(await page.locator('#attempt-controls > #recapture-button').count(), 1);
     assert.equal(await page.locator('#attempt-controls').evaluate(node => node.firstElementChild.id), 'recapture-button');
@@ -911,10 +947,14 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
     await hidden;
   }
   await openJson();
-  await page.waitForFunction(() => document.querySelector('#json-output').textContent.startsWith('{'));
-  assert.equal(await page.locator('#json-output').textContent(), JSON.stringify(fixture.report, null, 2));
+  await page.waitForSelector('#json-output .jse-main');
+  assert.equal(await page.evaluate(() => window.ArmEditors.text('json-output')), JSON.stringify(fixture.report, null, 2));
   assert.equal(reportRequests, 1, 'capture report is fetched only after the explicit preview action');
-  assert.ok((await page.locator('#json-original').getAttribute('href')).startsWith(`${origin}/api/files/${job.id}/2/`));
+  assert.ok((await page.locator('#json-download').getAttribute('data-source-url')).startsWith(`${origin}/api/files/${job.id}/2/`));
+  await page.locator('#json-copy').click(); await page.waitForFunction(() => document.querySelector('#json-action-status').textContent === 'Скопировано');
+  assert.equal(await page.evaluate(() => window.copied), JSON.stringify(fixture.report, null, 2));
+  const jsonDownload = page.waitForEvent('download'); await page.locator('#json-download').click();
+  const jsonFile = await jsonDownload; assert.equal(jsonFile.suggestedFilename(), 'capture-report.json'); assert.equal(fs.readFileSync(await jsonFile.path(), 'utf8'), JSON.stringify(fixture.report));
   assert.equal(browser.contexts()[0].pages().length, 1, 'report stays in same tab');
   await page.screenshot({ path: path.join(output, 'ui-json-modal-1440.png') });
   await closeJson();
@@ -941,10 +981,14 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   assert.equal(await page.locator('#png-counter').innerText(), '1 / 3');
   assert.equal(await page.locator('#png-prev').isDisabled(), true);
   assert.equal(await page.locator('#png-full').evaluate(img => img.width === img.naturalWidth && img.height === img.naturalHeight), true);
+  assert.equal(await page.locator('#png-modal .modal-footer a').count(), 0);
+  await page.locator('#png-copy').click(); await page.waitForFunction(() => document.querySelector('#png-action-status').textContent === 'Скопировано');
+  assert.deepEqual(await page.evaluate(() => window.copied), { type: 'image/png', size: tinyPng.length });
+  const pngDownload = page.waitForEvent('download'); await page.locator('#png-download').click();
+  const pngFile = await pngDownload; assert.equal(pngFile.suggestedFilename(), names[0]); assert.deepEqual(fs.readFileSync(await pngFile.path()), tinyPng);
   await page.locator('#png-next').click();
   assert.equal(await page.locator('#png-counter').innerText(), '2 / 3');
-  assert.equal(await page.locator('#png-status .image-status').innerText(), 'Есть замечания');
-  assert.equal(await page.locator('#png-status .badge').count(), 1);
+  assert.equal(await page.locator('#png-modal .image-status, #png-status').count(), 0);
   await page.keyboard.press('ArrowRight');
   assert.equal(await page.locator('#png-counter').innerText(), '3 / 3');
   assert.equal(await page.locator('#png-next').isDisabled(), true);
@@ -962,7 +1006,7 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   const pushedAt = Date.now(), pushedState = page.waitForResponse(response => response.url() === `${origin}/api/state`);
   queue.notifyReviewAccepted({ jobId: job.id, attempt: attempt.number, name: names[2] });
   await pushedState;
-  await page.waitForFunction(() => document.querySelector('#png-status .image-status')?.textContent === 'Проверено');
+  await page.waitForFunction(() => [...document.querySelectorAll('#png-gallery .image-status')].every(node => node.getAttribute('aria-label') === 'Проверено'));
   await page.waitForFunction(node => !node.isConnected, segmentsBeforeSse[0]);
   assert.ok(Date.now() - pushedAt < 1000, 'SSE refresh arrives before the 1500ms polling fallback');
   assert.equal(await page.locator('#qa-progress-count').innerText(), '3/3');
@@ -976,17 +1020,21 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   await page.waitForTimeout(1700);
   assert.equal(reportRequests, reportRequestsAfterPreview, 'polling does not inspect capture-report.json for QA state');
   assert.equal(await page.locator('#png-counter').innerText(), '2 / 3');
-  assert.ok((await page.locator('#png-original').getAttribute('href')).startsWith(`${origin}/api/files/${job.id}/2/`));
+  assert.ok((await page.locator('#png-download').getAttribute('data-source-url')).startsWith(`${origin}/api/files/${job.id}/2/`));
   await closePng();
   assert.equal(await originalTrigger.evaluate(node => node.isConnected), false, 'polling replaced the original gallery trigger');
   assert.equal(await page.locator('#png-gallery button').first().evaluate(node => document.activeElement === node), true, 'Escape restores focus to the current button with the original file identity');
+  await page.keyboard.press('Tab');
+  assert.equal(await page.locator('#png-gallery .image-status').first().evaluate(node => document.activeElement === node), true, 'compact status is keyboard accessible');
+  await page.waitForSelector('.tooltip.show');
+  assert.equal(await page.locator('.tooltip.show .tooltip-inner').innerText(), 'Проверено');
   await page.keyboard.press('Tab');
   assert.equal(await page.locator('#png-gallery button').nth(1).evaluate(node => document.activeElement === node), true, 'next Tab continues through the gallery, not the URL form');
   await page.selectOption('#attempt-select', '1');
   await page.waitForFunction(() => document.querySelectorAll('#png-gallery img').length === 1);
   await openFirstPng();
   assert.equal(await page.locator('#png-counter').innerText(), '1 / 1');
-  assert.ok((await page.locator('#png-original').getAttribute('href')).includes(`/1/`));
+  assert.ok((await page.locator('#png-download').getAttribute('data-source-url')).includes(`/1/`));
   await closePng();
 
   const invalid = ['http://a.reestr35.ru', 'https://reestr35.ru', 'https://a.reestr35.ru.evil.test', 'https://x:y@a.reestr35.ru', 'https://a.reestr35.ru:444', 'https://a.reestr35.ru./', 'https://a.reestr35.ru\\@evil.test', 'https://-a.reestr35.ru', '/relative', '', 'https://a.reestr35.ru/a b'];

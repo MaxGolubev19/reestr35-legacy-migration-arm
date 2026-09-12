@@ -7,7 +7,7 @@ const { acquireLock, createShutdownController } = require('./infrastructure/serv
 
 // Public Queue API remains compatible while the page scheduler owns no stage implementation.
 class Queue extends PageQueue {
-  constructor(options = {}) { super({ ...options, stageFactory: createStage }); }
+  constructor(options = {}) { super({ ...options, stageFactory: options.stageFactory || createStage }); }
   get reviewListeners() { return this.listenersFor('qa-review'); }
   set reviewListeners(listeners) { this.listeners.set('qa-review', listeners); }
   subscribeReviews(listener) { return this.subscribe('qa-review', listener); }

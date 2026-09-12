@@ -10,6 +10,7 @@ const { atomicJson } = require('../infrastructure/files.cjs');
 const { resolveRuntime } = require('../infrastructure/runtime.cjs');
 const { stopTree } = require('../infrastructure/process.cjs');
 const { launchWorker } = require('../infrastructure/launcher.cjs');
+const { restoreDuration, checkpointDuration } = require('./duration.cjs');
 const pidAlive = pid => { if (!Number.isInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
 const now = () => new Date().toISOString();
 const last = job => job.attempts.at(-1);
@@ -42,20 +43,28 @@ class PageQueue {
       this.concurrency = saved.concurrency;
     }
     if (!Array.isArray(this.jobs)) throw new Error('Некорректный state.json; сохраните его для диагностики');
+    this.nextQueueOrder = this.jobs.flatMap(job => job.attempts).reduce((max, attempt) => Math.max(max, attempt.queueOrder || 0), 0);
     for (const job of this.jobs) {
       if (!/^[a-f0-9-]{36}$/.test(job.id) || normalizeUrl(job.url) !== job.url || !Array.isArray(job.attempts) || !job.attempts.length) throw new Error('Некорректное задание в state.json');
       for (const attempt of job.attempts) {
         if (!Number.isInteger(attempt.number) || attempt.number < 1) throw new Error('Некорректная попытка');
+        restoreDuration(attempt);
         this.stage.restoreAttempt(job, attempt);
       }
     }
-    this.nextQueueOrder = this.jobs.flatMap(job => job.attempts).reduce((max, attempt) => Math.max(max, attempt.queueOrder || 0), 0);
     this.save();
-    this.recoveryTimer = this.setTimer(() => { if (this.autoStart && !this.closing) this.pump(); }, 1000);
+    this.recoveryTimer = this.setTimer(() => {
+      if (!this.closing && this.jobs.some(job => job.attempts.some(attempt => Number.isFinite(attempt.activeSince)))) {
+        try { this.save(); } catch (error) { console.error('Active duration checkpoint:', error.message); }
+      }
+      if (this.autoStart && !this.closing) this.pump();
+    }, 1000);
     this.recoveryTimer?.unref?.();
     if (autoStart) setImmediate(() => this.pump());
   }
   save() {
+    const timestamp = this.clock();
+    for (const job of this.jobs) for (const attempt of job.attempts) checkpointDuration(attempt, timestamp);
     atomicJson(this.stateFile, { version: 2, concurrency: this.concurrency, jobs: this.jobs });
   }
   listenersFor(eventName) {
@@ -98,7 +107,7 @@ class PageQueue {
     return result;
   }
   newAttempt(job) {
-    const attempt = { ...this.stage.attemptFields(), number: job.attempts.reduce((max, item) => Math.max(max, item.number), 0) + 1, status: 'queued', createdAt: now(), queuedAt: now(), queueOrder: ++this.nextQueueOrder, issues: [], files: [] };
+    const attempt = { ...this.stage.attemptFields(), number: job.attempts.reduce((max, item) => Math.max(max, item.number), 0) + 1, status: 'queued', createdAt: now(), queuedAt: now(), queueOrder: ++this.nextQueueOrder, issues: [], files: [], activeDurationMs: 0, activeSince: null, durationIncomplete: false };
     fs.mkdirSync(path.join(this.root, 'runs', job.id), { recursive: true });
     let locations;
     // Reserve atomically. Preserve orphan folders left before a state.json save.

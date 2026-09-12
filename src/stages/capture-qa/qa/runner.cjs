@@ -19,7 +19,7 @@ function launchQa(queue, job, attempt) {
     try {
       const evidence = checkManifest(queue.root, job, attempt, qa.manifest);
       session = nextReview(qa.manifest, qa.progress);
-      if (!session) { attempt.status = queue.stage.outcome(job, attempt); queue.save(); return; }
+      if (!session) { attempt.status = queue.stage.outcome(job, attempt); queue.stage.afterQa?.(job, attempt); queue.save(); return; }
       const progress = { ...qa.progress, generation: session.generation, policy: session.policy };
       atomicJson(p.progress, progress); qa.progress = progress;
       qaDir = stageBatch(p.hostDir, session, queue.root);
@@ -80,7 +80,7 @@ function launchQa(queue, job, attempt) {
         queue.stage.refreshArtifacts(job, attempt);
         attempt.status = attempt.cancellationRequested ? 'cancelled' : attempt.pauseRequested ? 'paused' : queue.stage.outcome(job, attempt);
         fs.rmSync(qaDir, { recursive: true, force: true });
-        atomicJson(path.join(p.dir, 'result.json'), attempt); queue.save(); queue.pump();
+        atomicJson(path.join(p.dir, 'result.json'), attempt); queue.stage.afterQa?.(job, attempt); queue.save(); queue.pump();
       });
     } catch (error) {
       if (appServer && !queue.active.has(job.id)) appServer.shutdown().finally(() => queue.qaServers.delete(appServer)).catch(failure => console.error('QA shutdown:', failure.message));

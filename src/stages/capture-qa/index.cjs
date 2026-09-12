@@ -106,8 +106,9 @@ class CaptureQaStage {
         if (attempt.workflow === 2) {
           try {
             const artifacts = this.refreshArtifacts(job, attempt, this.snapshotPngCache);
-            if (attempt.captureSealed && ['complete', 'needs_review', 'incomplete'].includes(attempt.status)) attempt.status = this.outcome(job, attempt, artifacts);
-          } catch (error) { attempt.error = error.message; if (attempt.status === 'complete') attempt.status = 'incomplete'; }
+            if (attempt.phase === 'html-media') attempt.captureStatus = this.outcome(job, attempt, artifacts);
+            else if (attempt.captureSealed && ['complete', 'needs_review', 'incomplete'].includes(attempt.status)) attempt.status = this.outcome(job, attempt, artifacts);
+          } catch (error) { attempt.error = error.message; if (attempt.phase === 'html-media') attempt.captureStatus = 'incomplete'; else if (attempt.status === 'complete') attempt.status = 'incomplete'; }
         }
       }
     } finally { this.snapshotPngCache.end(); }

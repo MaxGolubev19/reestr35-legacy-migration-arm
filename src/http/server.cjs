@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const { APP_ROOT } = require('../data-dir.cjs');
 const { safeFile } = require('../infrastructure/files.cjs');
 const { attemptDir } = require('../pipeline/paths.cjs');
+const { origins: embedOrigins } = require('../../public/embed-policy.js');
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
 function json(res, code, value) { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); }
 async function body(req) {
@@ -20,13 +21,17 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
   let shutdownRequested = false;
   const assets = new Map([
     ['/', ['index.html', 'text/html; charset=utf-8']], ['/app.js', ['app.js', 'text/javascript; charset=utf-8']], ['/app.css', ['app.css', 'text/css; charset=utf-8']],
+    ['/html-media.js', ['html-media.js', 'text/javascript; charset=utf-8']],
+    ['/embed-policy.js', ['embed-policy.js', 'text/javascript; charset=utf-8']],
+    ['/modal-actions.js', ['modal-actions.js', 'text/javascript; charset=utf-8']],
+    ['/vendor/editors/editors.js', ['vendor/editors/editors.js', 'text/javascript; charset=utf-8']],
     ['/vendor/css/tabler.css', ['vendor/css/tabler.css', 'text/css; charset=utf-8']], ['/vendor/js/tabler.js', ['vendor/js/tabler.js', 'text/javascript; charset=utf-8']],
     ['/assets/astronaut.png', ['assets/astronaut.png', 'image/png']],
     ['/assets/html-media-in-development.png', ['assets/html-media-in-development.png', 'image/png']],
   ]);
   const server = http.createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'");
+    res.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-src ${embedOrigins.join(' ')}; base-uri 'none'; frame-ancestors 'none'`);
     res.setHeader('Referrer-Policy', 'no-referrer');
     try {
       const host = `127.0.0.1:${server.address().port}`;
@@ -37,6 +42,17 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         if (req.headers['x-csrf-token'] !== csrfToken) return json(res, 403, { error: 'Неверный CSRF token; обновите страницу' });
         if (url.pathname === '/api/shutdown' && (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin')) {
           return json(res, 403, { error: 'Отключение разрешено только из локального интерфейса' });
+        }
+        const upload = url.pathname.match(/^\/api\/html-media\/([a-f0-9-]{36})\/([1-9][0-9]*)\/upload$/);
+        if (upload) {
+          if (req.headers.origin !== `http://${host}`) return json(res, 403, { error: 'Для загрузки требуется локальный Origin' });
+          if (!/^application\/octet-stream(?:;|$)/i.test(req.headers['content-type'] || '')) return json(res, 415, { error: 'Нужен application/octet-stream' });
+          const job = queue.get(upload[1]), attempt = job.attempts.find(a => a.number === Number(upload[2]));
+          if (!attempt) return json(res, 404, { error: 'Попытка не найдена' });
+          const revision = Number(req.headers['x-html-revision']);
+          if (!Number.isSafeInteger(revision) || revision < 0 || req.headers['x-html-revision'] === undefined) throw conflict('Требуется revision');
+          req.setTimeout(60000, () => req.destroy());
+          return json(res, 200, await queue.stage.media.upload(job, attempt, revision, req));
         }
         const data = await body(req);
         if (url.pathname === '/api/shutdown') {
@@ -77,6 +93,25 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         return;
       }
       if (url.pathname === '/api/state') return json(res, 200, queue.snapshot(csrfToken));
+      const media = url.pathname.match(/^\/api\/html-media\/([a-f0-9-]{36})\/([1-9][0-9]*)\/([1-9][0-9]*)\/(manifest|source|code|objects\/[a-f0-9]{64})$/);
+      if (media) {
+        const job = queue.get(media[1]), attempt = job.attempts.find(a => a.number === Number(media[2]));
+        if (!attempt || attempt.htmlMedia?.revision !== Number(media[3])) return json(res, 404, { error: 'Revision недоступна' });
+        const stage = queue.stage.media, manifest = stage.read(job, attempt), dir = stage.directory(job, attempt);
+        if (media[4] === 'manifest') return json(res, 200, manifest);
+        if (media[4] === 'code') {
+          const bytes = fs.readFileSync(safeFile(queue.root, safeFile(dir, path.join(dir, 'source.html'))));
+          let text; try { text = new TextDecoder(manifest.source.encoding || 'utf-8').decode(bytes); } catch { text = bytes.toString('utf8'); }
+          return json(res, 200, { text });
+        }
+        const source = media[4] === 'source', item = source ? null : manifest.resources.find(r => r.status === 'downloaded' && r.object === media[4]);
+        if (!source && !item) return json(res, 404, { error: 'Object не входит в manifest' });
+        const file = safeFile(queue.root, safeFile(dir, path.join(dir, source ? 'source.html' : item.object)));
+        const inlineImage = item && ['image/png','image/jpeg','image/gif','image/webp','image/avif','image/bmp'].includes(item.mime);
+        res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'");
+        res.writeHead(200, { 'Content-Type': inlineImage ? item.mime : 'application/octet-stream', 'Content-Disposition': `${inlineImage ? 'inline' : 'attachment'}; filename="${source ? 'source.html' : item.sha256}"` });
+        const stream = fs.createReadStream(file); stream.on('error', () => res.destroy()); stream.pipe(res); return;
+      }
       const logs = url.pathname.match(/^\/api\/logs\/([a-f0-9-]{36})\/([1-9][0-9]*)$/);
       if (logs) {
         const job = queue.get(logs[1]), attempt = job.attempts.find(a => a.number === Number(logs[2]));

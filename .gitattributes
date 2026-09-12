@@ -1,1 +1,7 @@
 build/licenses/*.txt text eol=lf -whitespace
+src/resources/** -text
+public/vendor/editors/** -text
+src/ui/editors.js text eol=lf
+build/bundle-editors.cjs text eol=lf
+package.json text eol=lf
+package-lock.json text eol=lf

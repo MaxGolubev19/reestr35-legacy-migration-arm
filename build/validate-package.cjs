@@ -49,6 +49,22 @@ assert.equal(exe.readUInt16LE(pe + 4), 0x8664, 'x64');
 assert.equal(exe.readUInt16LE(pe + 24 + 68), 2, 'Windows GUI subsystem');
 assert.equal(require(path.join(root,'runtime/node_modules/playwright/package.json')).version, '1.62.1');
 assert.equal(require(path.join(root,'runtime/node_modules/sharp/package.json')).version, '0.35.4');
+for (const [name, version] of [['parse5','7.3.0'],['ipaddr.js','2.2.0'],['postcss-value-parser','4.2.0']]) {
+  assert.equal(require(path.join(root, 'runtime/node_modules', name, 'package.json')).version, version);
+  assert.ok(fs.readdirSync(path.join(root, 'runtime/node_modules', name)).some(file => /^licen[cs]e/i.test(file)), `${name} license`);
+}
+for (const file of ['src/stages/workflow.cjs','src/stages/html-media/index.cjs','src/stages/html-media/inventory.cjs','src/stages/html-media/download.cjs','src/resources/domains.json','public/html-media.js','public/modal-actions.js']) assert(fs.statSync(path.join(root, file)).isFile(), file);
+const sourceReport = JSON.parse(fs.readFileSync(path.join(root, 'src/resources/import-report.json')));
+const editors = JSON.parse(fs.readFileSync(path.join(root, 'public/vendor/editors/manifest.json'))), runtimePackage = JSON.parse(fs.readFileSync(path.join(root, 'runtime/package.json')));
+for (const [name, sha] of Object.entries(editors.files)) assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'public/vendor/editors', name))).digest('hex'), sha, `editor bundle/license: ${name}`);
+for (const [name, version] of Object.entries(runtimePackage.devDependencies)) {
+  if (name === 'esbuild') assert.equal(editors.esbuild, version);
+  else assert.equal(editors.components.find(component => component.name === name)?.version, version, `editor component ${name}`);
+}
+for (const name of ['src/ui/editors.js','package.json','package-lock.json']) assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, name.startsWith('src/') ? name : 'runtime/' + name))).digest('hex'), editors.sources[name], `editor source ${name}`);
+for (const component of editors.components) assert.ok(component.files.length && component.files.every(file => editors.files[file]), `bundled licenses: ${component.name}`);
+assert.equal(sourceReport.copied.length, 92); assert.equal(sourceReport.missing.length, 33); assert.equal(sourceReport.unmatched.length, 3);
+for (const source of sourceReport.copied) assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'src/resources/html', source.hostname + '.html'))).digest('hex'), source.sha256);
 const resourceOffset = pe + 24 + 112 + 16;
 assert(exe.readUInt32LE(resourceOffset) > 0, 'embedded icon/version resources');
 console.log('Package structure, runtime versions, licenses and GUI PE resources validated.');

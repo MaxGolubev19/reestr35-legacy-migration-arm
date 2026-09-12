@@ -46,8 +46,8 @@
                   <div class="steps steps-counter" role="tablist" aria-label="Этапы">
                     <a id="stage-step-1" class="step-item active" href="#gallery-body" role="tab" aria-controls="gallery-body" aria-selected="true">Скриншоты</a>
                     <a id="stage-step-2" class="step-item" role="tab" aria-controls="stage-two-panel" aria-selected="false" aria-disabled="true" tabindex="-1">HTML и медиа</a>
-                    <a id="stage-step-3" class="step-item" role="tab" aria-selected="false" aria-disabled="true" tabindex="-1">Новая страница</a>
-                    <a id="stage-step-4" class="step-item" role="tab" aria-selected="false" aria-disabled="true" tabindex="-1">Приёмка</a>
+                    <a id="stage-step-3" class="step-item" role="tab" aria-controls="stage-three-panel" aria-selected="false" aria-disabled="true" tabindex="-1">Новая страница</a>
+                    <a id="stage-step-4" class="step-item" role="tab" aria-controls="stage-four-panel" aria-selected="false" aria-disabled="true" tabindex="-1">Приёмка</a>
                   </div>
                 </nav>
               </div>
@@ -55,21 +55,27 @@
             <div class="card-header attempt-header" id="attempt-header">
               <div id="attempt-controls" class="attempt-controls d-flex flex-wrap align-items-center gap-2">
                 <button id="recapture-button" type="button" class="btn btn-outline-primary btn-icon flex-shrink-0" aria-label="Перезапустить" title="Перезапустить"><svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg></button>
+                <output id="attempt-duration" class="form-control w-auto attempt-duration" aria-label="Активное время попытки">00:00:00</output>
                 <select id="attempt-select" class="form-select w-auto" aria-label="Попытка"></select>
-                <span id="attempt-duration" class="text-secondary font-monospace" aria-label="Длительность попытки">—</span>
               </div>
-              <div id="qa-progress" class="qa-progress d-none ms-auto"><div id="qa-progress-count" class="qa-progress-count text-secondary" aria-hidden="true">0/0</div><div id="qa-progress-bar" class="progress progress-sm" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Проверено 0 из 0 PNG"></div></div>
+              <div id="qa-progress" class="qa-progress ms-auto"><div id="qa-progress-count" class="qa-progress-count text-secondary" aria-hidden="true">0/0</div><div id="qa-progress-bar" class="progress progress-sm" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Проверено 0 из 0 PNG"></div></div>
+              <div id="media-progress" class="qa-progress d-none ms-auto"><div id="media-progress-count" class="qa-progress-count text-secondary" aria-hidden="true">0/0</div><div class="progress progress-sm" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Обработано 0 из 0 ресурсов"><div id="media-progress-bar" class="progress-bar" style="width:0%"></div></div></div>
             </div>
             <div class="card-body" id="gallery-body" role="tabpanel" aria-labelledby="stage-step-1" tabindex="0">
               <div id="png-gallery" class="row g-3"></div>
             </div>
             <div id="stage-two-panel" class="card-body d-none" role="tabpanel" aria-labelledby="stage-step-2" tabindex="0">
+              <div id="html-media-content"></div>
+            </div>
+            <div id="stage-three-panel" class="card-body d-none" role="tabpanel" aria-labelledby="stage-step-3" tabindex="0">
               <div class="empty stage-placeholder">
                 <img class="empty-img stage-placeholder-illustration" src="/assets/html-media-in-development.png" alt="" width="1024" height="1024">
-                <p class="empty-title">HTML и медиа</p>
+                <p class="empty-title">Новая страница</p>
                 <p class="empty-subtitle text-secondary">Раздел ещё в разработке.</p>
-                <div class="empty-action"><button id="back-to-stage-one" type="button" class="btn btn-primary">К скриншотам</button></div>
               </div>
+            </div>
+            <div id="stage-four-panel" class="card-body d-none" role="tabpanel" aria-labelledby="stage-step-4" tabindex="0">
+              <div class="empty stage-placeholder"><img class="empty-img stage-placeholder-illustration" src="/assets/html-media-in-development.png" alt="" width="1024" height="1024"><p class="empty-title">Приёмка</p><p class="empty-subtitle text-secondary">Раздел ещё в разработке.</p></div>
             </div>
             </div></div>
               <div class="col-12 col-xxl-6" id="metadata-panel"><div class="card h-100">
@@ -97,15 +103,16 @@
   </div>
 </div>
 <div class="modal fade" id="png-modal" tabindex="-1" aria-labelledby="png-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
-  <div class="modal-header"><div class="detail-heading"><h3 class="modal-title text-break" id="png-modal-title">Снимок</h3><div class="d-flex flex-wrap gap-2 mt-2"><span id="png-counter" class="text-secondary"></span><span id="png-status" class="d-flex flex-wrap gap-2"></span></div></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button></div>
-  <div class="modal-body gallery-viewport"><div id="png-error" class="alert alert-warning d-none" role="alert">Не удалось загрузить PNG. Попробуйте открыть оригинал.</div><img id="png-full" class="gallery-full-image" alt=""></div>
-  <div class="modal-footer justify-content-between gap-2"><div class="btn-list"><button id="png-prev" type="button" class="btn btn-outline-secondary">Предыдущий</button><button id="png-next" type="button" class="btn btn-outline-secondary">Следующий</button></div><a id="png-original" class="btn btn-primary" target="_blank" rel="noopener noreferrer">Оригинал PNG</a></div>
+  <div class="modal-header"><div class="detail-heading modal-image-heading"><h3 class="modal-title" id="png-modal-title">Снимок</h3><span id="png-counter" class="text-secondary image-counter"></span></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button></div>
+  <div class="modal-body gallery-viewport"><div id="png-error" class="alert alert-warning d-none" role="alert">Не удалось загрузить PNG.</div><img id="png-full" class="gallery-full-image" alt=""></div>
+  <div class="modal-footer justify-content-between gap-2"><div class="btn-list"><button id="png-prev" type="button" class="btn btn-outline-secondary">Предыдущий</button><button id="png-next" type="button" class="btn btn-outline-secondary">Следующий</button></div></div>
 </div></div></div>
 <div class="modal fade" id="json-modal" tabindex="-1" aria-labelledby="json-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
   <div class="modal-header"><h3 class="modal-title text-break" id="json-modal-title">capture-report.json</h3><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть JSON"></button></div>
-  <div class="modal-body"><div id="json-error" class="alert alert-danger d-none" role="alert"></div><pre id="json-output" class="bg-body-secondary text-body rounded p-3 json-output mb-0" aria-live="polite"></pre></div>
-  <div class="modal-footer"><a id="json-original" class="btn btn-primary" target="_blank" rel="noopener noreferrer">Оригинал JSON</a></div>
+  <div class="modal-body"><div id="json-error" class="alert alert-danger d-none" role="alert"></div><div id="json-output" class="editor-host"></div></div>
 </div></div></div>
-<script src="/vendor/js/tabler.js"></script><script src="/app.js"></script>
+<div class="modal fade" id="media-modal" tabindex="-1" aria-labelledby="media-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
+<div class="modal-header"><div class="detail-heading modal-image-heading"><h3 id="media-modal-title" class="modal-title">HTML и медиа</h3><span id="media-counter" class="text-secondary image-counter"></span></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button></div><div id="media-modal-body" class="modal-body media-modal-body"></div><div id="media-navigation" class="modal-footer justify-content-between gap-2 d-none"><div class="btn-list"><button id="media-prev" type="button" class="btn btn-outline-secondary">Предыдущий</button><button id="media-next" type="button" class="btn btn-outline-secondary">Следующий</button></div></div></div></div></div>
+<script src="/vendor/js/tabler.js"></script><script src="/vendor/editors/editors.js"></script><script src="/modal-actions.js"></script><script src="/embed-policy.js"></script><script src="/html-media.js"></script><script src="/app.js"></script>
 </body>
 </html>

@@ -76,7 +76,7 @@ local/
 
 Обработка разделена на три уровня:
 
-- `src/pipeline/queue.cjs` — общий жизненный цикл страницы: задания и попытки, сохранение state, FIFO, concurrency, остановка и snapshot. `pipeline/registry.cjs` подключает единственный реализованный этап.
+- `src/pipeline/queue.cjs` — общий жизненный цикл страницы: задания и попытки, сохранение state, FIFO, concurrency, остановка и snapshot. `pipeline/registry.cjs` подключает workflow с capture/QA и HTML/медиа.
 - `src/stages/capture-qa/index.cjs` — координатор этапа capture + QA: восстановление, переходы между операциями, целостность результата и правила повторной QA.
 - `stages/capture-qa/capture/` — capture helper, запуск, inventory/coverage и immutable manifest; `stages/capture-qa/qa/` — отдельный запуск QA, policy, checkpoints, staging и app-server.
 
@@ -84,7 +84,29 @@ HTTP/SSE и защита запросов находятся в `src/http/server
 
 Очередь получает этап через `stageFactory`. Этап задаёт начальные поля попытки, восстановление и проекцию, выбирает следующую операцию в `start(job, attempt)` и сообщает о занятых восстановленными процессами слотах. Каждый runner регистрирует процесс в общем `active`, предоставляет `armInterrupt()` и освобождает слот только после подтверждённого завершения. Переход `afterCapture` ставит QA в хвост общей FIFO-очереди: capture и QA занимают отдельные слоты. Runners используют контекст очереди для сохранения state и уведомлений, а coordinator определяет результат этапа.
 
-`state.json` остаётся версии 2, попытки сохраняют `workflow`, `phase`, прежние статусы и плоские поля. Расположение `runs`, версии manifest/progress, идентичность QA policy, HTTP/SSE и UI не меняются. Второй этап и миграция схемы пока не реализованы.
+`state.json` остаётся версии 2. `pipeline/registry.cjs` подключает `stages/workflow.cjs`: capture/QA и второй этап `stages/html-media/`. Успешный capture/QA сохраняет `captureStatus: complete`, затем попытка переходит в `phase: html-media`, `status: paused`. При загрузке прежние успешные попытки workflow 2 проходят тот же переход. Это не запускает скачивание: нажмите «Продолжить» в очереди или во втором этапе. Manifest и checkpoints первого этапа остаются неизменными; их целостность продолжает проверяться.
+
+### HTML и медиа
+
+Приложение содержит `src/resources/domains.json` и 92 исходных HTML в `src/resources/html/<hostname>.html`. `import-report.json` фиксирует SHA256, 33 домена без HTML и 3 HTML без домена; для них соответствия не угадывались. Источники импортированы из согласованной выгрузки `domains.json` + `todo/paid`. Повторный явный импорт для разработчика: `node build/import-html.cjs <domains.json> <paid-directory> src/resources`. Portable-сборка копирует весь `src/`; доступ к прежнему workspace во время работы не нужен.
+
+Для каждой попытки HTML копируется byte-for-byte в `runs/<job>/attempt-NNN/html-media/revision-NNN/source.html`. Рядом находятся атомарный `manifest.json` и `objects/<sha256>`. Источник revision неизменяем; ручная замена создаёт следующую revision и сохраняет прежнюю на диске. Номер revision не показывается в подписи карточки. При отсутствии/ошибке HTML нажатие карточки открывает выбор файла. Загрузка ограничена 8 MiB, защищена Origin/CSRF и номером попытки/revision; после неё требуется «Продолжить» в общем статусе очереди. Continue/Pause не дублируются в содержимом этапа.
+
+HTML modal использует настоящий CodeMirror 6 read-only/non-editable: светлая тема, подсветка HTML, номера строк и folding gutter без поиска; прокручивается только содержимое редактора, а не внешний контейнер modal. Prettier 3.9.6 HTML parser форматирует только копию для просмотра; при ошибке показаны raw text и предупреждение. JSON modal использует vanilla-jsoneditor 3.13.0 как одно read-only дерево со сворачиванием узлов, без переключателя режима, поиска, меню, navigation/status bars и toolbar; встроенные Ctrl/Cmd+F и Ctrl/Cmd+H блокируются только внутри viewer. Editors уничтожаются при закрытии/новом запросе, асинхронный formatter не может восстановить закрытый viewer. HTML/scripts не исполняются; скачивание сохраняет исходные bytes.
+
+Offline browser bundle создаётся `npm run build:editors` после `npm ci`; `npm run check:editors` и тест сравнивают воспроизводимую сборку с сохранёнными файлами. Release build устанавливает pinned devDependencies и отказывает при stale bundle. `public/vendor/editors/manifest.json` фиксирует версии, source/output SHA и лицензии всех включённых компонентов; package validation повторяет проверку. JSONEditor уже содержит некоторые upstream-компоненты: они определяются по published sourcemap; для них отдельно указана версия pinned license-source, не выдаваемая за внутреннюю версию upstream bundle. Полные licenses/Prettier third-party notices входят в portable, runtime npm/CDN/imports не нужны.
+
+В заголовках HTML, JSON и PNG/image modal находятся компактные кнопки копирования и скачивания перед закрытием. Текст копируется в показанном виде, скачивается исходный файл; raster копируется через ClipboardItem (при необходимости преобразуется в PNG). После успеха цвет остаётся нейтральным, подтверждение доступно aria-live; ошибки остаются видимыми. QA-статус PNG показан только компактным кругом в углу thumbnail, не в modal; текст доступен через tooltip и accessible label. Оба image modal имеют title/counter в строке, Previous/Next и стрелки; возвращают фокус исходной карточке даже после polling. Обе галереи используют одинаковые размеры, padding, object-fit и responsive columns, без captions под изображениями.
+
+parse5 разбирает HTML без выполнения JavaScript. Inventory включает img/src, srcset, ссылки на изображения/документы/архивы, CSS url(), video/audio/source, poster, iframe, embed/object. Относительные URL считаются от URL задания, а не от `<base>`; это предположение записано в provenance. Скрипты, обработчики событий, lazy data-src, Flash, data/blob/file/javascript и CSS URL с escape отмечаются unsupported. Внешние iframe/страницы embed сохраняются как ссылки; видео со страниц не извлекается. Тексты распознаются как UTF-8 либо по объявленному charset; исходные байты не преобразуются.
+
+Ссылки с расширением в атрибуте `download` тоже входят в inventory (например, `/download?id=4` + `download="manual.pdf"`); имя сохраняется в occurrence. Для raster MIME проверяются сигнатуры, включая BMP file/DIB header и AVIF ftyp/brands. Неизвестные `application/x-*`, Flash MIME и неподтверждённые бинарные payload отклоняются. `application/octet-stream` принимается только при узнаваемой сигнатуре поддерживаемого формата.
+
+Каждый ресурс содержит исходный/resolved URL, occurrence, redirect chain/final URL, MIME, bytes, SHA256, object или причину ошибки. Частичные ошибки дают `htmlMedia.status: ready_with_issues` и общий `status: complete`, сохраняя успешные объекты. Прогресс в state содержит только счётчики; полный inventory запрашивается отдельно. Шаги открываются последовательно: успешный capture+QA → HTML и медиа → после завершения второго этапа «Новая страница». Это пока заглушка без завершения, поэтому «Приёмка» остаётся disabled. Завершённые шаги зелёные, текущий доступный следующий — серый; мышь и клавиатура не открывают будущие шаги.
+
+Пауза ожидает завершения текущего файла и атомарного checkpoint. После перезапуска backend активный второй этап становится paused; продолжение проверяет SHA256 источника/готовых объектов и не скачивает их повторно. Shutdown прерывает сетевой запрос, удаляет временный файл и сохраняет последний checkpoint. Неподтверждённый файл после аварии может скачаться повторно. Замена HTML и retry запрещены во время работающего worker/загрузки; retry по-прежнему создаёт новую попытку capture.
+
+Скачиваются только HTTP(S) ресурсы без credentials. Каждый redirect проходит повторную проверку всех DNS-адресов; соединение закрепляется за проверенным IP. Запрещены private, loopback, link-local, metadata, multicast и прочие непубличные диапазоны. Лимиты: 3000 occurrences (крупнейший bundled HTML содержит 2740), 32 MiB на файл, 256 MiB на revision включая ошибочные передачи, 30 секунд на ресурс, 5 redirects. Проверяются MIME и сигнатуры распространённых форматов; HTML/script-ответы отклоняются. SVG и документы выдаются только как attachment/octet-stream с sandbox CSP; inline разрешены проверенные растровые изображения. HTML никогда не выдаётся активным документом на origin приложения.
 
 ### Выполнение
 
@@ -104,7 +126,7 @@ QA policy v5 имеет отдельные version/hash, не входящие �
 
 | Статус | Подпись, цвет, значок | Действие статуса |
 | --- | --- | --- |
-| `paused` | На паузе, серый, пауза | Продолжить текущий capture/QA после проверки checkpoint и lease |
+| `paused` | На паузе, серый, пауза | Продолжить текущий capture/QA либо HTML и медиа после проверки checkpoints |
 | `queued` | В очереди, синий, часы | Приостановить немедленно (capture и QA) |
 | `running` | Выполняется, синий, анимация | Приостановить capture с сохранением прогресса |
 | `validating` | Проверяется, синий, анимация; в результате azure badge | Приостановить QA с сохранением принятых checkpoints |
@@ -165,6 +187,7 @@ npm test
 | Команда | Что проверяет |
 | --- | --- |
 | `npm run test:backend` | Очередь, manifest, checkpoints, stop/recovery и API |
+| `npm run test:html-media` | Импорт, migration, статический inventory, SSRF/лимиты, upload, pause/resume, API и браузерный UI второго этапа |
 | `npm run test:ui` | Интерфейс и браузерные сценарии |
 | `npm run test:capture` | Самостоятельный capture helper |
 | `npm run test:portability` | `local/`, `ARM_DATA_DIR`, чужая cwd и перенос данных |

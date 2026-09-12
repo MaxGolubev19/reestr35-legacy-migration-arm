@@ -28,6 +28,8 @@ function setup(t, options = {}) {
     sessions.push(child); return child;
   } }; appServers.push(appServer); return appServer; };
   const queue = new Queue({ root, autoStart: false, concurrency: 1, qaAutoRetryLimit: 0, clock: () => time, idleTimeoutMs: 100,
+    // This suite owns the capture/QA contract; html-media.test exercises composed transitions.
+    stageFactory: (queue, config) => new (require('../src/stages/capture-qa/index.cjs').CaptureQaStage)(queue, config),
     setTimer: () => 1, clearTimer() {}, isPidAlive: () => false, appServerFactory,
     spawnFn(command, args, config) {
       const child = new EventEmitter(); child.pid = 990000 + children.length; child.exitCode = null;
@@ -58,6 +60,17 @@ function capture(ctx, count, finished = true, status = 'complete', job = ctx.que
 function start(t, count = 11, options = {}) { const ctx = setup(t, options); ctx.queue.add('https://a.reestr35.ru'); ctx.queue.pump(); Object.assign(ctx, capture(ctx, count)); return ctx; }
 function qa(ctx) { ctx.children[0].finish(0); const child = ctx.sessions.at(-1); child.bind(); return child; }
 function pass(child, count = child.config.files.length) { for (const file of child.config.files.slice(0, count)) child.record(file); }
+
+test('composed workflow enters paused HTML stage only after final QA process close and preserves capture result', t => {
+  const ctx = start(t, 1, { stageFactory: require('../src/pipeline/registry.cjs').createStage });
+  const child = qa(ctx); pass(child);
+  assert.equal(ctx.attempt.phase, 'qa'); assert.equal(ctx.queue.snapshot('').jobs[0].isActive, true);
+  child.finish();
+  assert.equal(ctx.attempt.phase, 'html-media'); assert.equal(ctx.attempt.status, 'paused'); assert.equal(ctx.attempt.captureStatus, 'complete');
+  assert.equal(ctx.attempt.htmlMedia.status, 'missing'); assert.equal(ctx.queue.active.size, 0); assert.equal(ctx.sessions.length, 1);
+  const result = JSON.parse(fs.readFileSync(path.join(ctx.p.dir, 'result.json')));
+  assert.equal(result.status, 'complete'); assert.equal(result.phase, 'qa');
+});
 
 test('QA pause preserves accepted checkpoints across restart and resumes only the unreviewed remainder', async t => {
   const ctx = start(t, 3), child = qa(ctx); pass(child, 1);

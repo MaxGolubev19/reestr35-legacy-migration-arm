@@ -7,16 +7,36 @@
     "node": ">=24.21.0"
   },
   "dependencies": {
+    "ipaddr.js": "2.2.0",
+    "parse5": "7.3.0",
     "playwright": "1.62.1",
+    "postcss-value-parser": "4.2.0",
     "sharp": "0.35.4"
   },
   "scripts": {
+    "build:editors": "node build/bundle-editors.cjs",
+    "check:editors": "node build/bundle-editors.cjs --check",
     "start": "node src/server.cjs",
     "test": "node test/run.cjs",
     "test:backend": "node test/run.cjs backend",
+    "test:html-media": "node test/run.cjs html-media",
     "test:ui": "node test/run.cjs ui",
     "test:capture": "node test/run.cjs capture",
     "test:portability": "node test/run.cjs portability",
     "test:cli": "node test/run.cjs cli"
+  },
+  "devDependencies": {
+    "@codemirror/lang-html": "6.4.12",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/state": "6.7.4",
+    "@codemirror/view": "6.43.11",
+    "@floating-ui/dom": "1.8.0",
+    "esbuild": "0.28.2",
+    "prettier": "3.9.6",
+    "style-inject": "0.3.0",
+    "svelte-awesome": "3.3.5",
+    "svelte-floating-ui": "1.6.2",
+    "svelte-select": "5.8.3",
+    "vanilla-jsoneditor": "3.13.0"
   }
 }

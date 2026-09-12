@@ -7,6 +7,11 @@ const { testTempRoot } = require('./support.cjs');
 const { Queue } = require('../src/server.cjs');
 const { PageQueue } = require('../src/pipeline/queue.cjs');
 const sourceRoot = path.resolve(__dirname, '../src');
+test('offline editor bundle is reproducible, licensed and current', async () => {
+  await require('../build/bundle-editors.cjs').bundle(true);
+  const manifest = JSON.parse(fs.readFileSync(path.join(sourceRoot, '../public/vendor/editors/manifest.json')));
+  for (const name of ['@codemirror/view','@codemirror/state','@codemirror/lang-html','prettier','vanilla-jsoneditor']) assert.ok(manifest.components.some(component => component.name === name));
+});
 
 test('module dependencies keep scheduler and infrastructure independent of the registered stage', () => {
   const graph = new Map();
@@ -30,7 +35,8 @@ test('module dependencies keep scheduler and infrastructure independent of the r
     for (const dependency of graph.get(file) || []) visit(dependency, [...ancestors, file]);
   }
   for (const file of graph.keys()) visit(file);
-  assert.ok(graph.get('pipeline/registry.cjs').includes('stages/capture-qa/index.cjs'));
+  assert.ok(graph.get('pipeline/registry.cjs').includes('stages/workflow.cjs'));
+  assert.ok(graph.get('stages/workflow.cjs').includes('stages/capture-qa/index.cjs'));
   assert.doesNotMatch(fs.readFileSync(path.join(sourceRoot, 'pipeline/queue.cjs'), 'utf8'), /\b(?:qa[A-Z_]\w*|reviewListeners|subscribeReviews|notifyReviewAccepted)\b/);
 });
 
@@ -95,10 +101,12 @@ test('existing state v2 loads without stage schema migration or altered flat API
   t.after(async () => { await queue.shutdown(); fs.rmSync(root, { recursive: true, force: true }); });
   assert.ok(queue instanceof PageQueue);
   assert.equal(queue.stage.id, 'capture-qa');
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'state.json'))), state);
+  const expected = structuredClone(state);
+  for (const attempt of expected.jobs[0].attempts) Object.assign(attempt, { activeDurationMs: 0, activeSince: null, durationIncomplete: attempt.status === 'complete' });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'state.json'))), expected);
   const snapshot = queue.snapshot('token'), job = snapshot.jobs[0];
   assert.equal(snapshot.csrfToken, 'token'); assert.equal(snapshot.concurrency, 3);
   assert.equal(job.status, 'paused'); assert.equal(job.canContinueQa, false); assert.equal(job.isActive, false);
-  assert.deepEqual(job.attempts, state.jobs[0].attempts);
+  assert.deepEqual(job.attempts, expected.jobs[0].attempts);
   assert.ok(!Object.hasOwn(job, 'stage') && !Object.hasOwn(job.attempts[1], 'stages'));
 });

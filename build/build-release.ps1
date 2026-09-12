@@ -27,6 +27,8 @@ $oldGoos = $env:GOOS; $oldGoarch = $env:GOARCH; $oldCgo = $env:CGO_ENABLED
 try {
     $env:PATH = $nodeHome + [IO.Path]::PathSeparator + $env:PATH
     $env:PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = '1'
+    & $node (Join-Path $nodeHome 'node_modules/npm/bin/npm-cli.js') ci --include=dev --prefix $repo
+    & $node (Join-Path $PSScriptRoot 'bundle-editors.cjs') --check
     & $node (Join-Path $nodeHome 'node_modules/npm/bin/npm-cli.js') ci --omit=dev --prefix $runtime
     $env:NODE_PATH = Join-Path $runtime 'node_modules'
     & $node (Join-Path $PSScriptRoot 'make-icon.cjs')

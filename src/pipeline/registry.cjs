@@ -1,5 +1,4 @@
 'use strict';
-const { CaptureQaStage } = require('../stages/capture-qa/index.cjs');
-// Composition boundary: one real stage today, no invented future state schema.
-function createStage(queue, options) { return new CaptureQaStage(queue, options); }
+const { Workflow } = require('../stages/workflow.cjs');
+function createStage(queue, options) { return new Workflow(queue, options); }
 module.exports = { createStage };

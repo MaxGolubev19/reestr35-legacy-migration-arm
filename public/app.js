@@ -60,13 +60,13 @@
     "job-detail", "detail-title", "detail-url", "attempt-duration", "detail-id",
     "detail-created", "attempt-select", "attempt-meta", "files-list", "recapture-button",
     "stage-step-1", "stage-step-2", "stage-step-3", "stage-step-4", "gallery-body",
-    "metadata-panel", "summary-panel", "stage-two-panel", "back-to-stage-one", "attempt-header",
+    "metadata-panel", "summary-panel", "stage-two-panel", "stage-three-panel", "stage-four-panel", "attempt-header",
     "summary-output", "issues-output", "logs-card", "stdout-output",
     "stderr-output", "stdout-truncated", "stderr-truncated", "png-gallery",
-    "qa-progress", "qa-progress-count", "qa-progress-bar",
-    "png-modal", "png-modal-title", "png-counter", "png-status",
-    "png-full", "png-error", "png-prev", "png-next", "png-original",
-    "json-modal", "json-modal-title", "json-output", "json-error", "json-original"
+    "qa-progress", "qa-progress-count", "qa-progress-bar", "media-progress", "media-progress-count", "media-progress-bar",
+    "png-modal", "png-modal-title", "png-counter",
+    "png-full", "png-error", "png-prev", "png-next",
+    "json-modal", "json-modal-title", "json-output", "json-error"
   ].map((id) => [id, document.getElementById(id)]));
 
   function setConnection(connected, message, phase = connected ? "connected" : "reconnecting") {
@@ -247,16 +247,26 @@
   }
 
   function updateActionTooltip(button) {
-    const title = `${STATUS_LABELS[button.dataset.status] || button.dataset.status} · ${button.disabled ? "Недоступно" : button.dataset.actionLabel}`;
+    const title = button.dataset.problem || `${STATUS_LABELS[button.dataset.status] || button.dataset.status} · ${button.disabled ? "Недоступно" : button.dataset.actionLabel}`;
     button.title = title;
     button.setAttribute("aria-label", `${title} · ${button.dataset.jobUrl}`);
     const wrapper = button.parentElement;
     window.tabler.Tooltip.getInstance(wrapper)?.dispose();
-    new window.tabler.Tooltip(wrapper, { trigger: "hover", title, html: false });
+    if (button.dataset.problem) { wrapper.tabIndex = 0; wrapper.setAttribute("role", "img"); wrapper.setAttribute("aria-label", title); }
+    new window.tabler.Tooltip(wrapper, { trigger: button.dataset.problem ? "hover focus" : "hover", title, html: false, animation: false });
   }
 
   function queueActions(job) {
     const status = effectiveStatus(job);
+    const attempt = currentAttempt(job);
+    if (status === "paused" && attempt?.phase === "html-media" && attempt.htmlMedia?.status === "missing") {
+      const control = actionButton(job, null, "Загрузить HTML", "alert", "yellow");
+      control.dataset.jobWarning = job.id;
+      const button = control.querySelector("button");
+      button.dataset.problem = "HTML не найден.";
+      updateActionTooltip(button);
+      return [control];
+    }
     const mapping = {
       paused: [job.canResume ? "resume" : null, "Продолжить", "pause", "secondary"],
       queued: ["pause", "Приостановить", "clock", "blue"],
@@ -277,7 +287,8 @@
 
   function renderJobs() {
     const focused = el["jobs-body"].contains(document.activeElement) ? document.activeElement : null;
-    const focusedId = focused?.dataset.jobAction || focused?.dataset.jobSecondaryAction || focused?.dataset.jobSelect;
+    const focusedWarning = focused?.dataset.jobWarning;
+    const focusedId = focused?.dataset.jobAction || focused?.dataset.jobSecondaryAction || focused?.dataset.jobSelect || focusedWarning;
     const focusedAction = Boolean(focused?.dataset.jobAction || focused?.dataset.jobSecondaryAction);
     const focusedOperation = focused?.dataset.action;
     el["jobs-body"].querySelectorAll(".queue-status-control").forEach(wrapper => window.tabler.Tooltip.getInstance(wrapper)?.dispose());
@@ -333,8 +344,8 @@
       el["jobs-body"].append(row);
     });
     if (focusedId) {
-      const controls = [...el["jobs-body"].querySelectorAll("[data-job-action], [data-job-secondary-action], [data-job-select]")];
-      const target = controls.find(control => (focusedAction ? (control.dataset.jobAction || control.dataset.jobSecondaryAction) : control.dataset.jobSelect) === focusedId &&
+      const controls = [...el["jobs-body"].querySelectorAll("[data-job-action], [data-job-secondary-action], [data-job-select], [data-job-warning]")];
+      const target = controls.find(control => (focusedWarning ? control.dataset.jobWarning : focusedAction ? (control.dataset.jobAction || control.dataset.jobSecondaryAction) : control.dataset.jobSelect) === focusedId &&
         (!focusedAction || control.dataset.action === focusedOperation) && !control.disabled) || controls.find(control => control.dataset.jobSelect === focusedId);
       target?.focus({ preventScroll: true });
     }
@@ -414,31 +425,35 @@
   }
 
   const STAGE_ERROR_STATUSES = new Set(["needs_review", "incomplete", "failed", "interrupted"]);
-  const defaultStage = attempt => attempt?.status === "complete" ? 2 : 1;
+  const secondStageAvailable = attempt => attempt?.captureStatus ? attempt.captureStatus === "complete" : attempt?.status === "complete";
+  const thirdStageAvailable = attempt => secondStageAvailable(attempt) && ["complete", "ready_with_issues"].includes(attempt?.htmlMedia?.status) && attempt?.status === "complete";
+  // Stage 3 is a placeholder and has no completion contract yet.
+  const stageAvailable = (stage, attempt) => stage === 1 || stage === 2 && secondStageAvailable(attempt) || stage === 3 && thirdStageAvailable(attempt);
+  const defaultStage = attempt => thirdStageAvailable(attempt) ? 3 : secondStageAvailable(attempt) ? 2 : 1;
 
   function renderStages(job, attempt) {
-    const secondAvailable = attempt?.status === "complete";
+    const secondAvailable = secondStageAvailable(attempt), thirdAvailable = thirdStageAvailable(attempt);
     const contextKey = job && attempt ? `${job.id}:${attempt.number}` : null;
     if (state.stageContextKey !== contextKey) {
       state.stageContextKey = contextKey;
       state.stageManuallySelected = false;
       state.activeStage = defaultStage(attempt);
     } else if (!state.stageManuallySelected) state.activeStage = defaultStage(attempt);
-    if (state.activeStage === 2 && !secondAvailable) {
-      state.activeStage = 1;
+    if (!stageAvailable(state.activeStage, attempt)) {
+      state.activeStage = defaultStage(attempt);
       state.stageManuallySelected = false;
     }
     const steps = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"], el["stage-step-4"]];
-    const firstState = secondAvailable ? "success" : STAGE_ERROR_STATUSES.has(attempt?.status) ? "error" : "active";
-    const colors = [firstState, secondAvailable ? "active" : "inactive", "inactive", "inactive"];
+    const firstState = attempt?.captureStatus && attempt.captureStatus !== "complete" ? "error" : secondAvailable ? "success" : STAGE_ERROR_STATUSES.has(attempt?.status) ? "error" : "active";
+    const colors = [firstState, thirdAvailable ? "success" : secondAvailable ? "active" : "inactive", thirdAvailable ? "active" : "inactive", "inactive"];
     steps.forEach((step, index) => {
-      const stage = index + 1, available = stage === 1 || (stage === 2 && secondAvailable), selected = state.activeStage === stage;
+      const stage = index + 1, available = stageAvailable(stage, attempt), selected = state.activeStage === stage;
       step.classList.toggle("active", selected);
       for (const color of ["inactive", "active", "success", "error"]) step.classList.toggle(`step-state-${color}`, colors[index] === color);
       step.setAttribute("aria-selected", String(selected));
       step.setAttribute("aria-disabled", String(!available));
       step.tabIndex = selected ? 0 : -1;
-      if (available) step.href = stage === 1 ? "#gallery-body" : "#stage-two-panel";
+      if (available) step.href = ["#gallery-body", "#stage-two-panel", "#stage-three-panel", "#stage-four-panel"][index];
       else step.removeAttribute("href");
     });
     const firstStage = state.activeStage === 1;
@@ -446,14 +461,17 @@
     el["metadata-panel"].classList.toggle("d-none", !firstStage);
     el["summary-panel"].classList.toggle("d-none", !firstStage);
     el["logs-card"].classList.toggle("d-none", !firstStage || !attempt);
-    el["stage-two-panel"].classList.toggle("d-none", firstStage);
+    el["stage-two-panel"].classList.toggle("d-none", state.activeStage !== 2);
+    el["stage-three-panel"].classList.toggle("d-none", state.activeStage !== 3);
+    el["stage-four-panel"].classList.toggle("d-none", state.activeStage !== 4);
     el["qa-progress"].classList.toggle("stage-hidden", !firstStage);
+    el["media-progress"].classList.toggle("stage-hidden", state.activeStage !== 2);
+    window.HtmlMedia.render(job, attempt, { csrfToken: state.csrfToken, refresh: () => refreshState() });
   }
 
   function selectStage(stage, { focus = false } = {}) {
     const job = state.jobs.find(candidate => candidate.id === state.selectedJobId), attempt = job && selectedAttempt(job);
-    if (stage === 2 && attempt?.status !== "complete") return;
-    if (stage !== 1 && stage !== 2) return;
+    if (!stageAvailable(stage, attempt)) return;
     state.activeStage = stage;
     state.stageManuallySelected = true;
     renderStages(job, attempt);
@@ -461,16 +479,17 @@
   }
 
   function formatDuration(attempt, timestamp = Date.now()) {
-    const start = Date.parse(attempt?.startedAt);
-    const finish = attempt?.finishedAt ? Date.parse(attempt.finishedAt) : ACTIVE_STATUSES.has(attempt?.status) ? timestamp : NaN;
-    if (!Number.isFinite(start) || !Number.isFinite(finish) || finish < start) return "—";
-    const seconds = Math.floor((finish - start) / 1000);
-    return [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map(value => String(value).padStart(2, "0")).join(":");
+    const elapsed = Math.max(0, Number(attempt?.activeDurationMs) || 0);
+    const active = ["running", "validating", "pausing", "stopping"].includes(attempt?.status) && Number.isFinite(attempt?.activeSince);
+    const seconds = Math.floor((elapsed + (active ? Math.max(0, timestamp - attempt.activeSince) : 0)) / 1000);
+    return `${attempt?.durationIncomplete ? "≥" : ""}${[Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map(value => String(value).padStart(2, "0")).join(":")}`;
   }
 
   function renderDuration() {
     const job = state.jobs.find(candidate => candidate.id === state.selectedJobId);
-    el["attempt-duration"].textContent = formatDuration(job && selectedAttempt(job));
+    const attempt = job && selectedAttempt(job);
+    el["attempt-duration"].textContent = formatDuration(attempt);
+    el["attempt-duration"].title = attempt?.durationIncomplete ? "Известное активное время. История ранних интервалов неполна; время на паузе и в очереди не учитывается." : "Активное время работы без пауз и ожидания в очереди";
   }
 
   function selectedAttempt(job) {
@@ -732,14 +751,15 @@
     state.jsonController = new AbortController();
     const request = ++state.jsonRequest;
     state.jsonTrigger = href;
+    window.ArmEditors.destroy('json-output');
     el["json-modal-title"].textContent = file.name || "JSON";
-    el["json-original"].href = href;
+    window.ModalActions.set('json-modal', null);
     el["json-output"].textContent = "Загрузка…";
     el["json-error"].classList.add("d-none");
     window.tabler.Modal.getOrCreateInstance(el["json-modal"]).show(trigger);
     try {
       const data = await api(href, { signal: state.jsonController.signal });
-      if (request === state.jsonRequest) el["json-output"].textContent = JSON.stringify(data, null, 2);
+      if (request === state.jsonRequest) { window.ArmEditors.showJson('json-output', data); window.ModalActions.set('json-modal', { url: href, name: file.name || 'report.json', text: () => window.ArmEditors.text('json-output') }); }
     } catch (error) {
       if (request !== state.jsonRequest) return;
       el["json-output"].textContent = "";
@@ -752,20 +772,26 @@
     const qaStatus = ["unreviewed", "passed", "issues"].includes(file.qaStatus) ? file.qaStatus : "unreviewed";
     const status = file.loadError ? "load_error" : qaStatus;
     const labels = { unreviewed: "Не проверено", passed: "Проверено", issues: "Есть замечания", load_error: "PNG не загружен" };
-    const classes = { unreviewed: "bg-secondary-lt", passed: "bg-green-lt", issues: "bg-yellow-lt", load_error: "bg-red-lt" };
+    const classes = { unreviewed: "bg-secondary", passed: "bg-green", issues: "bg-yellow", load_error: "bg-red" };
     const span = document.createElement("span");
-    span.className = `badge image-status ${classes[status]}`;
+    span.className = `image-status ${classes[status]}`;
     span.dataset.imageStatus = status;
-    span.textContent = labels[status];
+    span.tabIndex = 0; span.setAttribute('role', 'img'); span.setAttribute('aria-label', labels[status]); span.title = labels[status];
+    span.append(actionIcon(status === 'passed' ? 'check' : status === 'unreviewed' ? 'clock' : 'alert'));
+    span.addEventListener('click', event => event.stopPropagation());
+    // Polling can replace a focused status immediately after blur; avoid a
+    // pending hide transition calling into a disposed Tabler tooltip.
+    new window.tabler.Tooltip(span, { title: labels[status], trigger: 'hover focus', html: false, animation: false });
     return span;
   }
+  function replaceImageStatus(container, file) { container.querySelectorAll('.image-status').forEach(item => window.tabler.Tooltip.getInstance(item)?.dispose()); container.replaceChildren(imageStatusBadge(file)); }
 
   function qaCounts(attempt) {
     const qa = attempt?.qa && typeof attempt.qa === "object" ? attempt.qa : {};
     const segments = Array.isArray(qa.segments) ? qa.segments.map(segment => ({
       name: typeof segment?.name === "string" ? segment.name : "",
       status: ["passed", "issues", "pending"].includes(segment?.status) ? segment.status : "pending"
-    })) : [];
+    })) : (attempt?.files || []).filter(file => file.kind === "png").map(file => ({ name: file.name, status: "pending" }));
     const passed = segments.filter(segment => segment.status === "passed").length;
     const issues = segments.filter(segment => segment.status === "issues").length;
     const pending = segments.filter(segment => segment.status === "pending").length;
@@ -775,7 +801,7 @@
   function renderQaProgress(attempt) {
     const qa = qaCounts(attempt);
     const percent = qa.total ? Math.min(100, Math.round((qa.reviewed / qa.total) * 100)) : 0;
-    el["qa-progress"].classList.toggle("d-none", qa.total === 0);
+    el["qa-progress"].classList.remove("d-none");
     el["qa-progress-count"].textContent = `${qa.reviewed}/${qa.total}`;
     const progress = el["qa-progress-bar"];
     const classes = { passed: "bg-green", issues: "bg-red", pending: "bg-secondary" };
@@ -802,12 +828,12 @@
     state.galleryIndex = index;
     const file = state.gallery[index];
     el["png-modal-title"].textContent = file.name;
+    el["png-modal-title"].title = file.name;
     el["png-counter"].textContent = `${index + 1} / ${state.gallery.length}`;
-    el["png-status"].replaceChildren(imageStatusBadge(file));
     el["png-prev"].disabled = index === 0;
     el["png-next"].disabled = index === state.gallery.length - 1;
     if (el["png-modal"].classList.contains("show") && (document.activeElement.disabled || !el["png-modal"].contains(document.activeElement))) el["png-modal"].focus({ preventScroll: true });
-    el["png-original"].href = file.href;
+    window.ModalActions.set('png-modal', { url: file.href, name: file.name, image: true });
     if (el["png-full"].getAttribute("src") !== file.href) {
       el["png-error"].classList.add("d-none");
       el["png-full"].alt = `Снимок сегмента ${file.name}, попытка ${state.selectedAttemptNumber}`;
@@ -817,39 +843,33 @@
   }
 
   function drawGallery() {
+    el['png-gallery'].querySelectorAll('.image-status').forEach(item => window.tabler.Tooltip.getInstance(item)?.dispose());
     clear(el["png-gallery"]);
     state.gallery.forEach((file, index) => {
       const column = document.createElement("div");
       column.className = "col-12 col-md-6 col-xxl-4";
       const card = document.createElement("div");
-      card.className = "card h-100";
+      card.className = "card image-card h-100";
       const open = document.createElement("button");
       open.type = "button";
-      open.className = "btn p-0 w-100";
+      open.className = "btn w-100";
       open.dataset.fileName = file.name;
       open.dataset.fileHref = file.href;
       open.setAttribute("aria-label", `Просмотреть ${file.name}`);
       const img = document.createElement("img");
-      img.className = "card-img-top gallery-thumb";
+      img.className = "gallery-thumb w-100";
       img.src = file.href;
       img.alt = `Снимок сегмента ${file.name}`;
       img.loading = "lazy";
       open.append(img);
-      const body = document.createElement("div");
-      body.className = "card-body p-3";
-      const title = document.createElement("h4");
-      title.className = "card-title text-break mb-2";
-      title.textContent = file.name.replace(/\.png$/i, "").replace(/__/g, " / ").replace(/_/g, " ");
       const status = document.createElement("div");
-      status.className = "d-flex flex-wrap gap-2";
-      status.replaceChildren(imageStatusBadge(file));
+      status.className = "thumbnail-status";
+      replaceImageStatus(status, file);
       img.addEventListener("error", () => {
         file.loadError = true;
-        status.replaceChildren(imageStatusBadge(file));
-        if (state.gallery[state.galleryIndex] === file) el["png-status"].replaceChildren(imageStatusBadge(file));
+        replaceImageStatus(status, file);
       });
-      body.append(title, status);
-      card.append(open, body);
+      card.append(open, status);
       column.append(card);
       el["png-gallery"].append(column);
       card.addEventListener("click", () => {
@@ -1019,6 +1039,7 @@
   el["concurrency-slider"].addEventListener("change", changeConcurrency);
   el["concurrency-slider"].addEventListener("blur", () => { if (!state.settingsPending) renderSettings(); });
   el["json-modal"].addEventListener("hidden.bs.modal", () => {
+    window.ArmEditors.destroy('json-output');
     state.jsonRequest++;
     state.jsonController?.abort();
     const button = [...el["files-list"].querySelectorAll("button")].find(candidate => candidate.dataset.fileHref === state.jsonTrigger);
@@ -1055,16 +1076,15 @@
   el["recapture-button"].addEventListener("click", () => writeAction(state.selectedJobId, "retry", el["recapture-button"]));
   el["stage-step-1"].addEventListener("click", event => { event.preventDefault(); selectStage(1, { focus: false }); });
   el["stage-step-2"].addEventListener("click", event => { event.preventDefault(); selectStage(2, { focus: false }); });
-  for (const id of ["stage-step-3", "stage-step-4"]) el[id].addEventListener("click", event => event.preventDefault());
+  for (const id of ["stage-step-3", "stage-step-4"]) el[id].addEventListener("click", event => { event.preventDefault(); selectStage(Number(id.at(-1))); });
   for (const id of ["stage-step-1", "stage-step-2", "stage-step-3", "stage-step-4"]) el[id].addEventListener("keydown", event => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-    const available = [el["stage-step-1"], el["stage-step-2"]].filter(step => step.getAttribute("aria-disabled") !== "true");
+    const available = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"], el["stage-step-4"]].filter(step => step.getAttribute("aria-disabled") !== "true");
     const current = Math.max(0, available.indexOf(event.currentTarget));
     const index = event.key === "Home" ? 0 : event.key === "End" ? available.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + available.length) % available.length;
     event.preventDefault();
     selectStage(Number(available[index].id.at(-1)), { focus: true });
   });
-  el["back-to-stage-one"].addEventListener("click", () => selectStage(1, { focus: true }));
   window.addEventListener("beforeunload", () => {
     state.stopped = true;
     if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);

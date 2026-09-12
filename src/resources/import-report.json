@@ -1,0 +1,507 @@
+{
+  "version": 1,
+  "domainsSha256": "dd06ddf5d451a1ac570ee926734b63084a48be751f66d557df231de2a2806683",
+  "copied": [
+    {
+      "hostname": "mebelmaster.reestr35.ru",
+      "id": "610",
+      "sha256": "84bc1868695d5195052d9f8899e76715c4cc0780f13702621a7f50b7f4be0585"
+    },
+    {
+      "hostname": "advokatplus.reestr35.ru",
+      "id": "719",
+      "sha256": "909e5a8b500f66314c86907fa209d8193f5a308f82c3427effd5bf3ff2051837"
+    },
+    {
+      "hostname": "sport-d3.reestr35.ru",
+      "id": "1322",
+      "sha256": "85bb36dd9ec9a3d4e8578e3f6084e35c9d6a2f9f8b4dac2446bbb7024794aa6f"
+    },
+    {
+      "hostname": "khm2.reestr35.ru",
+      "id": "1532",
+      "sha256": "e9ce9d39433fad09d96e946b8f7cb33e819e01122ee9ccf4d70229bac0d37a76"
+    },
+    {
+      "hostname": "klinika-lada.reestr35.ru",
+      "id": "1647",
+      "sha256": "fa7f83fb27131fd6789e6e73a369f51a6775ea13f1481dcef1781b138dc6be0a"
+    },
+    {
+      "hostname": "auto.reestr35.ru",
+      "id": "5927",
+      "sha256": "e153921caf913025817bb42ff0a50055c097ce0c7c63567ece66727cbe460e09"
+    },
+    {
+      "hostname": "citadel.reestr35.ru",
+      "id": "6620",
+      "sha256": "8b855246c7b95a43527cbe0cbf08c65020cfaaae5bd4d3202c89dcf652128026"
+    },
+    {
+      "hostname": "domkrovli.reestr35.ru",
+      "id": "7188",
+      "sha256": "010839266cd59d501aa4810a1dc8d723057e4c92024bc03ae6632b8d201d46e6"
+    },
+    {
+      "hostname": "medprofilaktika.reestr35.ru",
+      "id": "7478",
+      "sha256": "9dab26871bb30b05553ce2d1cab8e3f2dd3d356e7e2b5f815b919489b6b50316"
+    },
+    {
+      "hostname": "kv-metr.reestr35.ru",
+      "id": "7639",
+      "sha256": "18080814dcb25697883a1b3aa5497fa650057972f090b5c7bf0cbfb71d98f572"
+    },
+    {
+      "hostname": "ukk.reestr35.ru",
+      "id": "7738",
+      "sha256": "25604049b47e40125bab1fd60c9b96d9be02a41807315657701dce222d67ebbe"
+    },
+    {
+      "hostname": "chtek.reestr35.ru",
+      "id": "7756",
+      "sha256": "1955427cb365c95ffe0594c64bd8248bab8f1a190596aa01284ff4d65fad1656"
+    },
+    {
+      "hostname": "bungalo.reestr35.ru",
+      "id": "8532",
+      "sha256": "df8d7d3ce4caacb7d45837c36b61f4e801261751ad788864e49700912a080221"
+    },
+    {
+      "hostname": "kirillica.reestr35.ru",
+      "id": "9614",
+      "sha256": "0c336fa0abcc27d44d886efc5458ad18cdc75df26ad113006d9b57ce5ecd487f"
+    },
+    {
+      "hostname": "dse.reestr35.ru",
+      "id": "9684",
+      "sha256": "1939c992447894e11f1d0ff25736d32a68311fd1f00ba793eeb4973e5a975710"
+    },
+    {
+      "hostname": "promelteh.reestr35.ru",
+      "id": "9717",
+      "sha256": "88ee6191115e18f5b9034372fe5b9f2a409dd4a0f3710d98721fabc73f6af011"
+    },
+    {
+      "hostname": "sta.reestr35.ru",
+      "id": "9771",
+      "sha256": "108fb82f887d92bc7cd8bd63e23e1986960a1d7fd67ba002a33a4e78472aaa61"
+    },
+    {
+      "hostname": "klinika2.reestr35.ru",
+      "id": "10307",
+      "sha256": "e8df48295b504c04b1ca194f8332bb96a4fb3c1389408f27b8e516255eb4e180"
+    },
+    {
+      "hostname": "cbi.reestr35.ru",
+      "id": "10432",
+      "sha256": "c23b2ddfdda0bc5ec981ebcc0a6a8b96b41f20fa917f3a62a01084bf95dda8ba"
+    },
+    {
+      "hostname": "dorogakdomy.reestr35.ru",
+      "id": "10652",
+      "sha256": "2d7094a977959eb5049e1368ca3dac917ded8e3dd8c56f804c3e3c2bdb4ce976"
+    },
+    {
+      "hostname": "fsmile.reestr35.ru",
+      "id": "10741",
+      "sha256": "0bd7f93418000cfbcb74359ecb275b8f90604b39c1005098aea59bbeee73f3ad"
+    },
+    {
+      "hostname": "dommuzikino.reestr35.ru",
+      "id": "10791",
+      "sha256": "51a9df6183d8032f5586e67e86cf9b48b4d0bd7084c91aa7613157892bd54499"
+    },
+    {
+      "hostname": "panorama.reestr35.ru",
+      "id": "10912",
+      "sha256": "ea25e55c6aa78ab2f32e37604bfc6cb0c3e242c6c162adeb822bf479b5932f1d"
+    },
+    {
+      "hostname": "tma.reestr35.ru",
+      "id": "10947",
+      "sha256": "f8b0c8d0955c4375ab0be705499250cf1e0c0162c630a4bbb0d80e22f8c449e7"
+    },
+    {
+      "hostname": "uvelir.reestr35.ru",
+      "id": "10955",
+      "sha256": "145e8cdaf24e4ec1db91854e7989e2f5d1cb9ea923c06cec06551e4c6117fbac"
+    },
+    {
+      "hostname": "stroitel.reestr35.ru",
+      "id": "12529",
+      "sha256": "dde0359ff60726dfaa86f03d23740d7611999d2749c568f387dd2a0e16c6a696"
+    },
+    {
+      "hostname": "electrotex.reestr35.ru",
+      "id": "14184",
+      "sha256": "37db41f08293528f2521987349edcaa6206f5aa69671e724c855e22438a3fa84"
+    },
+    {
+      "hostname": "tskplus.reestr35.ru",
+      "id": "15239",
+      "sha256": "f6225691f1ec127ae0c8c62f54ac3a8e6f417c70781ad83895ce25a956d82238"
+    },
+    {
+      "hostname": "uneverbit.reestr35.ru",
+      "id": "15250",
+      "sha256": "0a9fdf5756179624b14aa2b992b835163294f224a9b3dc7654603bf166f56cad"
+    },
+    {
+      "hostname": "azartauto.reestr35.ru",
+      "id": "15447",
+      "sha256": "defa1443d62b52933769f1e65327d4afe5d5d7d797808a6634607bb54ca945e9"
+    },
+    {
+      "hostname": "csstomat.reestr35.ru",
+      "id": "15524",
+      "sha256": "fafb06b9ac2339283be5e273045c2a0a6c8f9df7e3a60d52a89a77d8837ef0f1"
+    },
+    {
+      "hostname": "kapitan.reestr35.ru",
+      "id": "15648",
+      "sha256": "29551dee5335b1266910475c286ecb772fc9d3ccbf2ff303a2e5afeb3c241a6a"
+    },
+    {
+      "hostname": "chezis.reestr35.ru",
+      "id": "15810",
+      "sha256": "8689335dd27bf0f03287fbd412212f69d38e73f100cd1b73d25a91f25680316e"
+    },
+    {
+      "hostname": "ocenka.reestr35.ru",
+      "id": "15882",
+      "sha256": "99fb3f6b75af8e40a7b203992ea17a434100af92da1382a7ccd76d9803755bf5"
+    },
+    {
+      "hostname": "jalousie.reestr35.ru",
+      "id": "15951",
+      "sha256": "d831c0e85cfd7516226599f60ac5c43ecf939be8f29dac918e7533d810578a6f"
+    },
+    {
+      "hostname": "olimp-auto.reestr35.ru",
+      "id": "16172",
+      "sha256": "fef8ebf8f1b0479b843e85fd615bfc53d83175f34caa2c1e0e1254c3c7813d07"
+    },
+    {
+      "hostname": "razvitie-consalt.reestr35.ru",
+      "id": "16314",
+      "sha256": "491b0b6c67606d80f7ce715f44f26b138d756aeb344e08ccc68616365a5c0015"
+    },
+    {
+      "hostname": "dtd.reestr35.ru",
+      "id": "16753",
+      "sha256": "a71a231f764e7b6b13625f2e4d5747e295d5a63f65fbf7facb84edbcd2265957"
+    },
+    {
+      "hostname": "komanda.reestr35.ru",
+      "id": "16764",
+      "sha256": "26e88228142bfc7e252212b8baff6b4c3179b3919c319908bd18a00ecb3a7d67"
+    },
+    {
+      "hostname": "avtotrak.reestr35.ru",
+      "id": "16864",
+      "sha256": "51d9c089501d46dd0ed40110e66ce92da5aa67e1b8f5e75486724062c07db52b"
+    },
+    {
+      "hostname": "service.reestr35.ru",
+      "id": "17172",
+      "sha256": "7f09dd57bc7d813c95018315406842fb4f8825d299c8f636480cbba319021e5a"
+    },
+    {
+      "hostname": "posterprint.reestr35.ru",
+      "id": "17191",
+      "sha256": "9f7ffe9673e15253beffecf04d75ef3d8c3ff53b18fd8aa241a1816eee3ddad7"
+    },
+    {
+      "hostname": "mega.reestr35.ru",
+      "id": "17321",
+      "sha256": "0e40bffab0fcdd36bfb69a7ab1de8605961b25c76c046230cac222af06bc3270"
+    },
+    {
+      "hostname": "vms.reestr35.ru",
+      "id": "17536",
+      "sha256": "4533b287a496c2bdb0d27d75ae09661164c141c8bfd37bb05ed29457a0028d6f"
+    },
+    {
+      "hostname": "mori-cinema.reestr35.ru",
+      "id": "17552",
+      "sha256": "741969dd3fd8433f2916ea475ee9cf59c3369a8b73b655d2021c848b3da0a7a6"
+    },
+    {
+      "hostname": "guitar-studio.reestr35.ru",
+      "id": "17588",
+      "sha256": "19f7ebc0c9ff60f6b5557c47c96ffa3e3f5b15a5bdfbab5928e1ed07a8737821"
+    },
+    {
+      "hostname": "pes-kot.reestr35.ru",
+      "id": "18026",
+      "sha256": "e5f08cb2a2470aed8dd0d6cd597637678ca70caf0e5aa1687e9499fd5a4e76d4"
+    },
+    {
+      "hostname": "p-ocenka.reestr35.ru",
+      "id": "18030",
+      "sha256": "cc1f384e32d773059ee6098081095ff8188c27e2052e071ce8abde40c2bda791"
+    },
+    {
+      "hostname": "zenit.reestr35.ru",
+      "id": "18056",
+      "sha256": "bd0e246b8f3e745eaa37e344945cc2908b3f2e169abe116091f5ff3285a3075d"
+    },
+    {
+      "hostname": "sever-les.reestr35.ru",
+      "id": "18198",
+      "sha256": "2ca13cdce7f7f5076d0de5255e72dab9e344e3519f38bbbbf63fc29e2c80d5c8"
+    },
+    {
+      "hostname": "cherpk.reestr35.ru",
+      "id": "18237",
+      "sha256": "66c278a41447854f3ef4acc2fae1f424f4d13da14518be6be144ee0c412f232d"
+    },
+    {
+      "hostname": "bormeb.reestr35.ru",
+      "id": "18317",
+      "sha256": "00bb4758b64fd7309ab25ba21eb188b827a0c59a85739b422969991ef156ef4a"
+    },
+    {
+      "hostname": "norma.reestr35.ru",
+      "id": "18397",
+      "sha256": "1836e397cbc9e90ea39ab0e6bfdeea1721ce017ad101c96797672f4514208d73"
+    },
+    {
+      "hostname": "prestige.reestr35.ru",
+      "id": "18466",
+      "sha256": "1542635cb7d9ac29c1e6bf33c16f25b3a626b63bf8eca80eb8ddf4de88e53292"
+    },
+    {
+      "hostname": "dermatolog.reestr35.ru",
+      "id": "19523",
+      "sha256": "7b1b0a000ad5addf1bd4e6f08d1f0d664f90b8851bd8082ef710439f3d9e5323"
+    },
+    {
+      "hostname": "dom-stom.reestr35.ru",
+      "id": "19738",
+      "sha256": "71840233a849e1af5c7a5ee7171f4510b7c1efa996525ad0934e0d361652accf"
+    },
+    {
+      "hostname": "bassein35.reestr35.ru",
+      "id": "19750",
+      "sha256": "ee9cb0b38a5443a5de3068da529b44c36a8c3b9a931d6c8686d191c1b9539b00"
+    },
+    {
+      "hostname": "klinika1.reestr35.ru",
+      "id": "19789",
+      "sha256": "a335012b21b87d48c56576c1c3a2af3337c26c4a35219d33d5586c3d5da60288"
+    },
+    {
+      "hostname": "matitsa.reestr35.ru",
+      "id": "19850",
+      "sha256": "f439d76ea9055700064e3abdd3f032205d757e3f993536eb23a12552451c2bc5"
+    },
+    {
+      "hostname": "nc-raduga.reestr35.ru",
+      "id": "19857",
+      "sha256": "794bfd84434adae5501534b605ff2b39a4dcfbfd5a1dfd55df2e2a42fe060122"
+    },
+    {
+      "hostname": "varch.reestr35.ru",
+      "id": "20622",
+      "sha256": "15cc35b94201ac06359c4df5c03599df26a142476e101bdf6643797facef6016"
+    },
+    {
+      "hostname": "drova.reestr35.ru",
+      "id": "20738",
+      "sha256": "9d412b1b8a37b90fe9cacf9d6d9bff0a7e1771e670a147e1a827fbc803380be2"
+    },
+    {
+      "hostname": "poiskdetei.reestr35.ru",
+      "id": "20809",
+      "sha256": "fc4719d2cadb665d1d6443769e9975351d9989c9afab835b345f84171ba33831"
+    },
+    {
+      "hostname": "dietprodukt.reestr35.ru",
+      "id": "20888",
+      "sha256": "cc071920e38c2ba0e01b339270756424f5a770d3c8a04d025039cc3c035ebeec"
+    },
+    {
+      "hostname": "icon.reestr35.ru",
+      "id": "21179",
+      "sha256": "1f456cd7f2969cf43853f58df22d35b7011feb5904f6d0003ad55ea53565a6e0"
+    },
+    {
+      "hostname": "profsouz.reestr35.ru",
+      "id": "21286",
+      "sha256": "bc8dca10eb3fba6fe29fafd6bdbac76b5f50437b57a17a381b4981468ed07c35"
+    },
+    {
+      "hostname": "d-city.reestr35.ru",
+      "id": "21463",
+      "sha256": "1cfdcf139938cafcf4213dde4e9d0a9d4ac129a73cd1518ed80e191ff28ed81a"
+    },
+    {
+      "hostname": "ccavto.reestr35.ru",
+      "id": "21479",
+      "sha256": "2a4153fda9521d0e9814d83039deee8e1f1d0f107cc759e0d137a43f9576b0ea"
+    },
+    {
+      "hostname": "navigator.reestr35.ru",
+      "id": "21550",
+      "sha256": "841ef55df365eaf783926200508c0e94e8189f465f14145fa332434c953f9ec4"
+    },
+    {
+      "hostname": "cno.reestr35.ru",
+      "id": "21737",
+      "sha256": "939f579baf0ec9a3edc480b20270ee89367c7a3dcf11fd98a9f88c6aca6faf06"
+    },
+    {
+      "hostname": "smailing.reestr35.ru",
+      "id": "21860",
+      "sha256": "78d8a6f05b3d3f228829e893ecb8c0bfbdb03520b416a9690baaac6d0dbb5fc2"
+    },
+    {
+      "hostname": "estetica.reestr35.ru",
+      "id": "22043",
+      "sha256": "efa851388359b4deaa1ca52f46c6edc838a9231bb1bbe51270b8d634c4b1c5d4"
+    },
+    {
+      "hostname": "buza.reestr35.ru",
+      "id": "22687",
+      "sha256": "24bafa17d44b6e442c71f66a82dc8ecf671d5de31237dcf81b08831616e1d089"
+    },
+    {
+      "hostname": "dami.reestr35.ru",
+      "id": "23114",
+      "sha256": "181c41eb3dfe8c3163a3d7f5f15967665ce72f08f648eeed5ce7cd82c28128ab"
+    },
+    {
+      "hostname": "mirsan.reestr35.ru",
+      "id": "23279",
+      "sha256": "4698a865ad205380fd693c4b5aca8e933a9ccd50320faf04576d1a7a46770def"
+    },
+    {
+      "hostname": "f-domov.reestr35.ru",
+      "id": "23688",
+      "sha256": "9e26cf8b2bbdff2c0354e142dc13fe9819b474c2c30bbb1dbe30a222882059e8"
+    },
+    {
+      "hostname": "csb.reestr35.ru",
+      "id": "23706",
+      "sha256": "f1e93e9ac21b8f9b6e2277519243a1cf50d68261703d91c7db21c78131a0d302"
+    },
+    {
+      "hostname": "den-klin.reestr35.ru",
+      "id": "23783",
+      "sha256": "dba640fa139b850110dd8dfac220d96bdd1a07632368da81c71197af8c0c2ff0"
+    },
+    {
+      "hostname": "regata.reestr35.ru",
+      "id": "24224",
+      "sha256": "da8f31c9ddcf7f722d095b05e2112c5416207103b1dc999b194ba511a1ca3e5f"
+    },
+    {
+      "hostname": "bmg.reestr35.ru",
+      "id": "24331",
+      "sha256": "301e0ceb0027f0514fe3227bdd1d3ccaf8691c627fff153cf9b08b3430ae861a"
+    },
+    {
+      "hostname": "rus-sever.reestr35.ru",
+      "id": "24341",
+      "sha256": "38fc3f3122ccc581a49c8c0b0e74072bd9bf03036ae8f9ea0488e38df2a18d5f"
+    },
+    {
+      "hostname": "ivan-chay.reestr35.ru",
+      "id": "24348",
+      "sha256": "5428bf841b08502b63dfcf7674334138a4c256cd7e19ef922fe27805aa9751dc"
+    },
+    {
+      "hostname": "gradstroy.reestr35.ru",
+      "id": "25337",
+      "sha256": "5ebc9ce092d9149f54be9618915d7a092a3dd44f0e1d0aa12bb7c8fbe05827ed"
+    },
+    {
+      "hostname": "sadogorod.reestr35.ru",
+      "id": "30186",
+      "sha256": "4a20fa7c5a877b19fd9ec79d9a38eed1ad8e3ffc45f4c4daeb1946071e3d4a7c"
+    },
+    {
+      "hostname": "kamenniycvetok.reestr35.ru",
+      "id": "30315",
+      "sha256": "5fec6982215e817acd4ae835f7249c2d1e83d24344ed4d2437e058a5d74c8a09"
+    },
+    {
+      "hostname": "zakazmebel.reestr35.ru",
+      "id": "30321",
+      "sha256": "9d8695b8e2a600a9697ce09f86176d18a451da930f4d37a2c33fe05af6ea2dbe"
+    },
+    {
+      "hostname": "samson.reestr35.ru",
+      "id": "30503",
+      "sha256": "79eb070201fd4dd5e8b1a7ab1c5538413d9aced6f8e61ea483ae098f897ee69d"
+    },
+    {
+      "hostname": "remontotmaksa.reestr35.ru",
+      "id": "30550",
+      "sha256": "1729df9521e9e6d0d8796327371c8425eb73275425c635e1cc17d5c02372b4a6"
+    },
+    {
+      "hostname": "avtoplusa.reestr35.ru",
+      "id": "30744",
+      "sha256": "ab01f4b3986adfa00fcf800619c61cb16f6268379384aaf49e1e5acef8dd39cd"
+    },
+    {
+      "hostname": "st-raduga.reestr35.ru",
+      "id": "30787",
+      "sha256": "fd285e8e9d5a95e941971c12247da2ce76e8d28b9f51490f935632347b80dd04"
+    },
+    {
+      "hostname": "spec-trans.reestr35.ru",
+      "id": "30791",
+      "sha256": "ecb41409f79e22e6a22ac8542ce23351c67a01216b31665cc40787cf768d22c7"
+    },
+    {
+      "hostname": "everest.reestr35.ru",
+      "id": "30795",
+      "sha256": "f171338690bbc1e4b70469a1c9dd7a1749bdaf392282b393702c51423cf9bf48"
+    }
+  ],
+  "missing": [
+    "sonet.reestr35.ru",
+    "goldenfish.reestr35.ru",
+    "t-modul.reestr35.ru",
+    "leningrad.reestr35.ru",
+    "santehnika.reestr35.ru",
+    "kupec.reestr35.ru",
+    "dc.reestr35.ru",
+    "rostok.reestr35.ru",
+    "altavi.reestr35.ru",
+    "karnizi.reestr35.ru",
+    "taxi-blyuz.reestr35.ru",
+    "palermo.reestr35.ru",
+    "voda.reestr35.ru",
+    "dedal.reestr35.ru",
+    "vesna-dent.reestr35.ru",
+    "limo.reestr35.ru",
+    "rezger.reestr35.ru",
+    "parish.reestr35.ru",
+    "vanil-sky.reestr35.ru",
+    "profacademy.reestr35.ru",
+    "sem-dok.reestr35.ru",
+    "thm.reestr35.ru",
+    "ast.reestr35.ru",
+    "doska.reestr35.ru",
+    "virtuoz.reestr35.ru",
+    "dameko.reestr35.ru",
+    "mirvann.reestr35.ru",
+    "vashkover.reestr35.ru",
+    "enli.reestr35.ru",
+    "alucon35.reestr35.ru",
+    "narkolog.reestr35.ru",
+    "www.rceo.reestr35.ru",
+    "studiomassage.reestr35.ru"
+  ],
+  "ambiguous": [],
+  "unmatched": [
+    "16602.html",
+    "21379.html",
+    "23294.html"
+  ]
+}

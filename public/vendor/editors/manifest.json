@@ -1,0 +1,509 @@
+{
+  "version": 1,
+  "esbuild": "0.28.2",
+  "sources": {
+    "src/ui/editors.js": "35c7c93dc6e009da25a9a761e2ce6e3e547a61b897b8198dbd1c8971dc35dd5f",
+    "build/bundle-editors.cjs": "4323c7e9f4fb520b06b5b3f6ae063c064faf445b8c593ca428fb216c9c709e57",
+    "package.json": "a45cf5e83d40d378aae50e20cd5fec7be22a130d23038a8daffaeef99c7b3ab8",
+    "package-lock.json": "0e08649e3233d29c25ec2e03f3fbdf0fc4e5243465d0d3ae7bf348f58b6d2597"
+  },
+  "components": [
+    {
+      "name": "@codemirror/autocomplete",
+      "version": "6.20.3",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__autocomplete-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/commands",
+      "version": "6.11.0",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__commands-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/lang-css",
+      "version": "6.3.1",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__lang-css-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/lang-html",
+      "version": "6.4.12",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__lang-html-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/lang-javascript",
+      "version": "6.2.5",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__lang-javascript-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/lang-json",
+      "version": "6.0.2",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__lang-json-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/language",
+      "version": "6.12.4",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__language-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/lint",
+      "version": "6.9.7",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__lint-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/search",
+      "version": "6.7.2",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__search-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/state",
+      "version": "6.7.4",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__state-LICENSE"
+      ]
+    },
+    {
+      "name": "@codemirror/view",
+      "version": "6.43.11",
+      "license": "MIT",
+      "files": [
+        "licenses/@codemirror__view-LICENSE"
+      ]
+    },
+    {
+      "name": "@floating-ui/core",
+      "version": "1.8.0",
+      "license": "MIT",
+      "files": [
+        "licenses/@floating-ui__core-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "@floating-ui/dom",
+      "version": "1.8.0",
+      "license": "MIT",
+      "files": [
+        "licenses/@floating-ui__dom-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "@floating-ui/utils",
+      "version": "0.2.12",
+      "license": "MIT",
+      "files": [
+        "licenses/@floating-ui__utils-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "@fortawesome/free-regular-svg-icons",
+      "version": "7.3.1",
+      "license": "(CC-BY-4.0 AND MIT)",
+      "files": [
+        "licenses/@fortawesome__free-regular-svg-icons-LICENSE.txt"
+      ]
+    },
+    {
+      "name": "@fortawesome/free-solid-svg-icons",
+      "version": "7.3.1",
+      "license": "(CC-BY-4.0 AND MIT)",
+      "files": [
+        "licenses/@fortawesome__free-solid-svg-icons-LICENSE.txt"
+      ]
+    },
+    {
+      "name": "@jsonquerylang/jsonquery",
+      "version": "5.1.1",
+      "license": "ISC",
+      "files": [
+        "licenses/@jsonquerylang__jsonquery-LICENSE.md"
+      ]
+    },
+    {
+      "name": "@lezer/common",
+      "version": "1.5.2",
+      "license": "MIT",
+      "files": [
+        "licenses/@lezer__common-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "@lezer/css",
+      "version": "1.3.6",
+      "license": "MIT",
+      "files": [
+        "licenses/@lezer__css-LICENSE"
+      ]
+    },
+    {
+      "name": "@lezer/highlight",
+      "version": "1.2.3",
+      "license": "MIT",
+      "files": [
+        "licenses/@lezer__highlight-LICENSE"
+      ]
+    },
+    {
+      "name": "@lezer/html",
+      "version": "1.3.13",
+      "license": "MIT",
+      "files": [
+        "licenses/@lezer__html-LICENSE"
+      ]
+    },
+    {
+      "name": "@lezer/javascript",
+      "version": "1.5.4",
+      "license": "MIT",
+      "files": [
+        "licenses/@lezer__javascript-LICENSE"
+      ]
+    },
+    {
+      "name": "@lezer/json",
+      "version": "1.0.3",
+      "license": "MIT",
+      "files": [
+        "licenses/@lezer__json-LICENSE"
+      ]
+    },
+    {
+      "name": "@lezer/lr",
+      "version": "1.4.10",
+      "license": "MIT",
+      "files": [
+        "licenses/@lezer__lr-LICENSE"
+      ]
+    },
+    {
+      "name": "@marijn/find-cluster-break",
+      "version": "1.0.4",
+      "license": "MIT",
+      "files": [
+        "licenses/@marijn__find-cluster-break-LICENSE"
+      ]
+    },
+    {
+      "name": "@replit/codemirror-indentation-markers",
+      "version": "6.5.3",
+      "license": "MIT",
+      "files": [
+        "licenses/@replit__codemirror-indentation-markers-LICENSE"
+      ]
+    },
+    {
+      "name": "ajv",
+      "version": "8.20.0",
+      "license": "MIT",
+      "files": [
+        "licenses/ajv-LICENSE"
+      ]
+    },
+    {
+      "name": "clsx",
+      "version": "2.1.1",
+      "license": "MIT",
+      "files": [
+        "licenses/clsx-license"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "codemirror-wrapped-line-indent",
+      "version": "1.0.9",
+      "license": "MIT",
+      "files": [
+        "licenses/codemirror-wrapped-line-indent-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "crelt",
+      "version": "1.0.7",
+      "license": "MIT",
+      "files": [
+        "licenses/crelt-LICENSE"
+      ]
+    },
+    {
+      "name": "esm-env",
+      "version": "1.2.2",
+      "license": "MIT",
+      "files": [
+        "licenses/esm-env-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "fast-deep-equal",
+      "version": "3.1.3",
+      "license": "MIT",
+      "files": [
+        "licenses/fast-deep-equal-LICENSE"
+      ]
+    },
+    {
+      "name": "fast-uri",
+      "version": "3.1.7",
+      "license": "BSD-3-Clause",
+      "files": [
+        "licenses/fast-uri-LICENSE"
+      ]
+    },
+    {
+      "name": "immutable-json-patch",
+      "version": "6.0.3",
+      "license": "ISC",
+      "files": [
+        "licenses/immutable-json-patch-LICENSE.md"
+      ]
+    },
+    {
+      "name": "jmespath",
+      "version": "0.16.0",
+      "license": "Apache-2.0",
+      "files": [
+        "licenses/jmespath-LICENSE"
+      ]
+    },
+    {
+      "name": "json-schema-traverse",
+      "version": "1.0.0",
+      "license": "MIT",
+      "files": [
+        "licenses/json-schema-traverse-LICENSE"
+      ]
+    },
+    {
+      "name": "json-source-map",
+      "version": "0.6.1",
+      "license": "MIT",
+      "files": [
+        "licenses/json-source-map-LICENSE"
+      ]
+    },
+    {
+      "name": "jsonpath-plus",
+      "version": "10.4.0",
+      "license": "MIT",
+      "files": [
+        "licenses/jsonpath-plus-LICENSE"
+      ]
+    },
+    {
+      "name": "jsonrepair",
+      "version": "3.15.0",
+      "license": "ISC",
+      "files": [
+        "licenses/jsonrepair-LICENSE.md"
+      ]
+    },
+    {
+      "name": "lodash-es",
+      "version": "4.18.1",
+      "license": "MIT",
+      "files": [
+        "licenses/lodash-es-LICENSE"
+      ]
+    },
+    {
+      "name": "memoize-one",
+      "version": "6.0.0",
+      "license": "MIT",
+      "files": [
+        "licenses/memoize-one-LICENSE"
+      ]
+    },
+    {
+      "name": "natural-compare-lite",
+      "version": "1.4.1",
+      "license": "MIT",
+      "files": [
+        "licenses/natural-compare-lite-LICENSE"
+      ]
+    },
+    {
+      "name": "prettier",
+      "version": "3.9.6",
+      "license": "MIT",
+      "files": [
+        "licenses/prettier-LICENSE",
+        "licenses/prettier-THIRD-PARTY-NOTICES.md"
+      ]
+    },
+    {
+      "name": "style-inject",
+      "version": "0.3.0",
+      "license": "MIT",
+      "files": [
+        "licenses/style-inject-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "style-mod",
+      "version": "4.1.3",
+      "license": "MIT",
+      "files": [
+        "licenses/style-mod-LICENSE"
+      ]
+    },
+    {
+      "name": "svelte",
+      "version": "5.57.0",
+      "license": "MIT",
+      "files": [
+        "licenses/svelte-LICENSE.md"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "svelte-awesome",
+      "version": "3.3.5",
+      "license": "MIT",
+      "files": [
+        "licenses/svelte-awesome-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "svelte-floating-ui",
+      "version": "1.6.2",
+      "license": "MIT",
+      "files": [
+        "licenses/svelte-floating-ui-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "svelte-select",
+      "version": "5.8.3",
+      "license": "ISC",
+      "files": [
+        "licenses/svelte-select-LICENSE"
+      ],
+      "embeddedBy": "vanilla-jsoneditor@3.13.0",
+      "versionNote": "Pinned license-source package version; upstream prebundled version may differ."
+    },
+    {
+      "name": "vanilla-jsoneditor",
+      "version": "3.13.0",
+      "license": "ISC",
+      "files": [
+        "licenses/vanilla-jsoneditor-LICENSE.md"
+      ]
+    },
+    {
+      "name": "vanilla-picker",
+      "version": "2.12.3",
+      "license": "ISC",
+      "files": [
+        "licenses/vanilla-picker-LICENSE.md"
+      ]
+    },
+    {
+      "name": "w3c-keyname",
+      "version": "2.2.8",
+      "license": "MIT",
+      "files": [
+        "licenses/w3c-keyname-LICENSE"
+      ]
+    }
+  ],
+  "files": {
+    "editors.js": "c12a4086de6f862ae1788b17aac669eae25fe53df4dccfc780062106498be6b5",
+    "licenses/@codemirror__autocomplete-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__commands-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__lang-css-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__lang-html-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__lang-javascript-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__lang-json-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__language-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__lint-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__search-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__state-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@codemirror__view-LICENSE": "05c6130cda97e7600ca91427a41e8a065efcf82365fc0293e7de80faec494c07",
+    "licenses/@floating-ui__core-LICENSE": "0e4c9a9b6c71019cbbea3bdc20b01223110a9035700f9c960c8fcbf78c2325ce",
+    "licenses/@floating-ui__dom-LICENSE": "0e4c9a9b6c71019cbbea3bdc20b01223110a9035700f9c960c8fcbf78c2325ce",
+    "licenses/@floating-ui__utils-LICENSE": "0e4c9a9b6c71019cbbea3bdc20b01223110a9035700f9c960c8fcbf78c2325ce",
+    "licenses/@fortawesome__free-regular-svg-icons-LICENSE.txt": "20c6f40715a567c97b80f6944beb8bb325835cab47ea7dcab89ee3b8e077eced",
+    "licenses/@fortawesome__free-solid-svg-icons-LICENSE.txt": "20c6f40715a567c97b80f6944beb8bb325835cab47ea7dcab89ee3b8e077eced",
+    "licenses/@jsonquerylang__jsonquery-LICENSE.md": "99b6ee698a07fdfa2b7fde84a74e22d72f13f71d3f1b37451f875a26a040d3ab",
+    "licenses/@lezer__common-LICENSE": "568902fb66eaf1f11750e966b33fd7b5d7c618e65af09f35ef843635bcf5f1ba",
+    "licenses/@lezer__css-LICENSE": "568902fb66eaf1f11750e966b33fd7b5d7c618e65af09f35ef843635bcf5f1ba",
+    "licenses/@lezer__highlight-LICENSE": "568902fb66eaf1f11750e966b33fd7b5d7c618e65af09f35ef843635bcf5f1ba",
+    "licenses/@lezer__html-LICENSE": "568902fb66eaf1f11750e966b33fd7b5d7c618e65af09f35ef843635bcf5f1ba",
+    "licenses/@lezer__javascript-LICENSE": "568902fb66eaf1f11750e966b33fd7b5d7c618e65af09f35ef843635bcf5f1ba",
+    "licenses/@lezer__json-LICENSE": "7e744ae18ef84389d576469a5781172b0d50b7981111109f6da7cbc6b4188288",
+    "licenses/@lezer__lr-LICENSE": "568902fb66eaf1f11750e966b33fd7b5d7c618e65af09f35ef843635bcf5f1ba",
+    "licenses/@marijn__find-cluster-break-LICENSE": "9360b00fdd091f05c783b568bdd46c679c41b72415599252de98949462ea1acb",
+    "licenses/@replit__codemirror-indentation-markers-LICENSE": "f3202d54e64d4949a309745912ac025fb1d73ac764da4acaaf117fc70ff4c19b",
+    "licenses/ajv-LICENSE": "a05350a88e318e4f5f2c2a1ff1e2e88daa4dd38e6e78b71cccae422bdc762cc3",
+    "licenses/clsx-license": "9a9edad7baae52622bddf3c15b2ef8a33d2c89f2d25408ad13e8a7481c6b0c97",
+    "licenses/codemirror-wrapped-line-indent-LICENSE": "ec38675690f26393c0c8233e7a3e917909eac0def7450478f0e3c04d5b40fd8e",
+    "licenses/crelt-LICENSE": "23852ebf6aef7fadffc92514b3c5df163a8651f2c3ed0dbb494cb49d93bd5de5",
+    "licenses/esm-env-LICENSE": "6df5276ee7531fcc5446f19082c12e77bb6c5f081fd2b6d6cf88180a5ee36acd",
+    "licenses/fast-deep-equal-LICENSE": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a",
+    "licenses/fast-uri-LICENSE": "b010b0dfdfdb23d7396e03b82cd4621fc9bb8f95d6b0aea70b9c24e12074c786",
+    "licenses/immutable-json-patch-LICENSE.md": "fd50f5abb7eeb614c8d1293b9f239a5238d7536e3a9a9a8929a082c82d12b3fd",
+    "licenses/jmespath-LICENSE": "c2b65c29d1f0b1b5126304d8cd040a86121f58b3b51f52cdd7ad2cfbaec370c8",
+    "licenses/json-schema-traverse-LICENSE": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a",
+    "licenses/json-source-map-LICENSE": "7bf9b2de73a6b356761c948d0e9eeb4be6c1270bd04c79cd489c1e400ffdfc1a",
+    "licenses/jsonpath-plus-LICENSE": "f21ce68006d5bd12fef2f5463039783a50848f115d6e7287f04bb9d0fd0ed546",
+    "licenses/jsonrepair-LICENSE.md": "fd50f5abb7eeb614c8d1293b9f239a5238d7536e3a9a9a8929a082c82d12b3fd",
+    "licenses/lodash-es-LICENSE": "f71e8ed126b46346494aad5486874cd8f0aafe95092ed67d2e3cb6110f939abc",
+    "licenses/memoize-one-LICENSE": "b1c501095de70182748cb8e8d97ac5577701a4ef3b755ba30d59fd87b24bdb0f",
+    "licenses/natural-compare-lite-LICENSE": "353fe762ba595bf1ffe786acf0f5984bb164205901d74f258af195fc8228c67d",
+    "licenses/prettier-LICENSE": "b0f2417199889f1c0d28ec4e0244eacf1a15de5819d61f641dd7d8f45153ac9c",
+    "licenses/prettier-THIRD-PARTY-NOTICES.md": "ed5d4b7a970a10f85a80a730a3086cf59bf3dbb0bd3c5aa5f900da1b54fdfcac",
+    "licenses/style-inject-LICENSE": "4043c740a6b6749d1f706cacae941ddfaff6f882b66fce5df99b7f36176ae112",
+    "licenses/style-mod-LICENSE": "cb4474e26547397169061d3586c00022cda5330a1b64fa13e872319f3b63aff1",
+    "licenses/svelte-LICENSE.md": "06257f4847b13a49a039efb17b944c141e71b12fd8d231b362d86919067d77a3",
+    "licenses/svelte-awesome-LICENSE": "2c2a70f7c8769d7761e312d04ae25918400935a2908c45c1cfaa7936b694737f",
+    "licenses/svelte-floating-ui-LICENSE": "9442c01673a01a0c951b90c14b37a5b2d251ed29e2e68d844c0f4ebbef5f1d74",
+    "licenses/svelte-select-LICENSE": "1a036e249cf405ad843109b5e221eb21ccc3e9a25cad9843090064b15491e228",
+    "licenses/vanilla-jsoneditor-LICENSE.md": "fd50f5abb7eeb614c8d1293b9f239a5238d7536e3a9a9a8929a082c82d12b3fd",
+    "licenses/vanilla-picker-LICENSE.md": "a4294f0f987ce43d315e3d6db2bd46a2254fdec0b8996427daaa8a910ca1d7ca",
+    "licenses/w3c-keyname-LICENSE": "869c30f368eb08735e779027b9f4bc9fea2f39624351856aebe42741f0bc0884"
+  }
+}
