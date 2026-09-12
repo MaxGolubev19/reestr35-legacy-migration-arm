@@ -52,7 +52,7 @@ class AppServer {
     try {
       // Publish ownership before initialization or any request that can run QA.
       for (const session of this.sessions) session.onIdentity({ appServerPid: child.pid });
-      await this.request('initialize', { clientInfo: { name: 'reestr35_capture_qa', version: '3.0.1' }, capabilities: { experimentalApi: true } });
+      await this.request('initialize', { clientInfo: { name: 'reestr35_capture_qa', version: '3.1.0' }, capabilities: { experimentalApi: true } });
       this.send({ method: 'initialized' });
       const configuration = await this.request('config/read', { includeLayers: false });
       if (!configuration.config || typeof configuration.config !== 'object') throw new Error('Cannot verify app-server configuration');

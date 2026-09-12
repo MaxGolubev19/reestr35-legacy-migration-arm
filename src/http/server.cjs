@@ -81,7 +81,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         }
       }
       if (req.method !== 'GET') return json(res, 405, { error: 'Метод не поддерживается' });
-      if (url.pathname === '/api/health') return json(res, 200, { app: 'Reestr35 ARM', version: '3.0.1', instance: process.env.ARM_INSTANCE_ID || '', pid: process.pid });
+      if (url.pathname === '/api/health') return json(res, 200, { app: 'Reestr35 ARM', version: '3.1.0', instance: process.env.ARM_INSTANCE_ID || '', pid: process.pid });
       if (url.pathname === '/api/events') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
         res.write(': connected\n\n');

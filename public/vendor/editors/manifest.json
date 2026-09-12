@@ -4,8 +4,8 @@
   "sources": {
     "src/ui/editors.js": "35c7c93dc6e009da25a9a761e2ce6e3e547a61b897b8198dbd1c8971dc35dd5f",
     "build/bundle-editors.cjs": "4323c7e9f4fb520b06b5b3f6ae063c064faf445b8c593ca428fb216c9c709e57",
-    "package.json": "a45cf5e83d40d378aae50e20cd5fec7be22a130d23038a8daffaeef99c7b3ab8",
-    "package-lock.json": "0e08649e3233d29c25ec2e03f3fbdf0fc4e5243465d0d3ae7bf348f58b6d2597"
+    "package.json": "90d6678b3013d530a7cb9da4b34ea46a149099f6034043490886a27748cbb45b",
+    "package-lock.json": "ec5e33342d3f70d3f5caa70dd61e5ad2c6bbef21b8e50e05799fc527329dd6f5"
   },
   "components": [
     {
