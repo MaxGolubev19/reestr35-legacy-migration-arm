@@ -27,9 +27,9 @@
               <div id="batch-result" class="mt-3 d-none" aria-live="polite"></div>
           </form>
           <div class="card-body border-top" id="queue-progress">
-            <div id="progress-label" class="h3 mb-2" aria-live="polite">0 / 0</div>
+            <div class="d-flex justify-content-between align-items-center mb-2"><span class="form-label mb-0">Прогресс</span><output id="progress-label" class="badge bg-blue-lt" aria-live="polite">0 / 0</output></div>
             <div class="progress progress-sm" role="progressbar" aria-label="Общий прогресс" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-bar" class="progress-bar bg-primary" style="width:0%"></div></div>
-            <div class="d-flex justify-content-between align-items-center mt-3 mb-2"><label for="concurrency-slider" class="form-label mb-0">Параллельность</label><output id="concurrency-value" for="concurrency-slider" class="badge bg-blue-lt">2</output></div>
+            <div id="concurrency-label-row" class="d-flex justify-content-between align-items-center mt-3 mb-1"><label for="concurrency-slider" class="form-label mb-0">Параллельность</label><output id="concurrency-value" for="concurrency-slider" class="badge bg-blue-lt">2</output></div>
             <input id="concurrency-slider" type="range" class="form-range" min="1" max="8" step="1" value="2" disabled>
             <div id="settings-error" class="alert alert-danger mt-3 mb-0 d-none" role="alert"></div>
           </div>
@@ -41,25 +41,26 @@
             <div class="col-12" id="gallery-panel"><div class="card" id="results-card">
             <div class="card-header" id="results-header">
               <div id="results-common" class="results-common w-100">
-                <div class="detail-heading"><h3 id="detail-title" class="card-title">Результаты страницы</h3><a id="detail-url" class="text-break"></a></div>
+                <div id="header-control-group" class="header-control-group">
+                  <a id="detail-url" class="btn btn-outline-primary result-url"></a>
+                  <div id="attempt-controls" class="attempt-controls d-flex flex-wrap align-items-center gap-2">
+                    <output id="attempt-duration" class="form-control w-auto attempt-duration" aria-label="Активное время попытки">00:00:00</output>
+                    <button id="recapture-button" type="button" class="btn btn-outline-primary btn-icon flex-shrink-0" aria-label="Перезапустить" title="Перезапустить"><svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg></button>
+                  </div>
+                </div>
                 <nav id="result-steps" class="result-steps" aria-label="Этапы обработки страницы">
                   <div class="steps steps-counter" role="tablist" aria-label="Этапы">
-                    <a id="stage-step-1" class="step-item active" href="#gallery-body" role="tab" aria-controls="gallery-body" aria-selected="true">Скриншоты</a>
-                    <a id="stage-step-2" class="step-item" role="tab" aria-controls="stage-two-panel" aria-selected="false" aria-disabled="true" tabindex="-1">HTML и медиа</a>
-                    <a id="stage-step-3" class="step-item" role="tab" aria-controls="stage-three-panel" aria-selected="false" aria-disabled="true" tabindex="-1">Новая страница</a>
-                    <a id="stage-step-4" class="step-item" role="tab" aria-controls="stage-four-panel" aria-selected="false" aria-disabled="true" tabindex="-1">Приёмка</a>
+                    <a id="stage-step-1" class="step-item active" href="#gallery-body" role="tab" aria-controls="gallery-body" aria-selected="true"><span class="step-label">Скриншоты</span></a>
+                    <a id="stage-step-2" class="step-item" role="tab" aria-controls="stage-two-panel" aria-selected="false" aria-disabled="true" tabindex="-1"><span class="step-label">HTML и медиа</span></a>
+                    <a id="stage-step-3" class="step-item" role="tab" aria-controls="stage-three-panel" aria-selected="false" aria-disabled="true" tabindex="-1"><span class="step-label">Новая страница</span></a>
                   </div>
                 </nav>
               </div>
             </div>
             <div class="card-header attempt-header" id="attempt-header">
-              <div id="attempt-controls" class="attempt-controls d-flex flex-wrap align-items-center gap-2">
-                <button id="recapture-button" type="button" class="btn btn-outline-primary btn-icon flex-shrink-0" aria-label="Перезапустить" title="Перезапустить"><svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg></button>
-                <output id="attempt-duration" class="form-control w-auto attempt-duration" aria-label="Активное время попытки">00:00:00</output>
-                <select id="attempt-select" class="form-select w-auto" aria-label="Попытка"></select>
-              </div>
               <div id="qa-progress" class="qa-progress ms-auto"><div id="qa-progress-count" class="qa-progress-count text-secondary" aria-hidden="true">0/0</div><div id="qa-progress-bar" class="progress progress-sm" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Проверено 0 из 0 PNG"></div></div>
               <div id="media-progress" class="qa-progress d-none ms-auto"><div id="media-progress-count" class="qa-progress-count text-secondary" aria-hidden="true">0/0</div><div class="progress progress-sm" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Обработано 0 из 0 ресурсов"><div id="media-progress-bar" class="progress-bar" style="width:0%"></div></div></div>
+              <div id="builder-progress" class="qa-progress stage-hidden ms-auto"><div id="builder-progress-count" class="qa-progress-count text-secondary" aria-hidden="true">0/0</div><div id="builder-progress-bar" class="progress progress-sm" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Проверено 0 из 0 блоков"></div></div>
             </div>
             <div class="card-body" id="gallery-body" role="tabpanel" aria-labelledby="stage-step-1" tabindex="0">
               <div id="png-gallery" class="row g-3"></div>
@@ -68,18 +69,18 @@
               <div id="html-media-content"></div>
             </div>
             <div id="stage-three-panel" class="card-body d-none" role="tabpanel" aria-labelledby="stage-step-3" tabindex="0">
-              <div class="empty stage-placeholder">
-                <img class="empty-img stage-placeholder-illustration" src="/assets/html-media-in-development.png" alt="" width="1024" height="1024">
-                <p class="empty-title">Новая страница</p>
-                <p class="empty-subtitle text-secondary">Раздел ещё в разработке.</p>
-              </div>
-            </div>
-            <div id="stage-four-panel" class="card-body d-none" role="tabpanel" aria-labelledby="stage-step-4" tabindex="0">
-              <div class="empty stage-placeholder"><img class="empty-img stage-placeholder-illustration" src="/assets/html-media-in-development.png" alt="" width="1024" height="1024"><p class="empty-title">Приёмка</p><p class="empty-subtitle text-secondary">Раздел ещё в разработке.</p></div>
+              <div id="page-builder-loading" class="text-secondary py-5 text-center">Загрузка шаблона…</div>
+              <div id="page-builder-error" class="alert alert-danger d-none" role="alert"></div>
+              <div id="page-builder-content" class="d-none"></div>
             </div>
             </div></div>
+            <section class="col-12" id="technical-area" aria-label="Техническая информация"><div class="row row-cards">
+              <div class="col-12"><div class="card"><div class="card-body d-flex flex-wrap align-items-center gap-2">
+                <label for="attempt-select" class="form-label mb-0">Попытка</label>
+                <select id="attempt-select" class="form-select w-auto" aria-label="Попытка"></select>
+              </div></div></div>
               <div class="col-12 col-xxl-6" id="metadata-panel"><div class="card h-100">
-                <div class="card-header"><h3 class="card-title">Детали запуска</h3></div>
+                <div class="card-header"><h3 class="card-title">Детали попытки</h3></div>
                 <div class="card-body">
                   <dl class="row mb-3"><dt class="col-4">ID</dt><dd id="detail-id" class="col-8 font-monospace text-break"></dd><dt class="col-4">Создано</dt><dd id="detail-created" class="col-8"></dd></dl>
                   <div id="attempt-meta"></div><div id="files-list" class="mt-3"></div>
@@ -89,13 +90,22 @@
                 <div class="card-header"><h3 class="card-title">Сводка и замечания</h3></div>
                 <div class="card-body"><h4>Сводка</h4><pre id="summary-output" class="bg-body-secondary text-body rounded p-3 raw-output"></pre><h4 class="mt-3">Замечания</h4><pre id="issues-output" class="bg-body-secondary text-body rounded p-3 raw-output"></pre></div>
               </div></div>
+              <div class="col-12 col-xxl-6 d-none" id="media-source-panel"><div class="card h-100">
+                <div class="card-header"><h3 class="card-title">Источник HTML</h3></div>
+                <div class="card-body"><dl id="media-source-meta" class="row mb-0"></dl></div>
+              </div></div>
+              <div class="col-12 col-xxl-6 d-none" id="media-outcome-panel"><div class="card h-100">
+                <div class="card-header"><h3 class="card-title">Итог HTML и медиа</h3></div>
+                <div class="card-body"><p id="media-outcome-status" class="fw-medium"></p><dl id="media-outcome-meta" class="row mb-0"></dl></div>
+              </div></div>
               <div id="logs-card" class="col-12 d-none"><div class="card">
-                <div class="card-header"><h3 class="card-title">Журналы выбранной попытки</h3></div>
+                <div class="card-header"><h3 class="card-title">Журналы</h3></div>
                 <div class="card-body"><div class="row g-3">
                   <div class="col-12 col-md-6"><div class="d-flex align-items-center mb-2"><h4 class="mb-0">stdout · JSONL</h4><span id="stdout-truncated" class="badge bg-yellow-lt ms-auto d-none">Обрезан</span></div><pre id="stdout-output" class="bg-dark text-light rounded p-3 raw-log mb-0">Загрузка…</pre></div>
                   <div class="col-12 col-md-6"><div class="d-flex align-items-center mb-2"><h4 class="mb-0">stderr</h4><span id="stderr-truncated" class="badge bg-yellow-lt ms-auto d-none">Обрезан</span></div><pre id="stderr-output" class="bg-dark text-light rounded p-3 raw-log mb-0">Загрузка…</pre></div>
                 </div></div>
               </div></div>
+            </div></section>
           </div>
         </section>
       </div>
@@ -113,6 +123,11 @@
 </div></div></div>
 <div class="modal fade" id="media-modal" tabindex="-1" aria-labelledby="media-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
 <div class="modal-header"><div class="detail-heading modal-image-heading"><h3 id="media-modal-title" class="modal-title">HTML и медиа</h3><span id="media-counter" class="text-secondary image-counter"></span></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button></div><div id="media-modal-body" class="modal-body media-modal-body"></div><div id="media-navigation" class="modal-footer justify-content-between gap-2 d-none"><div class="btn-list"><button id="media-prev" type="button" class="btn btn-outline-secondary">Предыдущий</button><button id="media-next" type="button" class="btn btn-outline-secondary">Следующий</button></div></div></div></div></div>
-<script src="/vendor/js/tabler.js"></script><script src="/vendor/editors/editors.js"></script><script src="/modal-actions.js"></script><script src="/embed-policy.js"></script><script src="/html-media.js"></script><script src="/app.js"></script>
+<div class="modal fade" id="page-builder-modal" tabindex="-1" aria-labelledby="page-builder-modal-title" aria-hidden="true"><div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable"><form id="page-builder-form" class="modal-content" novalidate>
+  <div class="modal-header"><div><h3 id="page-builder-modal-title" class="modal-title">Блок</h3><div id="page-builder-modal-kind" class="text-secondary small"></div></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Отменить и закрыть"></button></div>
+  <div class="modal-body"><div id="page-builder-form-error" class="alert alert-danger d-none" role="alert"></div><div id="page-builder-fields"></div></div>
+  <div class="modal-footer"><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Отмена</button><button id="page-builder-save" type="submit" class="btn btn-primary">Сохранить</button></div>
+</form></div></div>
+<script src="/vendor/js/tabler.js"></script><script src="/vendor/editors/editors.js"></script><script src="/modal-actions.js"></script><script src="/embed-policy.js"></script><script src="/html-media.js"></script><script src="/page-builder.js"></script><script src="/app.js"></script>
 </body>
 </html>

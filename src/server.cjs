@@ -4,10 +4,11 @@ const { PageQueue } = require('./pipeline/queue.cjs');
 const { createStage } = require('./pipeline/registry.cjs');
 const { createServer } = require('./http/server.cjs');
 const { acquireLock, createShutdownController } = require('./infrastructure/server-lifecycle.cjs');
+const { PageBuilderStore } = require('./stages/page-builder/store.cjs');
 
 // Public Queue API remains compatible while the page scheduler owns no stage implementation.
 class Queue extends PageQueue {
-  constructor(options = {}) { super({ ...options, stageFactory: options.stageFactory || createStage }); }
+  constructor(options = {}) { super({ ...options, stageFactory: options.stageFactory || createStage }); this.pageBuilder = options.pageBuilder || new PageBuilderStore(this.root); }
   get reviewListeners() { return this.listenersFor('qa-review'); }
   set reviewListeners(listeners) { this.listeners.set('qa-review', listeners); }
   subscribeReviews(listener) { return this.subscribe('qa-review', listener); }

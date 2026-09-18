@@ -5,8 +5,8 @@ const { dataRoot, dataSubdir } = require('../src/data-dir.cjs');
 const { resolveRuntime } = require('../src/lib.cjs');
 
 const suites = {
-  full: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'ui', 'capture', 'capture-resume', 'portability', 'cli-isolation'],
-  backend: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media'],
+  full: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder', 'ui', 'capture', 'capture-resume', 'portability', 'cli-isolation'],
+  backend: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder'],
   'html-media': ['html-media'],
   ui: ['ui'], capture: ['capture', 'capture-resume'], portability: ['portability'], cli: ['cli-isolation'],
 };

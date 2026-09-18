@@ -405,7 +405,7 @@ test('missing HTML warning retains focus and tooltip across another running job 
   assert.equal(await warning.getAttribute('aria-label'), 'HTML не найден.');
   assert.equal(await page.locator('.tooltip.show').innerText(), 'HTML не найден.');
   assert.notEqual(await page.locator('#attempt-duration').innerText(), initialDuration, 'restoring warning focus does not freeze the selected task timer');
-  assert.equal(await page.locator('#detail-url').innerText(), running.url, 'focus restoration does not change selection');
+  assert.equal(await page.locator('#detail-url').innerText(), running.url.replace(/^https?:\/\//i, '').replace(/\/+$/, ''), 'focus restoration does not change selection');
   assert.deepEqual(errors, []);
 });
 
@@ -615,7 +615,7 @@ test('HTML card, modal actions, sequential stage guards and desktop/mobile geome
   await page.addInitScript(() => { window.copied = null; window.clipboardFail = false; Object.defineProperty(navigator, 'clipboard', { value: { writeText: async text => { if (window.clipboardFail) throw new Error('Clipboard denied'); window.copied = text; }, write: async items => { const blob = await items[0].getType('image/png'); window.copied = { type: blob.type, size: blob.size }; } } }); });
   await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click();
   assert.equal(await page.locator('#stage-two-panel').isVisible(), true);
-  assert.equal(await page.locator('#stage-step-3').getAttribute('aria-disabled'), 'true'); assert.equal(await page.locator('#stage-step-4').getAttribute('aria-disabled'), 'true');
+  assert.equal(await page.locator('#stage-step-3').getAttribute('aria-disabled'), 'true'); assert.equal(await page.locator('#stage-step-4').count(), 0);
   const source = Buffer.from('<script>window.SOURCE_EXECUTED=true</script><img src="/ok.png"><a href="/file.pdf">Doc</a>');
   const picker = page.waitForEvent('filechooser'); await page.locator('.html-source-card').click(); await (await picker).setFiles({ name: 'source.html', mimeType: 'text/html', buffer: source });
   await page.getByRole('button', { name: /^HTML ·/ }).click(); await page.waitForSelector('#media-modal-body .cm-content'); assert.equal(await page.evaluate(() => window.SOURCE_EXECUTED), undefined); assert.match(await page.evaluate(() => window.ArmEditors.text('media-modal-body')), /SOURCE_EXECUTED/);
@@ -644,10 +644,9 @@ test('HTML card, modal actions, sequential stage guards and desktop/mobile geome
   assert.equal(await page.locator('#stage-two-panel a').count(), 0, 'no duplicate original/source actions');
   ctx.queue.autoStart = true; ctx.queue.pump();
   await page.waitForFunction(() => document.querySelector('#stage-step-3').getAttribute('aria-disabled') === 'false');
-  assert.deepEqual(await page.locator('.result-steps .step-item').evaluateAll(nodes => nodes.map(node => [...node.classList].find(value => value.startsWith('step-state-')))), ['step-state-success','step-state-success','step-state-active','step-state-inactive']);
-  assert.equal(await page.locator('#stage-step-4').getAttribute('aria-disabled'), 'true'); assert.equal(await page.locator('#stage-step-4').getAttribute('tabindex'), '-1');
+  await page.waitForFunction(() => document.querySelector('#stage-step-3').classList.contains('step-state-review-failed'));
+  assert.deepEqual(await page.locator('.result-steps .step-item').evaluateAll(nodes => nodes.map(node => [...node.classList].find(value => value.startsWith('step-state-')))), ['step-state-success','step-state-success','step-state-review-failed']);
   await page.locator('#stage-step-2').focus(); await page.keyboard.press('ArrowRight'); assert.equal(await page.locator('#stage-three-panel').isVisible(), true); await page.keyboard.press('End'); assert.equal(await page.locator('#stage-three-panel').isVisible(), true);
-  await page.locator('#stage-step-4').evaluate(node => node.click()); assert.equal(await page.locator('#stage-four-panel').isHidden(), true);
   await page.keyboard.press('ArrowRight'); assert.equal(await page.locator('#gallery-body').isVisible(), true);
   await page.locator('#stage-step-2').click(); await page.locator('#html-media-accordion summary').first().click(); await page.getByRole('button', { name: /^Открыть изображение/ }).first().click();
   await page.waitForFunction(() => document.activeElement.closest('#media-modal') && document.querySelector('.media-full-image')?.complete && document.querySelector('.media-full-image').naturalWidth > 0);
@@ -657,12 +656,22 @@ test('HTML card, modal actions, sequential stage guards and desktop/mobile geome
   const geometries = [];
   for (const width of [1440,390,375,360,320]) {
     await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 });
+    await page.waitForFunction(() => [...document.querySelectorAll('.result-steps .step-item')].every(node => {
+      const bounds = node.getBoundingClientRect(), label = node.querySelector('.step-label').getBoundingClientRect();
+      return Math.abs(bounds.left + parseFloat(getComputedStyle(node, '::before').left) - label.left - label.width / 2) <= 1;
+    }));
     const geometry = await page.evaluate(() => {
-      const heading = document.querySelector('.detail-heading').getBoundingClientRect(), steps = document.querySelector('#result-steps').getBoundingClientRect();
-      return { viewport: innerWidth, scrollWidth: document.documentElement.scrollWidth, heading: { x: heading.x, width: heading.width }, steps: { x: steps.x, width: steps.width }, gap: steps.x - heading.right, centerDelta: steps.y + steps.height / 2 - heading.y - heading.height / 2,
-        cells: [...document.querySelectorAll('.result-steps .step-item')].map(node => { const bounds = node.getBoundingClientRect(), dot = getComputedStyle(node,'::before'), range = document.createRange(); range.selectNodeContents(node); return { width: bounds.width, labelGap: range.getBoundingClientRect().top - bounds.top - parseFloat(dot.top) - parseFloat(dot.height), labelsFit: [...range.getClientRects()].every(rect => rect.left >= bounds.left - .5 && rect.right <= bounds.right + .5) }; }) };
+      const heading = document.querySelector('#header-control-group').getBoundingClientRect(), steps = document.querySelector('#result-steps').getBoundingClientRect();
+      return { viewport: innerWidth, scrollWidth: document.documentElement.scrollWidth, heading: { x: heading.x, width: heading.width }, steps: { x: steps.x, width: steps.width }, gap: steps.x - heading.right, verticalGap: steps.top - heading.bottom, centerDelta: steps.y + steps.height / 2 - heading.y - heading.height / 2,
+        cells: [...document.querySelectorAll('.result-steps .step-item')].map(node => { const bounds = node.getBoundingClientRect(), dot = getComputedStyle(node,'::before'), range = document.createRange(); range.selectNodeContents(node); const label = node.querySelector('.step-label').getBoundingClientRect(); return { width: bounds.width, marker: bounds.left + parseFloat(dot.left), labelCenter: label.left + label.width / 2, labelGap: range.getBoundingClientRect().top - bounds.top - parseFloat(dot.top) - parseFloat(dot.height), labelsFit: [...range.getClientRects()].every(rect => rect.left >= bounds.left - .5 && rect.right <= bounds.right + .5) }; }) };
     });
-    geometries.push(geometry); assert.ok(geometry.scrollWidth <= width, `${width}: no overflow`); assert.ok(geometry.gap > 0); assert.ok(Math.abs(geometry.centerDelta - 4) <= 1); assert.ok(geometry.cells.every(cell => cell.labelsFit && cell.labelGap >= 4));
+    geometries.push(geometry); assert.ok(geometry.scrollWidth <= width, `${width}: no overflow`);
+    if (width >= 1400) { assert.ok(geometry.gap > 0); assert.ok(Math.abs(geometry.centerDelta - 4) <= 1); }
+    else assert.ok(geometry.verticalGap > 0, 'mobile steps follow the header controls');
+    assert.ok(geometry.cells.every(cell => cell.labelsFit && cell.labelGap >= 4));
+    const markerDistances = geometry.cells.slice(1).map((cell, index) => cell.marker - geometry.cells[index].marker);
+    assert.ok(Math.abs(markerDistances[0] - markerDistances[1]) <= 1, `${width}px uses equal marker distances: ${markerDistances}`);
+    assert.ok(geometry.cells.every(cell => Math.abs(cell.labelCenter - cell.marker) <= 1), `${width}px centers every caption below its marker`);
     if (width < 1200) assert.ok(Math.max(...geometry.cells.map(cell => cell.width)) - Math.min(...geometry.cells.map(cell => cell.width)) < .5);
     await page.screenshot({ path: path.join(testOutput(), `ui-step2-${width}.png`), fullPage: true });
   }

@@ -15,6 +15,12 @@ async function body(req) {
   for await (const chunk of req) { size += chunk.length; if (size > 150 * 1024) throw new Error('Слишком большой запрос'); chunks.push(chunk); }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
+const xml = value => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]);
+function mediaPlaceholder(asset) {
+  const name = decodeURIComponent(new URL(asset.originalUrl).pathname.split('/').at(-1) || 'Медиа');
+  const label = (asset.alt || name).slice(0, 80), hue = parseInt(crypto.createHash('sha256').update(asset.id).digest('hex').slice(0, 4), 16) % 360;
+  return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" role="img" aria-label="${xml(label)}"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="hsl(${hue} 70% 34%)"/><stop offset="1" stop-color="hsl(${(hue + 45) % 360} 75% 17%)"/></linearGradient></defs><rect width="800" height="450" fill="url(#g)"/><path d="M0 360 180 210l105 90 125-140 230 200 80-70 80 70v90H0z" fill="white" opacity=".18"/><circle cx="650" cy="105" r="48" fill="white" opacity=".2"/><text x="40" y="385" fill="white" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="600">${xml(name.slice(0, 42))}</text><text x="40" y="420" fill="white" opacity=".8" font-family="Segoe UI,Arial,sans-serif" font-size="18">Mori Cinema · локальный макет медиа</text></svg>`);
+}
 
 function createServer(queue, { onShutdown = async () => {} } = {}) {
   const csrfToken = crypto.randomBytes(32).toString('hex');
@@ -22,6 +28,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
   const assets = new Map([
     ['/', ['index.html', 'text/html; charset=utf-8']], ['/app.js', ['app.js', 'text/javascript; charset=utf-8']], ['/app.css', ['app.css', 'text/css; charset=utf-8']],
     ['/html-media.js', ['html-media.js', 'text/javascript; charset=utf-8']],
+    ['/page-builder.js', ['page-builder.js', 'text/javascript; charset=utf-8']],
     ['/embed-policy.js', ['embed-policy.js', 'text/javascript; charset=utf-8']],
     ['/modal-actions.js', ['modal-actions.js', 'text/javascript; charset=utf-8']],
     ['/vendor/editors/editors.js', ['vendor/editors/editors.js', 'text/javascript; charset=utf-8']],
@@ -74,6 +81,12 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
           if (!data || Object.keys(data).some(key => key !== 'urls')) throw new Error('Разрешено только поле urls');
           return json(res, 200, queue.add(data.urls));
         }
+        const pageBuilder = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})$/);
+        if (pageBuilder) {
+          queue.get(pageBuilder[1]);
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(key => !['revision', 'document'].includes(key)) || Object.keys(data).length !== 2) throw new Error('Разрешены только revision и document');
+          return json(res, 200, queue.pageBuilder.write(pageBuilder[1], data.revision, data.document));
+        }
         const action = url.pathname.match(/^\/api\/jobs\/([a-f0-9-]{36})\/(retry|pause|resume|continue-qa)$/);
         if (action) {
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length) throw new Error('Этот запрос не принимает параметры');
@@ -81,7 +94,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         }
       }
       if (req.method !== 'GET') return json(res, 405, { error: 'Метод не поддерживается' });
-      if (url.pathname === '/api/health') return json(res, 200, { app: 'Reestr35 ARM', version: '3.1.0', instance: process.env.ARM_INSTANCE_ID || '', pid: process.pid });
+      if (url.pathname === '/api/health') return json(res, 200, { app: 'Reestr35 ARM', version: '3.2.0', instance: process.env.ARM_INSTANCE_ID || '', pid: process.pid });
       if (url.pathname === '/api/events') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
         res.write(': connected\n\n');
@@ -93,6 +106,15 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         return;
       }
       if (url.pathname === '/api/state') return json(res, 200, queue.snapshot(csrfToken));
+      const pageBuilder = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})$/);
+      if (pageBuilder) { queue.get(pageBuilder[1]); return json(res, 200, queue.pageBuilder.read(pageBuilder[1])); }
+      const pageBuilderMedia = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/media\/([a-z0-9][a-z0-9-]{0,63})$/);
+      if (pageBuilderMedia) {
+        queue.get(pageBuilderMedia[1]); const asset = queue.pageBuilder.media(pageBuilderMedia[1], pageBuilderMedia[2]);
+        if (!asset) return json(res, 404, { error: 'Медиа не найдено' });
+        const svg = mediaPlaceholder(asset);
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Content-Length': svg.length }); res.end(svg); return;
+      }
       const media = url.pathname.match(/^\/api\/html-media\/([a-f0-9-]{36})\/([1-9][0-9]*)\/([1-9][0-9]*)\/(manifest|source|code|objects\/[a-f0-9]{64})$/);
       if (media) {
         const job = queue.get(media[1]), attempt = job.attempts.find(a => a.number === Number(media[2]));

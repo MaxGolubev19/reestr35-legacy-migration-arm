@@ -57,13 +57,14 @@
     "connection-control", "connection-dot", "connection-label", "concurrency-value", "global-alert",
     "batch-form", "url-input", "clear-url", "url-feedback", "submit-button", "batch-result", "progress-label",
     "progress-bar", "jobs-body", "empty-detail", "concurrency-slider", "settings-error",
-    "job-detail", "detail-title", "detail-url", "attempt-duration", "detail-id",
+    "job-detail", "detail-url", "result-steps", "attempt-duration", "detail-id",
     "detail-created", "attempt-select", "attempt-meta", "files-list", "recapture-button",
-    "stage-step-1", "stage-step-2", "stage-step-3", "stage-step-4", "gallery-body",
-    "metadata-panel", "summary-panel", "stage-two-panel", "stage-three-panel", "stage-four-panel", "attempt-header",
+    "stage-step-1", "stage-step-2", "stage-step-3", "gallery-body",
+    "metadata-panel", "summary-panel", "stage-two-panel", "stage-three-panel", "attempt-header",
+    "technical-area", "media-source-panel", "media-source-meta", "media-outcome-panel", "media-outcome-status", "media-outcome-meta",
     "summary-output", "issues-output", "logs-card", "stdout-output",
     "stderr-output", "stdout-truncated", "stderr-truncated", "png-gallery",
-    "qa-progress", "qa-progress-count", "qa-progress-bar", "media-progress", "media-progress-count", "media-progress-bar",
+    "qa-progress", "qa-progress-count", "qa-progress-bar", "media-progress", "media-progress-count", "media-progress-bar", "builder-progress", "builder-progress-count", "builder-progress-bar",
     "png-modal", "png-modal-title", "png-counter",
     "png-full", "png-error", "png-prev", "png-next",
     "json-modal", "json-modal-title", "json-output", "json-error"
@@ -366,10 +367,11 @@
     const list = document.createElement("dl");
     list.className = "row mb-0";
     [
-      ["Начало", formatDate(attempt.startedAt)],
-      ["Завершение", formatDate(attempt.finishedAt)],
-      ["Код выхода", attempt.exitCode === null || attempt.exitCode === undefined ? "—" : String(attempt.exitCode)],
-      ["Ошибка", attempt.error || "—"]
+      ["Начало попытки", formatDate(attempt.startedAt)],
+      ["Текущая фаза", attempt.phase || "—"],
+      ["Завершение в данных попытки", formatDate(attempt.finishedAt)],
+      ["Код выхода в данных попытки", attempt.exitCode === null || attempt.exitCode === undefined ? "—" : String(attempt.exitCode)],
+      ["Ошибка попытки", attempt.error || "—"]
     ].forEach(([label, value]) => {
       const dt = document.createElement("dt");
       dt.className = "col-4";
@@ -380,7 +382,18 @@
       list.append(dt, dd);
     });
     el["attempt-meta"].append(list);
-    el["summary-output"].textContent = formatValue(attempt.summary);
+    const capture = attempt.captureSummary, qa = attempt.qa;
+    const captureStatus = attempt.captureStatus || (attempt.phase !== "html-media" ? attempt.status : null);
+    const issueCount = value => Array.isArray(value) ? value.length : value ? 1 : 0;
+    const hasIssues = issueCount(attempt.issues) + issueCount(capture?.issues) + (Number(qa?.issues) || 0) > 0;
+    const outcome = captureStatus === "complete" && hasIssues ? "Завершено с замечаниями" : STATUS_LABELS[captureStatus] || captureStatus || "Итог шага ещё не зафиксирован";
+    el["summary-output"].textContent = formatValue({
+      "Итог скриншотов и QA": outcome,
+      "Статус шага": captureStatus || "—",
+      ...(capture ? { "Съёмка": capture } : attempt.summary ? { "Сводка прежней версии": attempt.summary } : {}),
+      ...(qa ? { "Проверка PNG": { "Всего": qa.total, "Проверено": qa.reviewed, "Принято": qa.passed, "С замечаниями": qa.issues, "Не проверено": qa.unreviewed ?? qa.pending } } : {}),
+      "Замечания попытки": issueCount(attempt.issues)
+    });
     el["issues-output"].textContent = formatValue(attempt.issues, "Замечаний нет");
 
     const files = (Array.isArray(attempt.files) ? attempt.files : []).filter(file => file.kind !== "png");
@@ -431,6 +444,32 @@
   const stageAvailable = (stage, attempt) => stage === 1 || stage === 2 && secondStageAvailable(attempt) || stage === 3 && thirdStageAvailable(attempt);
   const defaultStage = attempt => thirdStageAvailable(attempt) ? 3 : secondStageAvailable(attempt) ? 2 : 1;
 
+  function renderMediaTechnical(attempt) {
+    const info = attempt?.htmlMedia, source = info?.source;
+    const rows = (element, values) => {
+      clear(element);
+      for (const [label, value] of values) {
+        const dt = document.createElement("dt"), dd = document.createElement("dd");
+        dt.className = "col-5"; dt.textContent = label;
+        dd.className = "col-7 text-break"; dd.textContent = String(value ?? "—");
+        element.append(dt, dd);
+      }
+    };
+    rows(el["media-source-meta"], [
+      ["Ревизия (revision)", info?.revision], ["Происхождение (origin)", source?.origin],
+      ["Размер, байт", source?.bytes], ["SHA-256", source?.sha256],
+      ...(source?.status ? [["Статус источника", source.status]] : []), ["Статус этапа", info?.status]
+    ]);
+    const labels = { ready: "Готово к обработке", complete: "Завершено", ready_with_issues: "Завершено с замечаниями", missing: "HTML не найден", error: "Ошибка", downloading: "Скачивание", running: "Выполняется", paused: "На паузе", interrupted: "Прервано" };
+    el["media-outcome-status"].textContent = labels[info?.status] || info?.status || "Обработка ещё не начата";
+    const total = Number.isFinite(info?.total) ? Math.max(0, info.total) : null;
+    const pending = Number.isFinite(info?.pending) ? Math.max(0, info.pending) : null;
+    rows(el["media-outcome-meta"], [
+      ["Обработано / всего", total !== null && pending !== null ? `${Math.max(0, total - pending)} / ${total}` : "—"],
+      ["Скачано", info?.downloaded], ["Внешние", info?.external], ["Требуют внимания", info?.issues]
+    ]);
+  }
+
   function renderStages(job, attempt) {
     const secondAvailable = secondStageAvailable(attempt), thirdAvailable = thirdStageAvailable(attempt);
     const contextKey = job && attempt ? `${job.id}:${attempt.number}` : null;
@@ -443,30 +482,36 @@
       state.activeStage = defaultStage(attempt);
       state.stageManuallySelected = false;
     }
-    const steps = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"], el["stage-step-4"]];
+    const steps = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"]];
     const firstState = attempt?.captureStatus && attempt.captureStatus !== "complete" ? "error" : secondAvailable ? "success" : STAGE_ERROR_STATUSES.has(attempt?.status) ? "error" : "active";
-    const colors = [firstState, thirdAvailable ? "success" : secondAvailable ? "active" : "inactive", thirdAvailable ? "active" : "inactive", "inactive"];
+    const builderState = job?.pageBuilder?.status;
+    const builderColor = builderState === "system_error" ? "error" : builderState === "failed" ? "review-failed" : builderState === "passed" ? "success" : "active";
+    const colors = [firstState, thirdAvailable ? "success" : secondAvailable ? "active" : "inactive", thirdAvailable ? builderColor : "inactive"];
     steps.forEach((step, index) => {
       const stage = index + 1, available = stageAvailable(stage, attempt), selected = state.activeStage === stage;
       step.classList.toggle("active", selected);
-      for (const color of ["inactive", "active", "success", "error"]) step.classList.toggle(`step-state-${color}`, colors[index] === color);
+      for (const color of ["inactive", "active", "success", "error", "review-failed"]) step.classList.toggle(`step-state-${color}`, colors[index] === color);
       step.setAttribute("aria-selected", String(selected));
       step.setAttribute("aria-disabled", String(!available));
       step.tabIndex = selected ? 0 : -1;
-      if (available) step.href = ["#gallery-body", "#stage-two-panel", "#stage-three-panel", "#stage-four-panel"][index];
+      if (available) step.href = ["#gallery-body", "#stage-two-panel", "#stage-three-panel"][index];
       else step.removeAttribute("href");
     });
     const firstStage = state.activeStage === 1;
+    el["media-source-panel"].classList.toggle("d-none", state.activeStage !== 2);
+    el["media-outcome-panel"].classList.toggle("d-none", state.activeStage !== 2);
+    renderMediaTechnical(attempt);
     el["gallery-body"].classList.toggle("d-none", !firstStage);
     el["metadata-panel"].classList.toggle("d-none", !firstStage);
     el["summary-panel"].classList.toggle("d-none", !firstStage);
     el["logs-card"].classList.toggle("d-none", !firstStage || !attempt);
     el["stage-two-panel"].classList.toggle("d-none", state.activeStage !== 2);
     el["stage-three-panel"].classList.toggle("d-none", state.activeStage !== 3);
-    el["stage-four-panel"].classList.toggle("d-none", state.activeStage !== 4);
     el["qa-progress"].classList.toggle("stage-hidden", !firstStage);
     el["media-progress"].classList.toggle("stage-hidden", state.activeStage !== 2);
+    el["builder-progress"].classList.toggle("stage-hidden", state.activeStage !== 3);
     window.HtmlMedia.render(job, attempt, { csrfToken: state.csrfToken, refresh: () => refreshState() });
+    if (state.activeStage === 3) window.PageBuilder.render(job, { api, refresh: () => refreshState() });
   }
 
   function selectStage(stage, { focus = false } = {}) {
@@ -511,9 +556,8 @@
 
     el["empty-detail"].classList.add("d-none");
     el["job-detail"].classList.remove("d-none");
-    el["detail-title"].textContent = "Результаты страницы";
     const detailUrl = el["detail-url"];
-    detailUrl.textContent = job.url || "—";
+    detailUrl.textContent = job.url ? job.url.replace(/^https?:\/\//i, "").replace(/\/+$/, "") : "—";
     if (job.url) {
       detailUrl.href = job.url;
       detailUrl.target = "_blank";
@@ -1023,6 +1067,35 @@
     }
   }
 
+  function syncStepGeometry() {
+    const steps = [...el["result-steps"].querySelectorAll(".step-item")];
+    const firstLabel = steps[0].querySelector(".step-label").getBoundingClientRect();
+    const lastLabel = steps.at(-1).querySelector(".step-label").getBoundingClientRect();
+    const firstMarker = firstLabel.left + firstLabel.width / 2;
+    const lastMarker = lastLabel.left + lastLabel.width / 2;
+    const spacing = (lastMarker - firstMarker) / (steps.length - 1);
+    if (spacing <= 0) return;
+    const markers = steps.map((step, index) => {
+      const bounds = step.getBoundingClientRect();
+      const marker = firstMarker + spacing * index;
+      if (index > 0 && index < steps.length - 1) {
+        step.style.setProperty("--step-label-offset", `${marker - bounds.left - bounds.width / 2}px`);
+        step.style.setProperty("--step-label-max-width", `${Math.max(0, 2 * Math.min(marker - bounds.left, bounds.right - marker))}px`);
+      }
+      step.style.setProperty("--step-marker-left", `${marker - bounds.left}px`);
+      return marker;
+    });
+    steps.slice(1).forEach((step, index) => {
+      const width = markers[index + 1] - markers[index];
+      if (width > 0) step.style.setProperty("--step-connector-width", `${width}px`);
+    });
+  }
+
+  const stepGeometryObserver = new ResizeObserver(syncStepGeometry);
+  stepGeometryObserver.observe(el["result-steps"]);
+  document.fonts?.ready.then(syncStepGeometry);
+  syncStepGeometry();
+
   el["batch-form"].addEventListener("submit", submitUrl);
   el["connection-control"].addEventListener("click", requestShutdown);
   el["url-input"].addEventListener("input", () => {
@@ -1076,10 +1149,10 @@
   el["recapture-button"].addEventListener("click", () => writeAction(state.selectedJobId, "retry", el["recapture-button"]));
   el["stage-step-1"].addEventListener("click", event => { event.preventDefault(); selectStage(1, { focus: false }); });
   el["stage-step-2"].addEventListener("click", event => { event.preventDefault(); selectStage(2, { focus: false }); });
-  for (const id of ["stage-step-3", "stage-step-4"]) el[id].addEventListener("click", event => { event.preventDefault(); selectStage(Number(id.at(-1))); });
-  for (const id of ["stage-step-1", "stage-step-2", "stage-step-3", "stage-step-4"]) el[id].addEventListener("keydown", event => {
+  el["stage-step-3"].addEventListener("click", event => { event.preventDefault(); selectStage(3, { focus: false }); });
+  for (const id of ["stage-step-1", "stage-step-2", "stage-step-3"]) el[id].addEventListener("keydown", event => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-    const available = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"], el["stage-step-4"]].filter(step => step.getAttribute("aria-disabled") !== "true");
+    const available = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"]].filter(step => step.getAttribute("aria-disabled") !== "true");
     const current = Math.max(0, available.indexOf(event.currentTarget));
     const index = event.key === "Home" ? 0 : event.key === "End" ? available.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + available.length) % available.length;
     event.preventDefault();
@@ -1087,6 +1160,7 @@
   });
   window.addEventListener("beforeunload", () => {
     state.stopped = true;
+    stepGeometryObserver.disconnect();
     if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);
     state.eventSource?.close();
   });

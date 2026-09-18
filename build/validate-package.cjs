@@ -53,7 +53,7 @@ for (const [name, version] of [['parse5','7.3.0'],['ipaddr.js','2.2.0'],['postcs
   assert.equal(require(path.join(root, 'runtime/node_modules', name, 'package.json')).version, version);
   assert.ok(fs.readdirSync(path.join(root, 'runtime/node_modules', name)).some(file => /^licen[cs]e/i.test(file)), `${name} license`);
 }
-for (const file of ['src/stages/workflow.cjs','src/stages/html-media/index.cjs','src/stages/html-media/inventory.cjs','src/stages/html-media/download.cjs','src/resources/domains.json','public/html-media.js','public/modal-actions.js']) assert(fs.statSync(path.join(root, file)).isFile(), file);
+for (const file of ['src/stages/workflow.cjs','src/stages/html-media/index.cjs','src/stages/html-media/inventory.cjs','src/stages/html-media/download.cjs','src/stages/page-builder/store.cjs','src/resources/domains.json','public/html-media.js','public/page-builder.js','public/modal-actions.js']) assert(fs.statSync(path.join(root, file)).isFile(), file);
 const sourceReport = JSON.parse(fs.readFileSync(path.join(root, 'src/resources/import-report.json')));
 const editors = JSON.parse(fs.readFileSync(path.join(root, 'public/vendor/editors/manifest.json'))), runtimePackage = JSON.parse(fs.readFileSync(path.join(root, 'runtime/package.json')));
 for (const [name, sha] of Object.entries(editors.files)) assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root, 'public/vendor/editors', name))).digest('hex'), sha, `editor bundle/license: ${name}`);
