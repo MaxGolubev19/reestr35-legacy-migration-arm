@@ -107,6 +107,7 @@ test('existing state v2 loads without stage schema migration or altered flat API
   const snapshot = queue.snapshot('token'), job = snapshot.jobs[0];
   assert.equal(snapshot.csrfToken, 'token'); assert.equal(snapshot.concurrency, 3);
   assert.equal(job.status, 'paused'); assert.equal(job.canContinueQa, false); assert.equal(job.isActive, false);
-  assert.deepEqual(job.attempts, expected.jobs[0].attempts);
+  assert.deepEqual(job.attempts.map(({ pageBuilder, ...attempt }) => attempt), expected.jobs[0].attempts);
+  assert.ok(job.attempts.every(attempt => attempt.pageBuilder.total === 0 && attempt.pageBuilder.revision === 0));
   assert.ok(!Object.hasOwn(job, 'stage') && !Object.hasOwn(job.attempts[1], 'stages'));
 });

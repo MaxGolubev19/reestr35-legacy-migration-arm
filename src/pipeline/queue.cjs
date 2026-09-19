@@ -207,7 +207,7 @@ class PageQueue {
       ...this.stage.jobProjection(job),
       ...(this.pageBuilder ? { pageBuilder: this.pageBuilder.summary(job.id) } : {}),
       isActive: this.active.has(job.id) && this.active.get(job.id).exitCode === null,
-      attempts: job.attempts.map(attempt => ({ ...attempt, files: (attempt.files || []).map(file => ({ ...file,
+      attempts: job.attempts.map(attempt => ({ ...attempt, ...(this.pageBuilder ? { pageBuilder: this.pageBuilder.summary(job.id, attempt.number) } : {}), files: (attempt.files || []).map(file => ({ ...file,
         url: `/api/files/${job.id}/${attempt.number}/${encodeURIComponent(file.name)}` })) })) })) };
   }
 }

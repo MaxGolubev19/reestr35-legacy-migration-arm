@@ -154,10 +154,10 @@
       if (upstreamSignal.aborted) abortFromUpstream();
       else upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
     }
-    const timeout = window.setTimeout(() => controller.abort(new DOMException("Превышено время ожидания", "TimeoutError")), 10000);
+    const timeout = window.setTimeout(() => controller.abort(new DOMException("Превышено время ожидания", "TimeoutError")), options.timeoutMs || 10000);
     headers.set("Accept", "application/json");
     if (options.body !== undefined) {
-      headers.set("Content-Type", "application/json");
+      if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
       headers.set("x-csrf-token", state.csrfToken);
     }
     try {
@@ -484,7 +484,7 @@
     }
     const steps = [el["stage-step-1"], el["stage-step-2"], el["stage-step-3"]];
     const firstState = attempt?.captureStatus && attempt.captureStatus !== "complete" ? "error" : secondAvailable ? "success" : STAGE_ERROR_STATUSES.has(attempt?.status) ? "error" : "active";
-    const builderState = job?.pageBuilder?.status;
+    const builderState = attempt?.pageBuilder?.status;
     const builderColor = builderState === "system_error" ? "error" : builderState === "failed" ? "review-failed" : builderState === "passed" ? "success" : "active";
     const colors = [firstState, thirdAvailable ? "success" : secondAvailable ? "active" : "inactive", thirdAvailable ? builderColor : "inactive"];
     steps.forEach((step, index) => {
@@ -511,7 +511,7 @@
     el["media-progress"].classList.toggle("stage-hidden", state.activeStage !== 2);
     el["builder-progress"].classList.toggle("stage-hidden", state.activeStage !== 3);
     window.HtmlMedia.render(job, attempt, { csrfToken: state.csrfToken, refresh: () => refreshState() });
-    if (state.activeStage === 3) window.PageBuilder.render(job, { api, refresh: () => refreshState() });
+    if (state.activeStage === 3) window.PageBuilder.render(job, { api, attempt, refresh: () => refreshState() });
   }
 
   function selectStage(stage, { focus = false } = {}) {

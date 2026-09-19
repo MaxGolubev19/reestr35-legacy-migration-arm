@@ -23,6 +23,10 @@ function createShutdownController({ queue, server, unlock, exitFn = code => proc
         while (queue.active.size && clock() < deadline) await waitFn(100);
         if (queue.active.size) exitCode = 1;
       } catch (error) { console.error('Queue shutdown:', error.message); exitCode = 1; }
+      // Even when queue teardown times out, do not release ownership or exit
+      // while the native dialog process is still alive. Its adapter completes
+      // only after the child close event, never merely after a kill request.
+      await queue.mediaPicker?.shutdown();
       try { unlock(); } catch (error) { console.error('Unlock:', error.message); exitCode = 1; }
       try {
         if (server.listening) {

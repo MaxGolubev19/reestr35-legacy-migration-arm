@@ -5,6 +5,7 @@ const { attemptDir } = require('../../pipeline/paths.cjs');
 const { atomicJson, safeFile, stableRead } = require('../../infrastructure/files.cjs');
 const { inventory } = require('./inventory.cjs');
 const { LIMITS, download } = require('./download.cjs');
+const { checkedPath, filename, extensions } = require('../page-builder/media-picker.cjs');
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
 class HtmlMediaStage {
@@ -40,6 +41,18 @@ class HtmlMediaStage {
     atomicJson(path.join(this.directory(job, attempt, manifest.revision), 'manifest.json'), manifest);
     this.project(attempt, manifest); this.queue.save();
   }
+  publishImage(job, attempt, item) {
+    if (item.status !== 'downloaded' || !extensions[item.mime]) return;
+    if (!/^[a-f0-9]{64}$/.test(item.sha256) || item.object !== `objects/${item.sha256}`) throw new Error('Object identity mismatch');
+    const dir = this.directory(job, attempt), images = checkedPath(this.queue.root, path.join(dir, 'images'));
+    const source = checkedPath(this.queue.root, path.join(dir, item.object)), target = path.join(images, filename(item));
+    const bytes = stableRead(source, this.limits.maxFileBytes);
+    if (bytes.length !== item.bytes || sha(bytes) !== item.sha256) throw new Error('Object checksum mismatch');
+    try { fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const copied = stableRead(checkedPath(this.queue.root, target), this.limits.maxFileBytes);
+    if (copied.length !== item.bytes || sha(copied) !== item.sha256) throw new Error('Файл в папке выбора изменён; восстановите медиа шага 2');
+  }
   create(job, attempt, bytes, origin) {
     if (bytes.length > this.limits.maxHtmlBytes || !bytes.length) throw new Error('HTML пуст или превышает лимит 8 MiB');
     const root = path.join(attemptDir(this.queue.root, job, attempt), 'html-media'); fs.mkdirSync(root, { recursive: true });
@@ -53,7 +66,7 @@ class HtmlMediaStage {
       let text; try { text = new TextDecoder(charset).decode(bytes); } catch { text = bytes.toString('utf8'); }
       manifest.source.encoding = charset; manifest.resources = inventory(text, job.url, this.limits.maxResources);
       fs.writeFileSync(path.join(staging, 'source.html'), bytes, { flag: 'wx' });
-      fs.mkdirSync(path.join(staging, 'objects')); atomicJson(path.join(staging, 'manifest.json'), manifest);
+      fs.mkdirSync(path.join(staging, 'objects')); fs.mkdirSync(path.join(staging, 'images')); atomicJson(path.join(staging, 'manifest.json'), manifest);
       fs.renameSync(staging, dir); this.project(attempt, manifest);
     } finally { if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true }); }
     return manifest;
@@ -87,13 +100,26 @@ class HtmlMediaStage {
     else if (attempt.status === 'running') attempt.status = 'queued';
     delete attempt.pauseRequested; delete attempt.cancellationRequested;
     if (attempt.htmlMedia?.revision) {
-      try { const manifest = this.read(job, attempt, true); this.project(attempt, manifest); if (['complete', 'ready_with_issues'].includes(manifest.status)) attempt.status = 'complete'; }
+      try {
+        const manifest = this.read(job, attempt, true);
+        if (attempt.status === 'queued') this.recoverImages(job, attempt, manifest);
+        this.project(attempt, manifest);
+        if (['complete', 'ready_with_issues'].includes(manifest.status)) attempt.status = 'complete';
+      }
       catch (error) { attempt.status = 'interrupted'; attempt.error = error.message; }
     } else { const captureStatus = attempt.captureStatus; this.enter(job, attempt); attempt.captureStatus = captureStatus; }
   }
+  recoverImages(job, attempt, manifest) {
+    if (['complete', 'ready_with_issues'].includes(manifest.status)) return;
+    const dir = this.directory(job, attempt), images = path.join(dir, 'images');
+    checkedPath(this.queue.root, dir);
+    try { fs.mkdirSync(images); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    checkedPath(this.queue.root, images);
+    for (const item of manifest.resources) this.publishImage(job, attempt, item);
+  }
   validateResume(job, attempt) {
     if (this.uploads.has(job.id)) throw new Error('Загрузка HTML ещё выполняется');
-    this.read(job, attempt, true);
+    this.recoverImages(job, attempt, this.read(job, attempt, true));
   }
   start(job, attempt) {
     const queue = this.queue, controller = new AbortController();
@@ -116,6 +142,7 @@ class HtmlMediaStage {
             if (controller.signal.aborted) break;
             Object.assign(item, error.provenance || {}, { status: 'failed', error: error.message });
           }
+          if (item.status === 'downloaded') this.publishImage(job, attempt, item);
           this.publish(job, attempt, manifest);
         }
         const paused = attempt.pauseRequested || queue.closing;

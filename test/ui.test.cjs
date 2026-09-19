@@ -3,12 +3,24 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const { testTempRoot, testOutput } = require('./support.cjs');
 const path = require('node:path');
 const { chromium } = require('playwright');
+const sharp = require('sharp');
 const { Queue, createServer } = require('../src/server.cjs');
+const { seedMoriPage } = require('./page-builder-fixture.cjs');
 const { layout, normalizeUrl } = require('../src/lib.cjs');
 const { publishLease } = require('../src/launcher.cjs');
+
+function installLocalPreview(queue, job, asset) {
+  const attempt = job.attempts.at(-1), manifest = queue.stage.media.create(job, attempt, Buffer.from(`<img src="${asset.originalUrl}">`), 'test');
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+R5sGAAAAAElFTkSuQmCC', 'base64'), sha256 = crypto.createHash('sha256').update(png).digest('hex');
+  fs.writeFileSync(path.join(queue.stage.media.directory(job, attempt), 'objects', sha256), png);
+  Object.assign(manifest.resources[0], { status: 'downloaded', finalUrl: asset.originalUrl, redirects: [], mime: 'image/png', bytes: png.length, sha256, object: `objects/${sha256}` });
+  queue.stage.media.publishImage(job, attempt, manifest.resources[0]);
+  queue.stage.media.publish(job, attempt, manifest); return png;
+}
 
 test('connected indicator sends one protected shutdown POST and reaches disconnected only after server loss', { timeout: 30000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-shutdown-ui-'));
@@ -567,7 +579,7 @@ test('queue icons expose every action, preserve selection, handle races and show
   assert.equal(stepVisuals[1].dotBackground, activeBackground, 'step 2 uses the same neutral gray as an active step 1');
   assert.equal(new Set([stepVisuals[0].dotBackground, stepVisuals[1].dotBackground, stepVisuals[2].dotBackground, errorBackground]).size, 4, 'steps use exactly distinct success, active, inactive and error colors');
   assert.equal(await page.locator('#stage-two-panel .html-source-card').innerText(), 'HTML не найден — выбрать файл');
-  assert.equal(await page.locator('#stage-three-panel #page-builder-loading').textContent(), 'Загрузка шаблона…');
+  assert.equal(await page.locator('#stage-three-panel #page-builder-loading').textContent(), 'Загрузка страницы…');
   await page.screenshot({ path: path.join(output, 'ui-stage-two-1440.png'), fullPage: true });
   assert.equal(await page.locator('#gallery-body').isHidden(), true);
   const topGeometry = () => page.locator('#results-header, #result-steps, .result-steps .step-item').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return [node.id || node.className, box.x, box.y, box.width, box.height]; }));
@@ -850,15 +862,181 @@ test('technical area follows steps and attempts, preserves modern capture eviden
   assert.deepEqual(errors, []);
 });
 
+test('new empty page can add and delete its only tab at 320px', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-empty-tabs-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://new-page.reestr35.ru/');
+  const job = queue.jobs[0]; Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 320, height: 800 } }), errors = [], posts = [];
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('response', response => { if (response.request().method() === 'POST' && new URL(response.url()).pathname === `/api/page-builder/${job.id}`) posts.push(response.status()); });
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.tabs, []);
+  assert.equal(queue.pageBuilder.read(job.id).document.source.hostname, 'new-page.reestr35.ru');
+  const emptyAdd = page.getByRole('button', { name: 'Добавить вкладку' });
+  assert.equal(await emptyAdd.getAttribute('title'), 'Добавить вкладку');
+  assert.equal(await emptyAdd.innerText(), '+');
+  assert.equal(await emptyAdd.evaluate(node => { const box = node.getBoundingClientRect(), section = node.closest('.builder-tabs-section').getBoundingClientRect(); return box.width >= section.width - 2 && box.right <= innerWidth && box.height >= 55; }), true);
+  await emptyAdd.focus(); await page.keyboard.press('Enter'); await page.waitForSelector('#page-builder-modal.show');
+  await page.locator('#builder-title').fill('Новая вкладка'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
+  await page.waitForSelector('.builder-tab');
+  const compactAdd = page.locator('.builder-tab-add');
+  assert.equal(await compactAdd.evaluate(node => getComputedStyle(node).color), 'rgb(0, 0, 0)');
+  await compactAdd.hover();
+  await page.waitForFunction(() => getComputedStyle(document.querySelector('.builder-tab-add')).color !== 'rgb(0, 0, 0)');
+  for (const name of ['Перетащить вкладку: Новая вкладка', 'Действия вкладки: Новая вкладка']) {
+    const control = page.getByRole('button', { name });
+    assert.equal(await control.evaluate(node => getComputedStyle(node).borderWidth), '0px');
+    await control.hover();
+    await page.waitForFunction(label => { const node = [...document.querySelectorAll('.builder-tab-handle, .builder-tab-menu-button')].find(node => node.getAttribute('aria-label') === label); return node && getComputedStyle(node).backgroundColor !== 'rgba(0, 0, 0, 0)'; }, name);
+  }
+  await page.getByRole('button', { name: 'Действия вкладки: Новая вкладка' }).click(); await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
+  await page.waitForFunction(() => document.querySelector('.builder-tab-empty-add') && !document.querySelector('.builder-tab'));
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.tabs, []);
+  assert.deepEqual(posts, [200, 200]); assert.equal(await page.locator('#page-builder-error').isVisible(), false); assert.deepEqual(errors, []);
+});
+
+test('step 3 attempt switching isolates equal revisions, media, progress and pending drafts', { timeout: 45000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-attempt-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
+  const job = queue.jobs[0]; seedMoriPage(queue, job);
+  const complete = { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } };
+  Object.assign(job.attempts[0], structuredClone(complete)); queue.retry(job.id); Object.assign(job.attempts[1], structuredClone(complete)); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  assert.equal(await page.locator('#attempt-select').inputValue(), '2');
+  assert.equal(await page.locator('.builder-block-open').count(), 0); assert.equal(await page.locator('#builder-progress-count').innerText(), '0/0');
+  await page.locator('#attempt-select').selectOption('1');
+  await page.waitForFunction(() => document.querySelector('#builder-progress-count').textContent === '4/10');
+  assert.ok(await page.locator('.builder-block-open').count() > 0);
+  assert.match(await page.locator('.builder-block img').first().getAttribute('src'), /attempt=1/);
+  await page.locator('.builder-block-open').first().click(); await page.locator('#builder-title').fill('Не переносить в новую попытку');
+  // Exercise a context update while an editor owns a draft, as with polling/retry.
+  await page.evaluate(async () => {
+    const snapshot = await (await fetch('/api/state')).json(), job = snapshot.jobs[0];
+    await window.PageBuilder.render(job, { attempt: job.attempts[1], api: async (url, options = {}) => { const response = await fetch(url, { ...options, headers: { 'content-type': 'application/json', 'x-csrf-token': snapshot.csrfToken } }); const value = await response.json(); if (!response.ok) throw new Error(value.error); return value; } });
+  });
+  assert.equal(await page.locator('#page-builder-content').evaluate(node => node.classList.contains('d-none')), true);
+  await page.locator('#page-builder-save').click(); assert.match(await page.locator('#page-builder-form-error').innerText(), /Страница обновилась/);
+  await page.keyboard.press('Escape'); await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
+  await page.locator('#attempt-select').selectOption('2'); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  assert.equal(await page.locator('.builder-block-open').count(), 0);
+  await page.locator('[data-add-section="common"]').click(); await page.locator('#builder-title').fill('Блок второй попытки'); await page.locator('#page-builder-save').click();
+  await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.builder-block-open[aria-label^="Блок второй попытки"]');
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('.builder-block-open[aria-label^="Блок второй попытки"]');
+  await page.locator('#attempt-select').selectOption('1'); await page.waitForFunction(() => document.querySelector('#builder-progress-count').textContent === '4/10');
+  assert.equal(await page.locator('.builder-block-open[aria-label^="Блок второй попытки"]').count(), 0);
+  assert.equal(queue.pageBuilder.read(job.id, { attempt: 1 }).revision, 1); assert.equal(queue.pageBuilder.read(job.id, { attempt: 2 }).revision, 2);
+  assert.deepEqual(errors, []);
+});
+
+test('step 3 tab controls create, rename, reorder and delete tabs without breaking block drag or ARIA panels', { timeout: 60000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-tabs-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
+  seedMoriPage(queue, queue.jobs[0]);
+  const job = queue.jobs[0]; Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const close = async () => { await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); };
+  await page.getByRole('button', { name: 'Добавить вкладку' }).click();
+  await page.locator('#builder-title').fill('Новая вкладка'); await page.locator('#page-builder-save').click(); await close();
+  const tabId = queue.pageBuilder.read(job.id).document.tabs.at(-1).id;
+  await page.waitForSelector(`#builder-tab-${tabId}`);
+  assert.equal(await page.locator(`#builder-tab-${tabId}`).getAttribute('aria-selected'), 'true');
+  assert.equal(await page.locator(`#builder-tab-${tabId}`).getAttribute('aria-controls'), `builder-panel-${tabId}`);
+  assert.equal(await page.locator(`#builder-panel-${tabId}`).getAttribute('aria-labelledby'), `builder-tab-${tabId}`);
+  await page.getByRole('button', { name: 'Действия вкладки: Новая вкладка' }).click();
+  await page.getByRole('button', { name: 'Переименовать' }).click(); await page.locator('#builder-title').fill('Добавленная'); await page.locator('#page-builder-save').click(); await close();
+  await page.waitForFunction(id => document.getElementById(`builder-tab-${id}`)?.textContent.includes('Добавленная'), tabId);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs.at(-1).title, 'Добавленная');
+  const menuButton = page.getByRole('button', { name: 'Действия вкладки: Добавленная' });
+  for (const actionName of ['Переименовать', 'Удалить']) {
+    await menuButton.click(); const action = page.getByRole('button', { name: actionName, exact: true }); await action.focus(); const oldAction = await action.elementHandle();
+    const current = queue.pageBuilder.read(job.id), external = structuredClone(current.document); external.common.title = `Внешнее обновление ${actionName}`;
+    queue.pageBuilder.write(job.id, current.revision, external);
+    await page.waitForFunction(node => !node.isConnected, oldAction);
+    assert.equal(await action.evaluate(node => node === document.activeElement), true, `poll keeps focus on «${actionName}»`);
+    assert.equal(await menuButton.getAttribute('aria-expanded'), 'true');
+    assert.equal(await menuButton.evaluate(node => Boolean(document.getElementById(node.getAttribute('aria-controls')))), true);
+    await page.keyboard.press('Escape'); assert.equal(await menuButton.evaluate(node => node === document.activeElement), true);
+  }
+  const pattern = `**/api/page-builder/${job.id}?attempt=*`;
+  const conflict = async route => {
+    if (route.request().method() === 'POST') {
+      const current = queue.pageBuilder.read(job.id), external = structuredClone(current.document); external.tabs[0].title = 'Акции обновлены извне';
+      queue.pageBuilder.write(job.id, current.revision, external);
+    }
+    await route.continue();
+  };
+  await page.route(pattern, conflict);
+  const rejected = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === `/api/page-builder/${job.id}`);
+  await page.getByRole('button', { name: 'Перетащить вкладку: Добавленная' }).focus(); await page.keyboard.press('ArrowLeft');
+  assert.equal((await rejected).status(), 409); await page.waitForFunction(() => !document.querySelector('#page-builder-content').hasAttribute('aria-busy') && document.querySelector('#page-builder-error').textContent.includes('уже изменены'));
+  await page.unroute(pattern, conflict);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs.at(-1).id, tabId, 'stale reorder never reaches disk');
+  assert.equal(await page.evaluate(id => document.activeElement?.dataset.tabId === id, tabId), true, 'conflict returns focus to the tab');
+  await page.getByRole('button', { name: 'Перетащить вкладку: Добавленная' }).focus(); await page.keyboard.press('ArrowLeft');
+  await page.waitForFunction(id => [...document.querySelectorAll('.builder-tab')].at(-2)?.dataset.tabId === id, tabId);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs.at(-2).id, tabId);
+  await page.getByRole('button', { name: 'Перетащить вкладку: Добавленная' }).dragTo(page.locator('.builder-tab-item').first(), { targetPosition: { x: 4, y: 15 } });
+  await page.waitForFunction(id => document.querySelector('.builder-tab')?.dataset.tabId === id, tabId);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs[0].id, tabId);
+  await page.getByRole('button', { name: 'Перетащить блок: MORI CINEMA', exact: true }).dragTo(page.locator(`#builder-tab-${tabId}`));
+  await page.waitForFunction(id => document.querySelector(`#builder-panel-${id}`)?.querySelector('[data-builder-id="common-hero"]'), tabId);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs[0].blocks.some(block => block.id === 'common-hero'), true);
+  await page.getByRole('button', { name: 'Действия вкладки: Добавленная' }).click(); await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close();
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs[0].id, tabId, 'cancel preserves the tab and its blocks');
+  await page.getByRole('button', { name: 'Действия вкладки: Добавленная' }).click(); await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+  assert.match(await page.locator('#page-builder-fields').innerText(), /1 блок/);
+  await page.locator('#page-builder-save').click(); await close(); await page.waitForFunction(id => !document.getElementById(`builder-tab-${id}`), tabId);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs.some(tab => tab.id === tabId), false);
+  for (const tab of [...queue.pageBuilder.read(job.id).document.tabs]) {
+    await page.getByRole('button', { name: `Действия вкладки: ${tab.title}` }).click(); await page.getByRole('button', { name: 'Удалить', exact: true }).click();
+    await page.locator('#page-builder-save').click(); await close(); await page.waitForFunction(id => !document.getElementById(`builder-tab-${id}`), tab.id);
+  }
+  assert.equal(await page.locator('.builder-tab').count(), 0);
+  assert.equal(await page.getByRole('button', { name: 'Добавить вкладку' }).isEnabled(), true);
+  assert.equal(await page.locator('.builder-tab-empty-add').count(), 1);
+  assert.equal(await page.locator('.builder-tab-empty-add').getAttribute('title'), 'Добавить вкладку');
+  assert.equal(await page.locator('.builder-tab-empty-add').innerText(), '+');
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.tabs, []);
+  await page.getByRole('button', { name: 'Добавить вкладку' }).click(); await page.locator('#builder-title').fill('После удаления'); await page.locator('#page-builder-save').click(); await close();
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  assert.deepEqual(await page.locator('.builder-tab').allInnerTexts(), ['После удаления']);
+  await page.getByRole('button', { name: 'Действия вкладки: После удаления' }).click();
+  const oldRename = await page.getByRole('button', { name: 'Переименовать', exact: true }).elementHandle();
+  const current = queue.pageBuilder.read(job.id), external = structuredClone(current.document); external.tabs = []; queue.pageBuilder.write(job.id, current.revision, external);
+  await page.waitForFunction(node => !node.isConnected, oldRename);
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.tabAdd), 'true', 'external deletion of the open menu tab focuses the add button');
+  await page.setViewportSize({ width: 320, height: 800 });
+  assert.equal(await page.locator('.builder-tab-empty-add').evaluate(node => { const box = node.getBoundingClientRect(), section = node.closest('.builder-tabs-section').getBoundingClientRect(); return box.left >= section.left && box.right <= section.right && box.right <= innerWidth && box.width >= section.width - 2 && box.height >= 55; }), true);
+  await page.getByRole('button', { name: 'Добавить вкладку' }).focus(); await page.keyboard.press('Enter');
+  await page.waitForSelector('#page-builder-modal.show');
+  assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'empty add area works from the keyboard');
+  assert.deepEqual(errors, []);
+});
+
 test('step 3 template edits, review statuses, cancel rollback and responsive modal are local and durable', { timeout: 60000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-ui-'));
   const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
+  seedMoriPage(queue, queue.jobs[0]);
   const job = queue.jobs[0], attempt = job.attempts[0]; Object.assign(attempt, { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
-  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), external = [], errors = [];
-  page.on('request', request => { if (!request.url().startsWith(`http://127.0.0.1:${server.address().port}/`)) external.push(request.url()); }); page.on('pageerror', error => errors.push(error.message));
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), external = [], errors = [], builderPosts = [];
+  page.on('request', request => { if (!request.url().startsWith(`http://127.0.0.1:${server.address().port}/`)) external.push(request.url()); if (request.method() === 'POST' && new URL(request.url()).pathname === `/api/page-builder/${job.id}`) builderPosts.push(request); }); page.on('pageerror', error => errors.push(error.message));
   await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click();
   await page.waitForSelector('#page-builder-content:not(.d-none)'); assert.equal(await page.locator('#stage-step-3').getAttribute('aria-selected'), 'true');
   assert.equal(await page.locator('#stage-step-4, #stage-four-panel').count(), 0, 'step 4 is absent from UI and bodies');
@@ -876,6 +1054,18 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   assert.deepEqual(await page.locator('.builder-tab').allInnerTexts(), ['Акции/новости', 'Афиша', 'Цены', 'О нас']);
   assert.ok(await page.locator('.builder-block').count() >= 5); assert.match(await page.locator('.builder-failure-reason').first().innerText(), /проверить|сверить/i);
   assert.equal(await page.locator('.builder-block-status').count(), 0, 'cards do not duplicate the left-border status with a marker');
+  assert.equal(await page.locator('.builder-block').evaluateAll(nodes => nodes.every(node => node.querySelector('.builder-type-icon > svg') && node.querySelector('.builder-block-title') && !node.querySelector('.builder-block-heading'))), true, 'each compact card uses a square type icon and a dedicated title row');
+  assert.equal(await page.locator('.builder-block').first().evaluate(node => { const css = getComputedStyle(node), root = getComputedStyle(document.documentElement), surface = document.createElement('span'); surface.style.backgroundColor = root.getPropertyValue('--tblr-bg-surface'); document.body.append(surface); const expected = getComputedStyle(surface).backgroundColor; surface.remove(); const rgb = css.backgroundColor.match(/\d+/g).slice(0, 3).map(Number); return css.backgroundColor === expected && rgb.every(channel => channel > 224); }), true, 'block cards use the ARM light surface theme token');
+  assert.equal(await page.locator('.builder-text-preview').evaluateAll(nodes => nodes.every(node => { const css = getComputedStyle(node); return css.overflow === 'hidden' && css.webkitLineClamp === '2'; })), true, 'card text excerpts stay within two lines');
+  const gallery = page.locator('[data-builder-id="news-promos"] .builder-media-preview');
+  assert.equal(await gallery.locator('img').count(), 2); assert.equal((await gallery.locator('.builder-media-more').innerText()).trim(), '+2', 'media preview uses two thumbnails and a compact overflow count');
+  await page.setViewportSize({ width: 600, height: 900 });
+  assert.equal(await page.locator('[data-builder-id="common-actions"] .builder-media-preview img:visible').count(), 2, '600px keeps both thumbnails when the block has two media');
+  assert.equal(await page.locator('[data-builder-id="common-actions"] .builder-media-more').count(), 0, '600px does not invent an overflow count for two visible media');
+  assert.equal(await gallery.locator('img:visible').count(), 2, '600px keeps the two thumbnails represented by the overflow count');
+  assert.equal((await gallery.locator('.builder-media-more:visible').innerText()).trim(), '+2', '600px overflow count matches the two remaining media');
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, '600px media previews do not cause horizontal overflow');
+  await page.setViewportSize({ width: 1440, height: 1000 });
   const borderColors = await page.locator('.builder-block').evaluateAll(nodes => Object.fromEntries(nodes.map(node => [node.classList.contains('review-failed') ? 'failed' : node.classList.contains('review-passed') ? 'passed' : 'unreviewed', getComputedStyle(node).borderLeftColor])));
   assert.deepEqual(Object.keys(borderColors).sort(), ['failed', 'passed', 'unreviewed']); assert.equal(new Set(Object.values(borderColors)).size, 3, 'passed, failed and unreviewed use distinct left-border colors');
   assert.match(await page.locator('.builder-block.review-failed .builder-failure-reason').innerText(), /сверить/i, 'failed reason remains visible');
@@ -899,20 +1089,24 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   await page.locator('#builder-tab-prices').click(); assert.equal(await page.locator('#builder-tab-prices').getAttribute('aria-selected'), 'true'); assert.equal(await page.locator('#builder-panel-posters').evaluate(node => node.hidden), true); assert.equal(await page.locator('#builder-panel-prices').evaluate(node => node.hidden), false); assert.equal(await page.locator('.builder-tab-panel:visible').count(), 1, 'click keeps only its controlled panel visible');
   await page.locator('#builder-tab-news').click();
   await page.keyboard.press('End'); assert.equal(await page.locator('#builder-tab-about').evaluate(node => document.activeElement === node), true); await page.keyboard.press('Home'); assert.equal(await page.locator('#builder-tab-news').evaluate(node => document.activeElement === node), true); await page.keyboard.press('ArrowLeft'); assert.equal(await page.locator('#builder-tab-about').evaluate(node => document.activeElement === node), true); await page.keyboard.press('Home');
-  const commonHero = page.locator('#page-builder-content > .builder-section').first().locator('.builder-block').first(); await commonHero.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#builder-title').fill('MORI CINEMA · Годовикова, 37'); await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  const commonHero = page.locator('#page-builder-content > .builder-section').first().locator('.builder-block').first(), commonHeroOpener = commonHero.locator('.builder-block-open');
+  await commonHeroOpener.evaluate(opener => new Promise(resolve => { document.getElementById('page-builder-modal').addEventListener('hidden.bs.modal', resolve, { once: true }); opener.click(); document.getElementById('page-builder-form').requestSubmit(); }));
+  assert.equal(await page.locator('#page-builder-modal').isHidden(), true, 'unchanged submit before shown waits for shown and then closes'); assert.equal(builderPosts.length, 0); assert.equal(queue.pageBuilder.read(job.id).revision, 1); assert.equal(await commonHeroOpener.evaluate(node => node === document.activeElement), true, 'deferred no-op close restores focus to its opener');
+  await commonHero.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  assert.equal(builderPosts.length, 0, 'unchanged edit submit sends no POST'); assert.equal(queue.pageBuilder.read(job.id).revision, 1, 'unchanged edit does not consume a revision'); assert.equal(await commonHeroOpener.evaluate(node => node === document.activeElement), true, 'unchanged edit closes normally and restores focus');
+  await commonHero.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#builder-title').fill('MORI CINEMA · Годовикова, 37'); await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
   await page.waitForFunction(() => document.querySelector('#page-builder-content > .builder-section')?.textContent.includes('MORI CINEMA · Годовикова, 37'));
   let stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 2); assert.equal(stored.document.common.blocks[0].title, 'MORI CINEMA · Годовикова, 37', 'common block is located and persisted');
   const vacancy = page.getByRole('button', { name: /^Вакансии\./ }); await vacancy.click(); await page.waitForSelector('#page-builder-modal.show');
   assert.equal(await page.locator('#builder-review-status').inputValue(), 'failed'); assert.match(await page.locator('#builder-review-reason').inputValue(), /сверить/i);
   await page.locator('#builder-title').fill('Не сохранять'); await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
-  assert.match(await vacancy.innerText(), /^Текст\nВакансии/m, 'Cancel leaves the document unchanged');
+  assert.match(await vacancy.innerText(), /^Вакансии\nВ кинотеатр MORI CINEMA/m, 'Cancel leaves the document unchanged');
   await vacancy.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#builder-title').fill('Черновик пользователя');
   const externalStored = queue.pageBuilder.read(job.id), externalDocument = structuredClone(externalStored.document); externalDocument.tabs[0].blocks[1].title = 'Внешняя запись'; queue.pageBuilder.write(job.id, externalStored.revision, externalDocument);
   await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); await page.waitForTimeout(100);
   assert.equal(await vacancy.evaluate(node => node.isConnected), true, 'polling with a newer revision does not replace the live opener'); assert.equal(await page.locator('#builder-title').inputValue(), 'Черновик пользователя');
-  const conflictedPost = page.waitForRequest(request => request.method() === 'POST' && new URL(request.url()).pathname === `/api/page-builder/${job.id}`), conflictResponsePromise = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === `/api/page-builder/${job.id}`); await page.locator('#page-builder-save').click(); const [conflictRequest, conflictResponse] = await Promise.all([conflictedPost, conflictResponsePromise]);
-  assert.equal(conflictRequest.postDataJSON().revision, 2, 'save uses the revision captured when the draft opened'); assert.equal(conflictResponse.status(), 409, 'stale draft receives a CAS conflict'); await page.waitForFunction(() => document.querySelector('#page-builder-form-error').textContent.includes('уже изменены'));
-  assert.equal(await page.locator('#page-builder-modal').isVisible(), true); stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 3); assert.equal(stored.document.tabs[0].blocks[1].title, 'Внешняя запись', '409 preserves the external write');
+  const postsBeforeMismatch = builderPosts.length; await page.locator('#page-builder-save').click(); await page.waitForFunction(() => document.querySelector('#page-builder-form-error').textContent.includes('Страница обновилась'));
+  assert.equal(builderPosts.length, postsBeforeMismatch, 'draft revision mismatch sends no POST'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true); stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 3); assert.equal(stored.document.tabs[0].blocks[1].title, 'Внешняя запись', 'stale draft guard preserves the external write');
   await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); await page.waitForFunction(() => document.querySelector('.builder-tab-panel')?.textContent.includes('Внешняя запись')); assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'news-vacancy', 'focus maps to the refreshed opener after conflict cancel');
   const externalVacancy = page.getByRole('button', { name: /^Внешняя запись\./ }); await externalVacancy.click(); await page.locator('#builder-title').fill('Вакансии кинотеатра'); await page.locator('#builder-review-status').selectOption('failed'); await page.locator('#builder-review-reason').fill('');
   await page.locator('#page-builder-save').click(); assert.match(await page.locator('#page-builder-form-error').innerText(), /Укажите причину/);
@@ -920,14 +1114,14 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   await page.waitForFunction(() => document.querySelector('.builder-tab-panel')?.textContent.includes('Вакансии кинотеатра'));
   stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 4); assert.equal(stored.document.tabs[0].blocks[1].review.status, 'passed');
   let releaseDelayedSave, markDelayedSaveArrived; const delayedSaveGate = new Promise(resolve => { releaseDelayedSave = resolve; }), delayedSaveArrived = new Promise(resolve => { markDelayedSaveArrived = resolve; });
-  const builderApiPattern = `**/api/page-builder/${job.id}`, delayedSaveHandler = async route => { if (route.request().method() !== 'POST') return route.continue(); markDelayedSaveArrived(); await delayedSaveGate; await route.continue(); };
+  const builderApiPattern = `**/api/page-builder/${job.id}?attempt=*`, delayedSaveHandler = async route => { if (route.request().method() !== 'POST') return route.continue(); markDelayedSaveArrived(); await delayedSaveGate; await route.continue(); };
   await page.route(builderApiPattern, delayedSaveHandler); const delayedCommon = page.getByRole('button', { name: /^MORI CINEMA · Годовикова, 37\./ }); await delayedCommon.click(); await page.locator('#builder-title').fill('MORI CINEMA · атомарное сохранение'); await page.locator('#page-builder-save').click(); await delayedSaveArrived;
   const cancelSave = page.getByRole('button', { name: 'Отмена', exact: true }), closeSave = page.getByRole('button', { name: 'Отменить и закрыть', exact: true }); assert.equal(await cancelSave.isDisabled(), true); assert.equal(await closeSave.isDisabled(), true); assert.equal(await page.locator('#page-builder-modal').getAttribute('aria-busy'), '');
   await cancelSave.evaluate(node => node.click()); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'Cancel cannot interrupt an in-flight save'); await page.keyboard.press('Escape'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'Escape cannot interrupt an in-flight save'); await closeSave.evaluate(node => node.click()); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'close cannot interrupt an in-flight save');
   await page.getByRole('button', { name: /^Быстрые действия\./ }).evaluate(node => node.click()); assert.equal(await page.locator('#builder-title').inputValue(), 'MORI CINEMA · атомарное сохранение', 'another block cannot replace the pending draft');
   releaseDelayedSave(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); await page.unroute(builderApiPattern, delayedSaveHandler); await page.waitForFunction(() => document.querySelector('#page-builder-content > .builder-section')?.textContent.includes('MORI CINEMA · атомарное сохранение'));
   stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 5); assert.equal(stored.document.common.blocks[0].title, 'MORI CINEMA · атомарное сохранение'); assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'common-hero', 'completed delayed save renders and restores focus to its opener');
-  const edit = page.locator('.builder-tab-panel .builder-block').first(); await edit.focus(); const editHandle = await edit.elementHandle(); await edit.click(); await page.waitForSelector('#page-builder-modal.show'); await page.waitForFunction(() => document.activeElement?.closest('#page-builder-modal')); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); assert.equal(await editHandle.evaluate(node => node.isConnected), true, 'unchanged polling keeps the opener node alive'); await page.keyboard.press('Escape'); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); assert.equal(await editHandle.evaluate(node => document.activeElement === node), true, 'Escape restores focus after multiple polls');
+  const edit = page.locator('.builder-tab-panel .builder-block-open').first(); await edit.focus(); const editHandle = await edit.elementHandle(); await edit.click(); await page.waitForSelector('#page-builder-modal.show'); await page.waitForFunction(() => document.activeElement?.closest('#page-builder-modal')); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); assert.equal(await editHandle.evaluate(node => node.isConnected), true, 'unchanged polling keeps the opener node alive'); await page.keyboard.press('Escape'); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); assert.equal(await editHandle.evaluate(node => document.activeElement === node), true, 'Escape restores focus after multiple polls');
   for (const width of [1440, 390, 375, 360, 320]) {
     await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 }); await page.locator('.builder-block').filter({ hasText: 'Вакансии кинотеатра' }).click(); await page.waitForSelector('#page-builder-modal.show');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}: no horizontal document overflow`);
@@ -940,6 +1134,561 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   await page.waitForFunction(() => document.querySelector('#builder-progress-count')?.textContent === '10/10'); assert.equal(await page.locator('#builder-progress-bar .bg-yellow').count(), 0, 'stale section failure does not affect block progress');
   fs.writeFileSync(queue.pageBuilder.file(job.id), '{broken'); await page.waitForFunction(() => document.querySelector('#stage-step-3')?.classList.contains('step-state-error'));
   assert.deepEqual(external, [], 'step 3 does not fetch Mori media from the network'); assert.deepEqual(errors, []);
+});
+
+test('step 3 block management supports create, drag, keyboard move, delete, conflicts and reload', { timeout: 60000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-management-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
+  seedMoriPage(queue, queue.jobs[0]);
+  const job = queue.jobs[0]; Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = [], builderPosts = []; page.on('pageerror', error => errors.push(error.message)); page.on('request', request => { if (request.method() === 'POST' && new URL(request.url()).pathname === `/api/page-builder/${job.id}`) builderPosts.push(request); });
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const waitClosed = async () => { await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); };
+  const waitRevision = async revision => { await page.waitForFunction(() => !document.querySelector('#page-builder-content').hasAttribute('aria-busy')); assert.equal(queue.pageBuilder.read(job.id).revision, revision, await page.locator('#page-builder-error').textContent()); };
+  assert.equal(await page.locator('.builder-block-actions').count(), 0, 'the old separate action row is absent');
+  assert.equal(await page.locator('.builder-actions-toggle').count(), 0, 'there is no ellipsis menu button');
+  assert.equal(await page.locator('.builder-block button button, .builder-block button select').count(), 0, 'interactive controls are never nested');
+  assert.equal(await page.locator('.builder-action-panel:visible').count(), 0, 'additional actions are closed by default');
+  assert.equal(await page.locator('.builder-delete').evaluateAll(nodes => nodes.every(node => node.textContent === '' && node.title === 'Удалить блок' && node.getAttribute('aria-label').startsWith('Удалить блок:') && node.querySelector('svg'))), true, 'delete is a labelled trash icon without visible button text');
+  for (const width of [1440, 768, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 }); await page.mouse.move(0, 0); await page.evaluate(() => document.activeElement?.blur());
+    await page.locator('.builder-add').evaluateAll(nodes => Promise.all(nodes.flatMap(node => node.getAnimations().map(animation => animation.finished))));
+    const geometry = await page.locator('.builder-block:visible').evaluateAll(cards => cards.map(card => {
+      const box = card.getBoundingClientRect(), opener = card.querySelector('.builder-block-open').getBoundingClientRect();
+      const icon = card.querySelector('.builder-type-icon').getBoundingClientRect(), description = card.querySelector('.builder-text-preview'), descriptionCss = description && getComputedStyle(description);
+      return { tag: card.tagName, width: box.width, iconSquare: Math.abs(icon.width - icon.height) < 1, descriptionSingleLine: !description || (descriptionCss.webkitLineClamp === '2'), controls: [...card.querySelectorAll('.builder-card-tools > .btn, .builder-drag-handle')].map(control => { const rect = control.getBoundingClientRect(); return rect.left >= opener.right - 1 && rect.right <= box.right + 1 && rect.top >= box.top && rect.bottom <= box.bottom + 1; }) };
+    }));
+    assert.ok(geometry.every(card => card.tag === 'DIV' && card.iconSquare && card.descriptionSingleLine && card.controls.length === 2 && card.controls.every(Boolean)), `${width}: compact card geometry retains square type icons, two-line text excerpts, and right-side controls`);
+    assert.equal(await page.locator('.builder-add:visible').evaluateAll(nodes => nodes.every(node => { const box = node.getBoundingClientRect(), parent = node.parentElement.getBoundingClientRect(), plus = node.querySelector('.builder-add-plus').getBoundingClientRect(); return Math.abs(box.width - parent.width) < 2 && getComputedStyle(node).borderTopStyle === 'dashed' && node.innerText === '+' && node.title === node.getAttribute('aria-label') && node.title.startsWith('Добавить блок:') && Math.abs((plus.left + plus.right - box.left - box.right) / 2) < 1 && Math.abs((plus.top + plus.bottom - box.top - box.bottom) / 2) < 1; })), true, `${width}: full-width dashed add area displays only one centered plus and retains its accessible name`);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}: no horizontal overflow`);
+    if ([1440, 320].includes(width)) await page.locator('#stage-three-panel').screenshot({ path: path.join(testOutput(), `ui-stage-three-controls-${width}.png`) });
+    const addArea = page.locator('[data-add-section="common"]'); await addArea.scrollIntoViewIfNeeded();
+    const baseline = await addArea.evaluate(node => {
+      const probe = document.createElement('span'); probe.style.cssText = 'position:absolute;visibility:hidden;background:transparent;border:1px dashed var(--tblr-border-color);color:var(--tblr-primary)'; node.append(probe);
+      const read = () => { const css = getComputedStyle(probe); return { background: css.backgroundColor, border: css.borderTop, color: css.color }; };
+      const normal = read(); probe.style.background = 'var(--tblr-primary-lt)'; probe.style.borderColor = 'var(--tblr-primary)'; probe.style.color = 'var(--tblr-btn-hover-color, var(--tblr-body-color))'; const active = read(); probe.remove(); return { normal, active };
+    });
+    const appearance = () => addArea.evaluate(node => { const box = node.getBoundingClientRect(), css = getComputedStyle(node); return { width: box.width, height: box.height, border: css.borderTop, borderStyle: css.borderTopStyle, borderWidth: css.borderTopWidth, borderColor: css.borderTopColor, background: css.backgroundColor, plusColor: getComputedStyle(node.querySelector('.builder-add-plus')).color, shadow: css.boxShadow, outline: css.outlineStyle }; });
+    const idle = await appearance(); await addArea.hover(); await addArea.evaluate(node => Promise.all(node.getAnimations().map(animation => animation.finished)));
+    const hovered = await appearance();
+    assert.equal(idle.background, baseline.normal.background); assert.equal(idle.border, baseline.normal.border, 'normal background and border retain the original plus-only styling');
+    assert.equal(hovered.background, baseline.active.background); assert.equal(hovered.border, baseline.active.border, 'hover background and border retain the original plus-only styling');
+    assert.equal(idle.plusColor, idle.borderColor, 'normal plus exactly matches the dashed border color'); assert.equal(hovered.plusColor, baseline.normal.color, 'hover and focus plus retain the existing primary color');
+    assert.equal(hovered.width, idle.width); assert.equal(hovered.height, idle.height); assert.equal(hovered.borderStyle, 'dashed'); assert.equal(hovered.borderWidth, idle.borderWidth); assert.equal(hovered.shadow, 'none'); assert.equal(hovered.outline, 'none'); assert.notEqual(hovered.borderColor, idle.borderColor); assert.notEqual(hovered.background, idle.background);
+    if ([1440, 320].includes(width)) await addArea.screenshot({ path: path.join(testOutput(), `ui-stage-three-add-hover-${width}.png`) });
+    await addArea.focus(); await page.keyboard.press('Tab'); await page.keyboard.press('Shift+Tab'); await page.mouse.move(0, 0);
+    assert.equal(await addArea.evaluate(node => node.matches(':focus-visible')), true);
+    assert.deepEqual(await appearance(), hovered, `${width}: keyboard focus and hover share a single stable border/background with no geometry shift`);
+    if ([1440, 320].includes(width)) await addArea.screenshot({ path: path.join(testOutput(), `ui-stage-three-add-focus-${width}.png`) });
+  }
+  await page.emulateMedia({ forcedColors: 'active' });
+  const forcedAdd = page.locator('[data-add-section="common"]');
+  assert.equal(await forcedAdd.evaluate(node => { const css = getComputedStyle(node); return node.matches(':focus-visible') && css.color !== css.backgroundColor && css.borderTopStyle === 'dashed' && css.boxShadow === 'none'; }), true, 'forced colors preserves a distinguishable keyboard focus state');
+  await page.emulateMedia({ forcedColors: 'none' });
+  const tools = page.getByRole('button', { name: 'Перетащить блок: MORI CINEMA', exact: true }); await tools.focus(); await page.keyboard.press('Enter');
+  assert.equal(await tools.getAttribute('aria-expanded'), 'true');
+  assert.equal(await page.locator('#builder-actions-common-hero').evaluate(node => { const box = node.getBoundingClientRect(); return box.left >= 0 && box.right <= innerWidth; }), true, 'actions panel fits at 320px');
+  await page.keyboard.press('Escape'); assert.equal(await tools.getAttribute('aria-expanded'), 'false'); assert.equal(await tools.evaluate(node => node === document.activeElement), true);
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.evaluate(() => { window.builderModalShown = new Promise(resolve => document.getElementById('page-builder-modal').addEventListener('shown.bs.modal', resolve, { once: true })); });
+  await page.locator('[data-add-section="common"]').click(); await page.locator('#builder-title').fill('Отменённый блок'); await page.evaluate(() => window.builderModalShown.then(() => true)); await page.keyboard.press('Escape'); await waitClosed();
+  assert.equal(queue.pageBuilder.read(job.id).revision, 1); assert.equal(await page.locator('[data-add-section="common"]').evaluate(node => node === document.activeElement), true);
+  await page.locator('[data-add-section="common"]').click(); await page.locator('#builder-title').fill('Новый общий блок'); await page.locator('#builder-type').selectOption('table'); await page.locator('#builder-content').fill('Колонка; Значение'); await page.locator('#page-builder-save').click(); await waitClosed();
+  await page.waitForSelector('.builder-block-open[data-builder-id^="block-"]');
+  const created = queue.pageBuilder.read(job.id).document.common.blocks.at(-1); assert.match(created.id, /^block-[a-f0-9-]{36}$/); assert.equal(created.type, 'table'); assert.equal(created.review.status, 'unreviewed');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.builderId), created.id, 'create focuses persisted block');
+  await page.getByRole('button', { name: 'Перетащить блок: Новый общий блок', exact: true }).focus(); await page.keyboard.press('Enter'); await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Выше: Новый общий блок', 'keyboard opens actions and reaches reorder');
+  await page.keyboard.press('Enter'); await waitRevision(3);
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.common.blocks.map(block => block.id), ['common-hero', created.id, 'common-actions']);
+  await page.getByRole('button', { name: 'Перетащить блок: Новый общий блок', exact: true }).focus(); await page.keyboard.press('Space'); await page.keyboard.press('ArrowDown'); await waitRevision(4);
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks.at(-1).id, created.id);
+  // Native browser drag to an inactive tab moves the block and selects its destination.
+  await page.getByRole('button', { name: 'Перетащить блок: Новый общий блок', exact: true }).dragTo(page.locator('#builder-tab-posters')); await waitRevision(5);
+  assert.equal(await page.locator('#builder-tab-posters').getAttribute('aria-selected'), 'true');
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks.at(-1).id, created.id);
+  // The upper half of a card is a precise insertion target.
+  await page.getByRole('button', { name: 'Перетащить блок: Новый общий блок', exact: true }).dragTo(page.locator('[data-block-id="posters-gallery"]'), { targetPosition: { x: 30, y: 5 } }); await waitRevision(6);
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.tabs[1].blocks.map(block => block.id), [created.id, 'posters-gallery']);
+  await page.getByRole('button', { name: 'Перетащить блок: Афиша', exact: true }).click(); await page.getByLabel('Перенести блок: Афиша', { exact: true }).selectOption('common'); await waitRevision(7);
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks.at(-1).review.status, 'unreviewed');
+  await page.locator('#builder-tab-posters').click(); await page.getByRole('button', { name: 'Удалить блок: Новый общий блок', exact: true }).click();
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await waitClosed(); assert.equal(queue.pageBuilder.read(job.id).revision, 7);
+  await page.getByRole('button', { name: 'Удалить блок: Новый общий блок', exact: true }).click(); await page.locator('#page-builder-save').click(); await waitClosed(); await page.waitForFunction(() => document.activeElement?.dataset.addSection === 'posters');
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.tabs[1].blocks, []); assert.equal(await page.locator('[data-drop-section="posters"]').innerText(), '+', 'empty sections also display only the add symbol');
+  await page.getByRole('button', { name: 'Перетащить блок: MORI CINEMA', exact: true }).dragTo(page.locator('[data-drop-section="posters"]')); await waitRevision(9);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks[0].id, 'common-hero');
+  // Creation keeps its opening revision across polling and cannot overwrite external edits.
+  await page.locator('[data-add-section="posters"]').click(); await page.locator('#builder-title').fill('Конфликт создания');
+  const beforeConflict = queue.pageBuilder.read(job.id), external = structuredClone(beforeConflict.document); external.common.blocks[0].title = 'Изменено извне'; queue.pageBuilder.write(job.id, beforeConflict.revision, external);
+  await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state');
+  const postsBeforeConflict = builderPosts.length; await page.locator('#page-builder-save').click(); await page.waitForFunction(() => document.querySelector('#page-builder-form-error').textContent.includes('Страница обновилась'));
+  assert.equal(builderPosts.length, postsBeforeConflict, 'stale create draft sends no POST'); assert.equal(queue.pageBuilder.read(job.id).revision, 10); assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks.length, 1);
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await waitClosed(); await page.waitForSelector('.builder-block-open[data-builder-id="common-actions"][aria-label^="Изменено извне"]');
+  // Delayed creation freezes other mutations, Escape and polling until the CAS completes.
+  let release, arrived; const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { arrived = resolve; });
+  const pattern = `**/api/page-builder/${job.id}?attempt=*`, delay = async route => { if (route.request().method() !== 'POST') return route.continue(); arrived(); await gate; await route.continue(); };
+  await page.route(pattern, delay); await page.locator('[data-add-section="posters"]').click(); await page.locator('#builder-title').fill('Сохранённая вкладка'); await page.locator('#builder-type').selectOption('embed'); await page.locator('#page-builder-save').click(); await started;
+  assert.equal(await page.getByRole('button', { name: 'Отмена', exact: true }).isDisabled(), true); await page.keyboard.press('Escape'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true);
+  await page.locator('[data-add-section="common"]').evaluate(node => node.click()); assert.equal(await page.locator('#builder-title').inputValue(), 'Сохранённая вкладка');
+  release(); await waitClosed(); await page.unroute(pattern, delay); await page.waitForSelector('.builder-block-open[aria-label^="Сохранённая вкладка"]');
+  const final = queue.pageBuilder.read(job.id); assert.equal(final.revision, 11); assert.equal(final.document.tabs[1].blocks.at(-1).type, 'embed');
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await page.locator('#builder-tab-posters').click();
+  assert.deepEqual(await page.locator('#builder-panel-posters .builder-block-open').evaluateAll(nodes => nodes.map(node => node.dataset.builderId)), final.document.tabs[1].blocks.map(block => block.id));
+  assert.deepEqual(queue.pageBuilder.read(job.id), final);
+  await page.setViewportSize({ width: 320, height: 844 }); assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  assert.deepEqual(errors, []);
+});
+
+test('step 3 canonical editor offers dependent views, browser media selection and safe review with reload', { timeout: 60000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-editor-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0];
+  seedMoriPage(queue, job);
+  const openedFolders = []; let selectedPath = null;
+  queue.mediaPicker.openDialog = async directory => { openedFolders.push(directory); return selectedPath; };
+  const previewBytes = installLocalPreview(queue, job, queue.pageBuilder.read(job.id).document.common.blocks[0].media[0]);
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1100 } }), external = [], errors = [], origin = `http://127.0.0.1:${server.address().port}`;
+  page.on('request', request => { if (!request.url().startsWith(origin)) external.push(request.url()); }); page.on('pageerror', error => errors.push(error.message));
+  await page.goto(origin); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const opener = page.locator('[data-builder-id="common-hero"]'), modal = page.locator('#page-builder-modal');
+  const close = async () => { await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); };
+  const initial = queue.pageBuilder.read(job.id);
+  await opener.click();
+  assert.equal(await page.getByRole('button', { name: 'Выбрать основную картинку из шага 2' }).isDisabled(), false);
+  assert.equal(await page.locator('.builder-media-status').count(), 0, 'there is no media preparation stage');
+  const preview = await page.locator('.builder-image-row img').first().evaluate(async image => { const response = await fetch(image.src); return { type: response.headers.get('content-type'), bytes: (await response.arrayBuffer()).byteLength }; });
+  assert.deepEqual(preview, { type: 'image/png', bytes: previewBytes.length }, 'saved media uses the verified local stage-2 image instead of the SVG placeholder');
+  const savedAsset = initial.document.common.blocks[0].media[0], savedRow = page.locator('.builder-image-row').first(), originalUrl = savedRow.getByLabel('URL изображения', { exact: true }), bigUrl = savedRow.getByLabel('URL крупной версии', { exact: true });
+  const legacyFilename = decodeURIComponent(new URL(savedAsset.originalUrl).pathname.split('/').at(-1)); assert.equal(await originalUrl.inputValue(), legacyFilename);
+  assert.equal(await originalUrl.isDisabled(), true); assert.equal(await bigUrl.isDisabled(), true); assert.equal(await originalUrl.evaluate(node => node.readOnly), true);
+  assert.equal(await savedRow.locator('figcaption').count(), 0); assert.equal(await savedRow.locator('label').count(), 0);
+  assert.deepEqual(await savedRow.locator('.builder-media-placeholder').allTextContents(), ['Большая картинка'], 'only the empty preview shows its label');
+  const placeholderCentered = async row => row.locator('.builder-media-placeholder').evaluateAll(nodes => nodes.every(node => {
+    const style = getComputedStyle(node);
+    return style.display === 'grid' && style.placeItems === 'center' && style.textAlign === 'center';
+  }));
+  assert.equal(await placeholderCentered(savedRow), true);
+  assert.equal(await savedRow.locator('.builder-image-picker button').evaluateAll(buttons => buttons.every(button => button.textContent === '' && button.querySelector('svg[aria-hidden="true"]'))), true, 'image picker uses a vector icon without emoji');
+  assert.equal(await page.locator('#builder-title').getAttribute('placeholder'), 'Заголовок');
+  for (const [label, placeholder] of [['URL изображения', 'Основная картинка'], ['URL крупной версии', 'Большая картинка'], ['Ссылка изображения', 'Ссылка'], ['Альтернативный текст', 'Альтернативный текст'], ['Подпись', 'Подпись']]) assert.equal(await savedRow.getByLabel(label, { exact: true }).getAttribute('placeholder'), placeholder);
+  const imageDirectory = path.join(queue.stage.media.directory(job, job.attempts[0]), 'images'), imageName = fs.readdirSync(imageDirectory)[0];
+  assert.equal(await savedRow.locator('.builder-image-picker button').count(), 2, 'one folder button per image variant');
+  assert.equal(await savedRow.locator('input[type="file"]').count(), 0, 'browser upload button is removed');
+  const folderButton = savedRow.getByRole('button', { name: 'Выбрать основную картинку из шага 2' });
+  const selectImage = async (row, kind, file, status = 200) => {
+    selectedPath = file;
+    const done = page.waitForResponse(response => response.url().endsWith('/pick-prepared-media'));
+    await row.getByRole('button', { name: `Выбрать ${kind} картинку из шага 2`, exact: true }).click();
+    const response = await done; assert.equal(response.status(), status);
+    await page.waitForFunction(() => !document.getElementById('page-builder-save').disabled);
+  };
+  await selectImage(savedRow, 'основную', null); assert.deepEqual(openedFolders, [imageDirectory]);
+  assert.equal(await originalUrl.inputValue(), legacyFilename);
+  let dialogStarted, finishDialog, dialogSignal;
+  const started = new Promise(resolve => { dialogStarted = resolve; });
+  queue.mediaPicker.openDialog = (_directory, signal) => {
+    dialogSignal = signal;
+    const pending = new Promise((_, reject) => { finishDialog = () => reject(new Error('Диалог закрыт')); });
+    dialogStarted(); return pending;
+  };
+  await folderButton.click(); await started;
+  assert.equal(queue.mediaPicker.dialogBusy, true);
+  assert.equal(await savedRow.locator('.builder-picker-feedback:visible').count(), 0, 'opening the system picker adds no instruction below the fields');
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close();
+  await new Promise((resolve, reject) => {
+    if (dialogSignal.aborted) return resolve();
+    const timer = setTimeout(() => reject(new Error('modal close did not abort the native dialog')), 3000);
+    dialogSignal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+  });
+  assert.equal(queue.mediaPicker.dialogBusy, true, 'modal close waits for native process exit');
+  finishDialog();
+  await new Promise((resolve, reject) => {
+    const deadline = Date.now() + 3000;
+    const check = () => queue.mediaPicker.dialogBusy ? (Date.now() < deadline ? setTimeout(check, 10) : reject(new Error('dialog did not close'))) : resolve();
+    check();
+  });
+  queue.mediaPicker.openDialog = async directory => { openedFolders.push(directory); return selectedPath; };
+  await opener.click(); await page.waitForFunction(() => !document.getElementById('builder-media-common-hero-media-originalUrl-choose')?.disabled);
+  assert.equal(await originalUrl.inputValue(), legacyFilename, 'closing a dialog leaves the draft unchanged');
+  selectedPath = path.join(root, 'outside.png');
+  await selectImage(savedRow, 'большую', selectedPath, 400);
+  assert.match(await savedRow.locator('.builder-picker-feedback[role="alert"]').innerText(), /папки изображений шага 2/);
+  assert.equal(await bigUrl.inputValue(), '', 'wrong filename leaves the draft unchanged');
+  const changed = Buffer.from(previewBytes); changed[changed.length - 1] ^= 1; fs.writeFileSync(path.join(imageDirectory, imageName), changed);
+  await selectImage(savedRow, 'большую', path.join(imageDirectory, imageName), 400);
+  assert.match(await savedRow.locator('.builder-picker-feedback[role="alert"]').innerText(), /не совпадает/);
+  assert.equal(await bigUrl.inputValue(), '', 'wrong bytes leave the draft unchanged');
+  fs.writeFileSync(path.join(imageDirectory, imageName), previewBytes);
+  await selectImage(savedRow, 'большую', path.join(imageDirectory, imageName)); assert.equal(await savedRow.locator('img').count(), 2); assert.match(await bigUrl.inputValue(), /\.png$/);
+  assert.equal(await originalUrl.inputValue(), legacyFilename, 'big-image selection leaves the original variant unchanged');
+  assert.deepEqual(queue.pageBuilder.read(job.id), initial, 'browser selection changes only the draft');
+  assert.equal(await page.locator('.builder-image-row').first().getByText(/Изображение 1/).count(), 0, 'image number is not visibly rendered');
+  assert.equal(await page.locator('.builder-image-row').first().getByRole('button', { name: /Выше|Ниже/ }).count(), 0, 'separate arrow buttons are removed');
+  assert.equal(await page.locator('.builder-image-row').first().locator('.builder-image-tools').count(), 1); assert.equal(await page.locator('.builder-image-tools svg').count(), 1);
+  assert.equal((await page.locator('#builder-add-image').innerText()).trim(), '+'); assert.equal(await page.locator('#builder-add-image').getAttribute('aria-label'), 'Добавить изображение'); assert.equal(await page.locator('#builder-add-image').evaluate(node => node.classList.contains('builder-add')), true);
+  assert.equal(await page.locator('.builder-images-section').evaluate(node => parseFloat(getComputedStyle(node).marginBottom) > 0), true, 'image section keeps vertical separation before review status');
+  await page.locator('#builder-add-image').click();
+  assert.equal(await page.locator('.builder-image-row').last().getByLabel('URL изображения', { exact: true }).evaluate(node => node.required), false);
+  const emptyRow = page.locator('.builder-image-row').last();
+  assert.deepEqual(await emptyRow.locator('.builder-media-placeholder').allTextContents(), ['Основная картинка', 'Большая картинка']);
+  assert.equal(await placeholderCentered(emptyRow), true, 'both labels are centered in empty previews');
+  const picksBeforeDrop = openedFolders.length;
+  await emptyRow.locator('.builder-media-placeholder').first().evaluate((target, data) => {
+    const transfer = new DataTransfer(); transfer.items.add(new File([Uint8Array.from(data.bytes)], data.name, { type: 'image/png' }));
+    target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+    target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  }, { name: imageName, bytes: [...previewBytes] });
+  assert.equal(openedFolders.length, picksBeforeDrop, 'dropping a file on preview does not select it');
+  assert.equal(await page.locator('.builder-image-row').last().locator('img').count(), 0);
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); assert.deepEqual(queue.pageBuilder.read(job.id), initial, 'cancel discards newly added media');
+  await opener.click(); assert.deepEqual(await page.locator('.builder-type-view label').allInnerTexts(), ['Тип блока', 'Вид отображения']);
+  assert.deepEqual(await page.locator('#page-builder-fields > .mb-3 label').allInnerTexts(), ['Заголовок', 'Причина непройденной визуальной проверки']);
+  assert.equal(await page.locator('.modal-footer #builder-review-status').count(), 1);
+  assert.doesNotMatch(await page.locator('#page-builder-fields').innerText(), /Mori|Принудительный|Описание карточки|Настройки|JSON/i);
+  assert.deepEqual(await page.locator('#builder-type option').evaluateAll(nodes => nodes.map(node => node.value)), initial.blockTypes.map(type => type.name));
+  await page.locator('#builder-type').selectOption('content');
+  for (const type of initial.blockTypes) {
+    await page.locator('#builder-type').selectOption(type.name);
+    assert.deepEqual(await page.locator('#builder-view option').evaluateAll(nodes => nodes.map(node => node.value)), type.views);
+    assert.equal(await page.locator('#builder-view').inputValue(), type.default_view);
+    assert.equal(await page.locator('#builder-review-status').inputValue(), 'unreviewed');
+    for (const name of new Set(initial.blockTypes.flatMap(item => item.fields.map(field => field.name)))) assert.equal(await page.locator(`#builder-${name}`).count(), Number(type.fields.some(field => field.name === name)), `${type.name}: only applicable scalar ${name}`);
+    const structured = ['table', 'grid', 'data-table', 'links', 'sections'].includes(type.name);
+    assert.equal(await page.locator('.builder-editor-placeholder').count(), Number(structured), `${type.name}: structured editor is explicitly unavailable`);
+    assert.equal(await page.locator('#builder-add-image').count(), Number(['big-media', 'service', 'content'].includes(type.name)), `${type.name}: images only appear for supported media fields`);
+    if (structured) {
+      assert.equal(await page.locator('.builder-editor-placeholder img').getAttribute('src'), '/assets/astronaut.png');
+      assert.deepEqual(await page.locator('.builder-text-fields legend').allInnerTexts(), ['Текст']);
+      assert.equal(await page.getByLabel('Текст в Markdown', { exact: true }).count(), 1);
+    }
+  }
+  await page.locator('#builder-type').selectOption('service'); await page.locator('#builder-view').selectOption('media-right'); await page.locator('#builder-badge').fill('Новинка');
+  await page.locator('#builder-link').fill('https://example.org/service'); await page.locator('#builder-link_text').fill('Подробнее'); await page.locator('#builder-title').fill('Новая услуга');
+  await page.getByRole('button', { name: 'Удалить изображение 1', exact: true }).click();
+  for (const name of ['first', 'second']) {
+    await page.locator('#builder-add-image').click(); const row = page.locator('.builder-image-row').last();
+    await selectImage(row, 'основную', path.join(imageDirectory, imageName)); await selectImage(row, 'большую', path.join(imageDirectory, imageName));
+    await row.getByLabel('Ссылка изображения', { exact: true }).fill(`/${name}`); await row.getByLabel('Альтернативный текст', { exact: true }).fill(name); await row.getByLabel('Подпись', { exact: true }).fill(`Caption ${name}`);
+  }
+  const mediaIds = await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)); assert.ok(mediaIds.every(id => /^media-[a-f0-9-]{36}$/.test(id)));
+  assert.equal(await page.locator('.builder-image-row img').count(), 4, 'both browser selections preview immediately before save');
+  await page.locator(`.builder-image-row[data-media-id="${mediaIds[1]}"] .builder-media-drag`).focus(); await page.keyboard.press('ArrowUp');
+  assert.deepEqual(await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)), [...mediaIds].reverse());
+  await page.locator(`.builder-image-row[data-media-id="${mediaIds[0]}"] .builder-media-drag`).dragTo(page.locator(`.builder-image-row[data-media-id="${mediaIds[1]}"]`), { targetPosition: { x: 25, y: 5 } });
+  assert.deepEqual(await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)), mediaIds, 'native image DnD restores first/second order');
+  await page.locator('#builder-review-status').selectOption('passed'); await page.locator('.builder-image-row').first().getByLabel('Подпись', { exact: true }).fill('Изменена подпись'); assert.equal(await page.locator('#builder-review-status').inputValue(), 'unreviewed');
+  for (const width of [1440, 600, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 }); assert.equal(await modal.evaluate(node => { const box = node.querySelector('.modal-dialog').getBoundingClientRect(); return box.left >= 0 && box.right <= innerWidth && node.querySelector('.modal-body').scrollWidth <= node.querySelector('.modal-body').clientWidth; }), true, `${width}: canonical/media editor fits the modal`);
+    const selectors = await page.locator('.builder-type-view').evaluate(node => { const [type, view] = [...node.querySelectorAll('select')].map(item => item.getBoundingClientRect()); return { sameRow: Math.abs(type.top - view.top) < 1, fits: view.right <= node.getBoundingClientRect().right + 1, separate: type.right <= view.left, labelsFit: [...node.querySelectorAll('label')].every(label => label.scrollWidth <= label.clientWidth) }; });
+    assert.equal(selectors.sameRow, true, `${width}: type/view selectors stay in one row`); assert.equal(selectors.fits, true); assert.equal(selectors.separate, true); assert.equal(selectors.labelsFit, true);
+    if ([1440, 320].includes(width)) {
+      await page.locator('#builder-type').scrollIntoViewIfNeeded(); await page.screenshot({ path: path.join(testOutput(), `ui-stage-three-editor-${width}.png`) });
+      await page.locator('.builder-image-row').first().scrollIntoViewIfNeeded(); await page.screenshot({ path: path.join(testOutput(), `ui-stage-three-media-${width}.png`) });
+    }
+  }
+  await page.setViewportSize({ width: 1440, height: 1100 }); await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await close();
+  const saved = queue.pageBuilder.read(job.id), block = saved.document.common.blocks[0]; assert.equal(saved.revision, 2); assert.equal(block.type, 'service'); assert.equal(block.view, 'media-right'); assert.equal(block.badge, 'Новинка'); assert.equal(block.review.status, 'passed'); assert.deepEqual(block.media.map(item => item.id), mediaIds);
+  assert.equal(block.media[0].bigUrl, savedAsset.originalUrl); assert.equal(block.media[0].bigMedia.sha256, block.media[0].originalMedia.sha256); assert.equal(block.media[0].href, '/first'); assert.equal(block.media[0].caption, 'Изменена подпись');
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await opener.click();
+  assert.equal(await page.locator('#builder-type').inputValue(), 'service'); assert.equal(await page.locator('#builder-view').inputValue(), 'media-right'); assert.equal(await page.locator('#builder-badge').inputValue(), 'Новинка');
+  assert.deepEqual(await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)), mediaIds);
+  await page.getByRole('button', { name: 'Удалить изображение 2', exact: true }).click(); await page.locator('#page-builder-save').click(); await close(); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].media.length, 1); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].review.status, 'unreviewed');
+  assert.deepEqual(external, []); assert.deepEqual(errors, []);
+});
+
+test('replacing the original image updates the card and reopened editor before reload', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-original-preview-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
+  const job = queue.jobs[0]; seedMoriPage(queue, job);
+  const initial = queue.pageBuilder.read(job.id), asset = initial.document.common.blocks[0].media[0], attempt = job.attempts[0];
+  const replacementUrl = new URL('/replacement.png', job.url).href;
+  const manifest = queue.stage.media.create(job, attempt, Buffer.from(`<img src="${asset.originalUrl}"><img src="${replacementUrl}">`), 'test');
+  const oldImage = await sharp({ create: { width: 1, height: 1, channels: 4, background: '#ff0000' } }).png().toBuffer();
+  const newImage = await sharp({ create: { width: 1, height: 1, channels: 4, background: '#0000ff' } }).png().toBuffer();
+  const imageDirectory = queue.stage.media.directory(job, attempt);
+  for (const [url, bytes] of [[asset.originalUrl, oldImage], [replacementUrl, newImage]]) {
+    const resource = manifest.resources.find(item => item.originalUrl === url), sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+    assert.ok(resource, `manifest contains ${url}`);
+    fs.writeFileSync(path.join(imageDirectory, 'objects', sha256), bytes);
+    Object.assign(resource, { status: 'downloaded', finalUrl: url, redirects: [], mime: 'image/png', bytes: bytes.length, sha256, object: `objects/${sha256}` });
+    queue.stage.media.publishImage(job, attempt, resource);
+  }
+  queue.stage.media.publish(job, attempt, manifest);
+  Object.assign(attempt, { status: 'complete', captureStatus: 'complete' }); attempt.htmlMedia.status = 'complete'; queue.save();
+  queue.mediaPicker.openDialog = async directory => path.join(directory, fs.readdirSync(directory).find(name => name.startsWith('replacement-')));
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage(), origin = `http://127.0.0.1:${server.address().port}`;
+  const pixel = image => image.evaluate(async element => {
+    await element.decode();
+    const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1;
+    const context = canvas.getContext('2d'); context.drawImage(element, 0, 0);
+    return [...context.getImageData(0, 0, 1, 1).data];
+  });
+  await page.goto(origin); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const opener = page.locator('[data-builder-id="common-hero"]'), cardImage = opener.locator('.builder-media-preview img').first();
+  assert.deepEqual(await pixel(cardImage), [255, 0, 0, 255]);
+  const before = await cardImage.elementHandle();
+  await opener.click(); await page.waitForFunction(() => !document.getElementById('builder-media-common-hero-media-originalUrl-choose')?.disabled);
+  const picked = page.waitForResponse(response => response.url().endsWith('/pick-prepared-media'));
+  await page.getByRole('button', { name: 'Выбрать основную картинку из шага 2' }).click(); assert.equal((await picked).status(), 200);
+  await page.waitForFunction(() => !document.getElementById('page-builder-save').disabled);
+  assert.deepEqual(await pixel(page.locator('.builder-image-previews figure img').first()), [0, 0, 255, 255], 'draft previews the selected image');
+  const saved = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === `/api/page-builder/${job.id}`);
+  await page.locator('#page-builder-save').click(); assert.equal((await saved).status(), 200);
+  await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForFunction(node => !node.isConnected, before);
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].media[0].originalMedia.sha256, crypto.createHash('sha256').update(newImage).digest('hex'));
+  assert.deepEqual(await pixel(cardImage), [0, 0, 255, 255], 'card shows the saved image immediately');
+  await opener.click(); await page.waitForSelector('#page-builder-modal.show');
+  assert.deepEqual(await pixel(page.locator('.builder-image-previews figure img').first()), [0, 0, 255, 255], 'reopened editor shows the saved image without reload');
+});
+
+test('media selection is immediately available when switching grid gallery to content', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-late-media-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0];
+  seedMoriPage(queue, job);
+  installLocalPreview(queue, job, queue.pageBuilder.read(job.id).document.common.blocks[0].media[0]);
+  const stored = queue.pageBuilder.read(job.id), grid = structuredClone(stored.document);
+  Object.assign(grid.common.blocks[0], { type: 'grid', view: 'gallery' }); queue.pageBuilder.write(job.id, stored.revision, grid);
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage(), origin = `http://127.0.0.1:${server.address().port}`; let preparations = 0;
+  page.on('request', request => { if (request.url().endsWith('/prepare-media')) preparations++; });
+  await page.goto(origin); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  await page.locator('[data-builder-id="common-hero"]').click(); assert.equal(await page.locator('#builder-type').inputValue(), 'grid');
+  assert.equal(preparations, 0, 'grid gallery has not rendered image fields');
+  await page.locator('#builder-type').selectOption('content');
+  assert.equal(await page.getByRole('button', { name: 'Выбрать основную картинку из шага 2' }).isDisabled(), false);
+  assert.equal(preparations, 0);
+  await page.locator('#builder-type').selectOption('grid'); await page.locator('#builder-type').selectOption('content');
+  assert.equal(preparations, 0, 'rerendering image fields does not prepare media');
+  const directory = path.join(queue.stage.media.directory(job, job.attempts[0]), 'images'), filename = fs.readdirSync(directory)[0];
+  queue.mediaPicker.openDialog = async () => path.join(directory, filename);
+  const picked = page.waitForResponse(response => response.url().endsWith('/pick-prepared-media'));
+  await page.getByRole('button', { name: 'Выбрать основную картинку из шага 2' }).click(); assert.equal((await picked).status(), 200);
+  assert.equal(preparations, 0);
+});
+
+test('step 3 type and view changes keep drafts and explain unfinished structured editors', { timeout: 45000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-fields-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const original = queue.pageBuilder.read(job.id), opener = page.locator('[data-builder-id="common-hero"]');
+  const close = async () => { await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); };
+  await page.evaluate(() => { window.builderFieldsShown = new Promise(resolve => document.getElementById('page-builder-modal').addEventListener('shown.bs.modal', resolve, { once: true })); });
+  await opener.click();
+  await page.evaluate(() => window.builderFieldsShown.then(() => true));
+  assert.deepEqual(await page.locator('#builder-type option').allTextContents(), original.blockTypes.map(type => type.label));
+  for (const type of original.blockTypes) {
+    await page.locator('#builder-type').selectOption(type.name);
+    for (const view of type.views) {
+      await page.locator('#builder-view').focus();
+      await page.locator('#builder-view').selectOption(view);
+      assert.match(await page.locator('#builder-view option:checked').innerText(), /[А-Яа-я]/, `${type.name}/${view}: descriptive Russian view name`);
+      assert.equal(await page.locator('#builder-view').evaluate(node => node === document.activeElement), true, 'changing view keeps the selector focused');
+      if (['table', 'grid', 'data-table', 'links', 'sections'].includes(type.name)) assert.match(await page.locator('.builder-editor-placeholder').innerText(), /Редактор содержимого в разработке[\s\S]+пока недоступно/);
+    }
+  }
+  await page.locator('#builder-type').selectOption('service'); await page.locator('#builder-badge').fill('Черновик метки'); await page.locator('#builder-content').fill('Черновик текста');
+  await page.locator('#builder-view').selectOption('media-left'); assert.equal(await page.locator('#builder-images-title').innerText(), 'Изображения слева');
+  await page.locator('#builder-view').selectOption('media-right'); assert.equal(await page.locator('#builder-images-title').innerText(), 'Изображения справа');
+  assert.equal(await page.locator('#builder-badge').inputValue(), 'Черновик метки'); assert.equal(await page.locator('#builder-content').inputValue(), 'Черновик текста');
+  await page.locator('#builder-type').selectOption('embed'); await page.locator('#builder-ratio').selectOption('4:3'); await page.locator('#builder-source_url').fill('https://example.org/map');
+  assert.deepEqual(await page.locator('#builder-provider option').allTextContents(), ['Не задано', 'Виджет (iframe)', 'Карта', 'Видео', 'Другой источник']);
+  await page.locator('#builder-view').selectOption('map'); assert.equal(await page.locator('#builder-ratio').count(), 0); assert.equal(await page.getByLabel('URL карты', { exact: true }).inputValue(), 'https://example.org/map');
+  await page.locator('#builder-view').selectOption('wide'); assert.equal(await page.locator('#builder-ratio').inputValue(), '4:3');
+  await page.locator('#builder-type').selectOption('rich-content'); assert.equal(await page.getByLabel('HTML-код', { exact: true }).count(), 1); assert.equal(await page.getByLabel('Обоснование использования HTML', { exact: true }).getAttribute('required'), null);
+  await page.locator('#builder-type').selectOption('service'); assert.equal(await page.locator('#builder-view').inputValue(), 'default'); assert.equal(await page.locator('#builder-badge').inputValue(), 'Черновик метки');
+  assert.equal(await page.locator('.builder-image-row').count(), original.document.common.blocks[0].media.length, 'hidden media survives type/view switches');
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); assert.deepEqual(queue.pageBuilder.read(job.id), original, 'type and view exploration never writes data');
+  // A legacy structured block can still update its real common fields and review;
+  // its existing text, media and settings are not replaced by pretend rows/items.
+  const structured = structuredClone(original.document); Object.assign(structured.common.blocks[0], { type: 'grid', view: 'gallery' }); queue.pageBuilder.write(job.id, original.revision, structured);
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await opener.click();
+  assert.equal(await page.locator('.builder-editor-placeholder img').getAttribute('src'), '/assets/astronaut.png'); assert.equal(await page.locator('#builder-add-image').count(), 0);
+  for (const width of [1440, 600, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 }); await page.locator('.builder-editor-placeholder').scrollIntoViewIfNeeded();
+    assert.equal(await page.locator('#page-builder-modal .modal-body').evaluate(node => node.scrollWidth <= node.clientWidth), true, `${width}: placeholder has no horizontal overflow`);
+    if ([1440, 320].includes(width)) await page.screenshot({ path: path.join(testOutput(), `ui-stage-three-placeholder-${width}.png`) });
+  }
+  await page.locator('#builder-title').fill('Галерея с новым заголовком'); await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await close();
+  const saved = queue.pageBuilder.read(job.id).document.common.blocks[0];
+  assert.equal(saved.review.status, 'passed'); assert.equal(saved.title, 'Галерея с новым заголовком');
+  for (const field of ['text', 'content', 'settings', 'media']) assert.deepEqual(saved[field], original.document.common.blocks[0][field], `${field} survives a structured block edit`);
+  assert.deepEqual(errors, []);
+});
+
+test('step 3 Markdown editor preserves source, optional fields, safe previews and footer keyboard geometry', { timeout: 60000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-markdown-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  const stored = queue.pageBuilder.read(job.id); stored.document.common.blocks[0].description = 'RETired description never shown';
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify(stored));
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = [], external = [], posts = [], origin = `http://127.0.0.1:${server.address().port}`;
+  page.on('pageerror', error => errors.push(error.message)); page.on('request', request => { if (!request.url().startsWith(origin)) external.push(request.url()); if (request.method() === 'POST') posts.push(request); });
+  await page.goto(origin); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const opener = page.locator('[data-builder-id="common-hero"]'), close = async () => { await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); };
+  assert.doesNotMatch(await opener.innerText(), /RETired/); await opener.click(); await page.waitForSelector('#page-builder-modal.show');
+  assert.equal(await page.locator('#page-builder-modal [required]').count(), 0);
+  assert.deepEqual(await page.locator('.builder-link-fields legend').allInnerTexts(), ['Ссылка']);
+  assert.equal(await page.locator('.builder-link-fields label').count(), 0);
+  assert.equal(await page.getByLabel('URL', { exact: true }).count(), 1);
+  assert.equal(await page.getByLabel('Текст ссылки', { exact: true }).count(), 1);
+  assert.equal(await page.locator('#builder-link').getAttribute('placeholder'), 'URL');
+  assert.equal(await page.locator('#builder-link_text').getAttribute('placeholder'), 'Текст ссылки');
+  assert.deepEqual(await page.locator('.builder-text-fields legend').allInnerTexts(), ['Текст']);
+  assert.equal(await page.locator('.builder-text-fields label, .builder-markdown .form-label, #builder-markdown-help').count(), 0);
+  assert.equal(await page.locator('#builder-content').getAttribute('placeholder'), 'Текст в Markdown');
+  assert.equal(await page.getByLabel('Текст в Markdown').count(), 1);
+  assert.equal(await page.getByRole('region', { name: 'Предпросмотр Markdown' }).count(), 1);
+  assert.equal(await page.locator('.builder-markdown').getByText('Предпросмотр', { exact: true }).count(), 0);
+  assert.equal(await page.locator('.builder-markdown-tools').getByRole('button', { name: 'Код', exact: true }).count(), 0);
+  assert.equal(await page.getByRole('button', { name: 'Маркированный список', exact: true }).count(), 1);
+  assert.equal(await page.getByRole('button', { name: 'Список', exact: true }).count(), 0);
+  await page.locator('#builder-content').fill(''); await page.getByRole('button', { name: 'Маркированный список', exact: true }).click();
+  assert.equal(await page.locator('#builder-content').inputValue(), '- Пункт'); assert.equal(await page.locator('#builder-markdown-preview ul li').innerText(), 'Пункт');
+  await page.locator('#builder-content').fill(''); await page.getByRole('button', { name: 'Нумерованный список', exact: true }).click();
+  assert.equal(await page.locator('#builder-content').inputValue(), '1. Пункт'); assert.equal(await page.locator('#builder-markdown-preview ol li').innerText(), 'Пункт');
+  const markdown = '# Заголовок\n\n**Жирный** и *курсив*\n- Первый\n- Второй\n\n[Каталог](https://example.org/catalog)\n![фото](https://example.org/image.png)\n[опасно](javascript:alert%281%29) [data](data:text/html,bad)\n<script>window.markdownPwned=1</script>\n<img src="https://example.org/raw.png" onerror="window.markdownPwned=2">\n\n```html\n<b>код</b>\n```';
+  await page.locator('#builder-content').fill(markdown);
+  const preview = page.locator('#builder-markdown-preview');
+  assert.equal(await preview.locator('h1').innerText(), 'Заголовок'); assert.equal(await preview.locator('strong').innerText(), 'Жирный'); assert.deepEqual(await preview.locator('li').allInnerTexts(), ['Первый', 'Второй']);
+  assert.equal(await preview.locator('a').count(), 1); assert.equal(await preview.locator('a').getAttribute('href'), 'https://example.org/catalog');
+  assert.equal(await preview.locator('img,script,iframe,object,embed,style').count(), 0); assert.match(await preview.innerText(), /<script>window.markdownPwned=1<\/script>/);
+  assert.equal(await page.evaluate(() => window.markdownPwned), undefined);
+  await page.locator('#builder-view').selectOption('compact'); assert.equal(await page.locator('#builder-content').inputValue(), markdown);
+  await page.locator('#builder-type').selectOption('rich-content'); assert.equal(await preview.count(), 0); assert.equal(await page.getByLabel('HTML-код', { exact: true }).inputValue(), markdown);
+  await page.locator('#builder-type').selectOption('content'); assert.equal(await page.locator('#builder-content').inputValue(), markdown);
+  await page.locator('#builder-content').fill('выделение'); await page.locator('#builder-content').press('Control+a'); await page.keyboard.press('Control+b'); assert.equal(await page.locator('#builder-content').inputValue(), '**выделение**');
+  assert.equal(await page.locator('#builder-content').evaluate(node => document.activeElement === node), true);
+  await page.keyboard.press('Tab'); assert.equal(await page.locator('#builder-content').evaluate(node => document.activeElement !== node), true, 'Tab leaves source editor normally');
+  await page.locator('#builder-content').fill(markdown); await page.locator('#builder-title').fill('');
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const geometry = await page.locator('#page-builder-modal').evaluate(modal => {
+      const box = element => { const r = element.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; };
+      const footer = modal.querySelector('.modal-footer'), status = modal.querySelector('#builder-review-status'), cancel = footer.querySelector('[data-bs-dismiss]'), save = modal.querySelector('#page-builder-save');
+      const link = box(modal.querySelector('#builder-link')), linkText = box(modal.querySelector('#builder-link_text')), source = box(modal.querySelector('#builder-content')), preview = box(modal.querySelector('#builder-markdown-preview'));
+      return { footer: box(footer), status: box(status), cancel: box(cancel), save: box(save), linkGap: linkText.top - link.bottom, previewGap: preview.top - source.bottom, overflow: modal.querySelector('.modal-body').scrollWidth > modal.querySelector('.modal-body').clientWidth };
+    });
+    assert.equal(geometry.overflow, false, `${width}: no horizontal form overflow`); assert.ok(geometry.status.left >= 0 && geometry.save.right <= width && geometry.status.right <= geometry.cancel.left, `${width}: footer controls fit without overlap`);
+    assert.ok(Math.abs(geometry.linkGap - geometry.previewGap) < 1, `${width}: link inputs and Markdown preview have equal vertical gaps`);
+    assert.ok(Math.abs(geometry.status.bottom - geometry.save.bottom) < 2, `${width}: review and buttons share baseline`);
+    await page.locator('#builder-review-status').focus(); await page.keyboard.press('Tab'); assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Отмена'); await page.keyboard.press('Tab'); assert.equal(await page.evaluate(() => document.activeElement.id), 'page-builder-save');
+    await page.locator('#builder-content').scrollIntoViewIfNeeded(); await page.screenshot({ path: path.join(testOutput(), `ui-stage-three-markdown-${width}.png`) });
+  }
+  await page.locator('#builder-review-status').selectOption('failed'); assert.equal(await page.locator('#builder-review-reason').isVisible(), true); assert.equal(await page.locator('#builder-review-reason').evaluate(node => node.required), true);
+  assert.equal(await page.locator('#builder-review-reason').getAttribute('placeholder'), 'Что не так с блоком или какие правки нужны?');
+  const beforeFailure = posts.length; await page.locator('#page-builder-save').click(); assert.equal(posts.length, beforeFailure); assert.equal(await page.evaluate(() => document.activeElement.id), 'builder-review-reason');
+  await page.locator('#builder-review-reason').fill('Исправить отступы'); await page.locator('#builder-review-status').selectOption('passed'); assert.equal(await page.locator('#builder-review-reason').isVisible(), false); assert.equal(await page.locator('#builder-review-reason').inputValue(), '');
+  await page.locator('#page-builder-save').click(); await close(); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].text, markdown);
+  assert.equal(Object.hasOwn(JSON.parse(fs.readFileSync(queue.pageBuilder.file(job.id))).document.common.blocks[0], 'description'), false);
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const excerpt = await opener.locator('.builder-text-preview').innerText(); assert.match(excerpt, /Заголовок Жирный и курсив Первый Второй Каталог фото/); assert.doesNotMatch(excerpt, /RETired|\*\*|#|<script>|<img|https:\/\/|javascript:/); assert.match(await opener.innerText(), /Без заголовка/);
+  await opener.click(); assert.equal(await page.locator('#builder-content').inputValue(), markdown);
+  await page.locator('#builder-type').selectOption('rich-content'); await page.locator('#builder-content').fill(''); await page.locator('#builder-reason').fill(''); await page.locator('#page-builder-save').click(); await close(); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].text, '');
+  await opener.click(); await page.waitForFunction(() => document.activeElement?.closest('#page-builder-modal')); await page.keyboard.press('Escape'); await close(); assert.equal(await page.evaluate(() => document.activeElement.dataset.builderId), 'common-hero');
+  await page.locator('[data-add-section="common"]').click(); await page.locator('#builder-add-image').click(); await page.locator('#page-builder-save').click(); await close();
+  const blank = queue.pageBuilder.read(job.id).document.common.blocks.at(-1); assert.equal(blank.title, ''); assert.equal(blank.text, ''); assert.equal(blank.media[0].originalUrl, '');
+  assert.deepEqual(external, []); assert.deepEqual(errors, []);
+});
+
+test('step 3 native block drag keeps its source during a poll between pointerdown and dragstart', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-drag-poll-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
+  seedMoriPage(queue, queue.jobs[0]);
+  const job = queue.jobs[0]; Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  // Exercise modal scroll/focus restoration before the pointer sequence, as in the original regression.
+  await page.locator('.builder-block-open').first().click(); await page.locator('#builder-add-image').scrollIntoViewIfNeeded(); await page.keyboard.press('Escape');
+  await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  const handle = page.getByRole('button', { name: 'Перетащить блок: MORI CINEMA', exact: true }); await handle.scrollIntoViewIfNeeded();
+  let announceRead, releaseRead; const readStarted = new Promise(resolve => { announceRead = resolve; }), readGate = new Promise(resolve => { releaseRead = resolve; });
+  const pattern = `**/api/page-builder/${job.id}?attempt=*`;
+  await page.route(pattern, async route => { if (route.request().method() !== 'GET') return route.continue(); const response = await route.fetch(); announceRead(); await readGate; await route.fulfill({ response }); });
+  const external = queue.pageBuilder.read(job.id); external.document.tabs[0].blocks[0].title = 'Внешнее изменение при нажатой ручке'; queue.pageBuilder.write(job.id, external.revision, external.document);
+  await readStarted;
+  const source = await handle.elementHandle(), box = await handle.boundingBox(), target = await page.locator('#builder-tab-posters').boundingBox();
+  await handle.evaluate(node => { window.nativeBuilderDrags = 0; node.addEventListener('dragstart', () => { window.nativeBuilderDrags++; }); });
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2); await page.mouse.down();
+  const readFinished = page.waitForResponse(response => response.request().method() === 'GET' && new URL(response.url()).pathname === `/api/page-builder/${job.id}`); releaseRead(); await readFinished;
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  assert.equal(await source.evaluate(node => node.isConnected), true, 'the in-flight response cannot detach the pressed native drag source');
+  const rejectedDrop = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === `/api/page-builder/${job.id}`);
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 12 }); await page.mouse.move(target.x + target.width / 2 + 1, target.y + target.height / 2); await page.mouse.up();
+  assert.equal(await page.evaluate(() => window.nativeBuilderDrags), 1, 'real mouse movement starts one native drag after the delayed read');
+  assert.equal((await rejectedDrop).status(), 409, 'fencing rendering never weakens CAS for the stale drop');
+  await page.waitForFunction(() => !document.querySelector('#page-builder-content').hasAttribute('aria-busy') && !document.querySelector('#page-builder-error').classList.contains('d-none'));
+  assert.match(await page.locator('#page-builder-error').innerText(), /уже изменены/); assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'common-hero');
+  assert.equal(queue.pageBuilder.read(job.id).revision, 2); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].id, 'common-hero');
+});
+
+test('step 3 structural CAS errors remain visible and preserve focus after reconciliation and polling', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-conflict-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
+  seedMoriPage(queue, queue.jobs[0]);
+  const job = queue.jobs[0]; Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage(), errors = []; page.on('pageerror', error => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const pattern = `**/api/page-builder/${job.id}?attempt=*`;
+  async function conflict(action, externalEdit) {
+    const handler = async route => {
+      if (route.request().method() === 'POST') { const current = queue.pageBuilder.read(job.id), changed = structuredClone(current.document); externalEdit(changed); queue.pageBuilder.write(job.id, current.revision, changed); }
+      await route.continue();
+    };
+    await page.route(pattern, handler);
+    const response = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === `/api/page-builder/${job.id}`);
+    await action(); assert.equal((await response).status(), 409);
+    await page.waitForFunction(() => !document.querySelector('#page-builder-content').hasAttribute('aria-busy') && document.querySelector('#page-builder-error').textContent.includes('уже изменены'));
+    await page.unroute(pattern, handler);
+    assert.equal(await page.locator('#page-builder-error').isVisible(), true);
+  }
+  await page.getByRole('button', { name: 'Перетащить блок: MORI CINEMA', exact: true }).click();
+  await conflict(() => page.getByRole('button', { name: 'Ниже: MORI CINEMA', exact: true }).click(), doc => { doc.common.blocks[0].title = 'Баннер изменён извне'; });
+  assert.equal(queue.pageBuilder.read(job.id).revision, 2);
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.common.blocks.map(block => block.id), ['common-hero', 'common-actions'], 'rejected reorder never reaches disk');
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'common-hero');
+  // A later ordinary poll must neither clear the error nor destroy the focused node's identity.
+  await page.evaluate(() => {
+    const box = document.querySelector('#page-builder-error'); window.builderErrorHidden = false;
+    window.builderErrorObserver = new MutationObserver(records => { if (box.classList.contains('d-none') || records.some(record => /\bd-none\b/.test(record.oldValue || ''))) window.builderErrorHidden = true; });
+    window.builderErrorObserver.observe(box, { attributes: true, attributeFilter: ['class'], attributeOldValue: true });
+  });
+  const external = queue.pageBuilder.read(job.id); external.document.common.blocks[0].title = 'Обновлено ещё раз'; queue.pageBuilder.write(job.id, external.revision, external.document);
+  await page.waitForSelector('.builder-block-open[aria-label^="Обновлено ещё раз"]');
+  assert.equal(await page.locator('#page-builder-error').isVisible(), true); assert.match(await page.locator('#page-builder-error').innerText(), /уже изменены/);
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'common-hero');
+  assert.equal(await page.evaluate(() => { window.builderErrorObserver.disconnect(); return window.builderErrorHidden; }), false, 're-render never transiently hides the visible conflict');
+  await page.getByRole('button', { name: 'Перетащить блок: Быстрые действия', exact: true }).click();
+  await conflict(() => page.getByLabel('Перенести блок: Быстрые действия', { exact: true }).selectOption('news'), doc => { doc.common.blocks = doc.common.blocks.filter(block => block.id !== 'common-actions'); });
+  assert.equal(queue.pageBuilder.read(job.id).revision, 4);
+  assert.equal(queue.pageBuilder.read(job.id).document.tabs[0].blocks.some(block => block.id === 'common-actions'), false, 'rejected transfer does not resurrect an externally deleted block');
+  assert.equal(await page.evaluate(() => document.activeElement?.dataset.addSection), 'common', 'missing block falls back to its original section add button');
+  await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state');
+  assert.equal(await page.locator('#page-builder-error').isVisible(), true); assert.equal(await page.evaluate(() => document.activeElement?.dataset.addSection), 'common');
+  assert.deepEqual(errors, []);
 });
 
 test('queue action loading survives a stale poll and waits for the next ordinary snapshot without an eager GET', { timeout: 30000 }, async t => {

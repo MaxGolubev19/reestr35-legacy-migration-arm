@@ -5,10 +5,22 @@ const { createStage } = require('./pipeline/registry.cjs');
 const { createServer } = require('./http/server.cjs');
 const { acquireLock, createShutdownController } = require('./infrastructure/server-lifecycle.cjs');
 const { PageBuilderStore } = require('./stages/page-builder/store.cjs');
+const { MediaPicker } = require('./stages/page-builder/media-picker.cjs');
 
 // Public Queue API remains compatible while the page scheduler owns no stage implementation.
 class Queue extends PageQueue {
-  constructor(options = {}) { super({ ...options, stageFactory: options.stageFactory || createStage }); this.pageBuilder = options.pageBuilder || new PageBuilderStore(this.root); }
+  constructor(options = {}) {
+    super({ ...options, stageFactory: options.stageFactory || createStage }); this.pageBuilder = options.pageBuilder || new PageBuilderStore(this.root, jobId => this.get(jobId));
+    this.mediaPicker = new MediaPicker(this);
+    this.pageBuilder.validateMedia = (...args) => this.mediaPicker.validateDocument(...args);
+    // Bind legacy pages before any subsequent retry can change the latest attempt.
+    for (const job of this.jobs) { try { this.pageBuilder.migrateLegacy(job.id); } catch { /* surfaced by the page summary; retry also refuses incomplete migration */ } }
+  }
+  retry(id) { this.pageBuilder.migrateLegacy(id); return super.retry(id); }
+  async shutdown() {
+    const pickerStopped = this.mediaPicker.shutdown();
+    try { await super.shutdown(); } finally { await pickerStopped; }
+  }
   get reviewListeners() { return this.listenersFor('qa-review'); }
   set reviewListeners(listeners) { this.listeners.set('qa-review', listeners); }
   subscribeReviews(listener) { return this.subscribe('qa-review', listener); }
@@ -41,6 +53,8 @@ if (require.main === module) {
     server.on('error', error => { console.error(error.message); void stop(1); });
     server.listen(port, '127.0.0.1', () => {
       console.log(`АРМ: http://127.0.0.1:${port} (параллельность ${queue.concurrency})`);
+      // Prepare PowerShell and WinForms on startup, without opening a dialog.
+      void queue.mediaPicker.warmup().catch(error => console.error('Прогрев выбора изображения:', error.message));
       queue.autoStart = true; queue.pump();
     });
     process.on('SIGINT', () => { void stop(); }); process.on('SIGTERM', () => { void stop(); }); process.on('exit', unlock);

@@ -15,11 +15,38 @@ async function body(req) {
   for await (const chunk of req) { size += chunk.length; if (size > 150 * 1024) throw new Error('Слишком большой запрос'); chunks.push(chunk); }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
+async function imageBody(req, limit) {
+  if (!/^application\/octet-stream(?:;|$)/i.test(req.headers['content-type'] || '')) throw Object.assign(new Error('Нужен application/octet-stream'), { statusCode: 415 });
+  if (Number(req.headers['content-length']) > limit) throw Object.assign(new Error('Изображение превышает допустимый размер'), { statusCode: 413 });
+  const chunks = []; let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw Object.assign(new Error('Изображение превышает допустимый размер'), { statusCode: 413 });
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, size);
+}
 const xml = value => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]);
 function mediaPlaceholder(asset) {
-  const name = decodeURIComponent(new URL(asset.originalUrl).pathname.split('/').at(-1) || 'Медиа');
+  let name = 'Медиа';
+  if (asset.originalUrl || asset.bigUrl) { const filename = new URL(asset.originalUrl || asset.bigUrl).pathname.split('/').at(-1); if (filename) { try { name = decodeURIComponent(filename); } catch { name = filename; } } }
   const label = (asset.alt || name).slice(0, 80), hue = parseInt(crypto.createHash('sha256').update(asset.id).digest('hex').slice(0, 4), 16) % 360;
   return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" role="img" aria-label="${xml(label)}"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="hsl(${hue} 70% 34%)"/><stop offset="1" stop-color="hsl(${(hue + 45) % 360} 75% 17%)"/></linearGradient></defs><rect width="800" height="450" fill="url(#g)"/><path d="M0 360 180 210l105 90 125-140 230 200 80-70 80 70v90H0z" fill="white" opacity=".18"/><circle cx="650" cy="105" r="48" fill="white" opacity=".2"/><text x="40" y="385" fill="white" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="600">${xml(name.slice(0, 42))}</text><text x="40" y="420" fill="white" opacity=".8" font-family="Segoe UI,Arial,sans-serif" font-size="18">Mori Cinema · локальный макет медиа</text></svg>`);
+}
+const INLINE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp']);
+function pageBuilderMediaFile(queue, job, asset, kind = 'original', attemptNumber) {
+  const reference = asset[`${kind}Media`];
+  if (reference) return queue.mediaPicker.resolve(job.id, reference, asset[`${kind}Url`]);
+  const attempt = job.attempts.find(item => item.number === attemptNumber);
+  if (!attempt?.htmlMedia?.revision) return null;
+  let manifest;
+  try { manifest = queue.stage.media.read(job, attempt, true); } catch { return null; }
+  const urls = new Set([asset[`${kind}Url`]].filter(Boolean));
+  const item = manifest.resources.find(resource => resource.status === 'downloaded' && INLINE_IMAGES.has(resource.mime)
+    && [resource.originalUrl, resource.resolvedUrl, resource.finalUrl].some(value => urls.has(value)));
+  if (!item) return null;
+  const dir = queue.stage.media.directory(job, attempt);
+  return { file: safeFile(queue.root, safeFile(dir, path.join(dir, item.object))), mime: item.mime };
 }
 
 function createServer(queue, { onShutdown = async () => {} } = {}) {
@@ -29,6 +56,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
     ['/', ['index.html', 'text/html; charset=utf-8']], ['/app.js', ['app.js', 'text/javascript; charset=utf-8']], ['/app.css', ['app.css', 'text/css; charset=utf-8']],
     ['/html-media.js', ['html-media.js', 'text/javascript; charset=utf-8']],
     ['/page-builder.js', ['page-builder.js', 'text/javascript; charset=utf-8']],
+    ['/builder-markdown.js', ['builder-markdown.js', 'text/javascript; charset=utf-8']],
     ['/embed-policy.js', ['embed-policy.js', 'text/javascript; charset=utf-8']],
     ['/modal-actions.js', ['modal-actions.js', 'text/javascript; charset=utf-8']],
     ['/vendor/editors/editors.js', ['vendor/editors/editors.js', 'text/javascript; charset=utf-8']],
@@ -45,6 +73,12 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
       if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== `http://${host}`)) return json(res, 403, { error: 'Разрешён только локальный origin' });
       if (req.headers['sec-fetch-site'] === 'cross-site') return json(res, 403, { error: 'Cross-site запрос запрещён' });
       const url = new URL(req.url, `http://${host}`);
+      const builderAttempt = (jobId, writing = false) => {
+        const job = queue.get(jobId), value = url.searchParams.get('attempt');
+        if (value === null && writing && job.attempts.length > 1) throw conflict('Требуется номер попытки шага 3');
+        if (value !== null && !/^[1-9][0-9]*$/.test(value)) throw conflict('Некорректный номер попытки шага 3');
+        return queue.pageBuilder.attempt(jobId, value === null ? undefined : Number(value));
+      };
       if (req.method === 'POST') {
         if (req.headers['x-csrf-token'] !== csrfToken) return json(res, 403, { error: 'Неверный CSRF token; обновите страницу' });
         if (url.pathname === '/api/shutdown' && (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin')) {
@@ -61,7 +95,36 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
           req.setTimeout(60000, () => req.destroy());
           return json(res, 200, await queue.stage.media.upload(job, attempt, revision, req));
         }
+        const picker = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/pick-media$/);
+        if (picker) {
+          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Выбор разрешён только из локального интерфейса' });
+          const number = key => { const value = req.headers[key]; if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('Некорректный контекст выбора изображения'); return Number(value); };
+          const request = { revision: number('x-page-revision'), attempt: number('x-media-attempt'), htmlRevision: number('x-html-revision') };
+          const encoded = req.headers['x-image-name'];
+          if (typeof encoded !== 'string' || encoded.length > 1024) throw new Error('Некорректное имя изображения');
+          let name; try { name = decodeURIComponent(encoded); } catch { throw new Error('Некорректное имя изображения'); }
+          // Check CAS before accepting bytes, then check it again after the read.
+          queue.mediaPicker.selectionContext(picker[1], request);
+          req.setTimeout(60000, () => req.destroy());
+          const bytes = await imageBody(req, queue.stage.media.limits.maxFileBytes);
+          return json(res, 200, queue.mediaPicker.choose(picker[1], request, name, bytes));
+        }
         const data = await body(req);
+        const preparedMedia = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/pick-prepared-media$/);
+        if (preparedMedia) {
+          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Выбор изображения разрешён только из локального интерфейса' });
+          const controller = new AbortController();
+          const disconnect = () => { if (!res.writableEnded) controller.abort(); };
+          res.once('close', disconnect);
+          try {
+            const selected = await queue.mediaPicker.pickPrepared(preparedMedia[1], data, controller.signal);
+            if (controller.signal.aborted || res.destroyed) return;
+            return json(res, 200, selected);
+          } catch (error) {
+            if (controller.signal.aborted || res.destroyed) return;
+            throw error;
+          } finally { res.removeListener('close', disconnect); }
+        }
         if (url.pathname === '/api/shutdown') {
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length) throw new Error('Этот запрос принимает только пустой JSON-объект');
           if (shutdownRequested) throw conflict('Отключение уже выполняется');
@@ -85,7 +148,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         if (pageBuilder) {
           queue.get(pageBuilder[1]);
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(key => !['revision', 'document'].includes(key)) || Object.keys(data).length !== 2) throw new Error('Разрешены только revision и document');
-          return json(res, 200, queue.pageBuilder.write(pageBuilder[1], data.revision, data.document));
+          return json(res, 200, queue.pageBuilder.write(pageBuilder[1], data.revision, data.document, builderAttempt(pageBuilder[1], true)));
         }
         const action = url.pathname.match(/^\/api\/jobs\/([a-f0-9-]{36})\/(retry|pause|resume|continue-qa)$/);
         if (action) {
@@ -107,11 +170,26 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
       }
       if (url.pathname === '/api/state') return json(res, 200, queue.snapshot(csrfToken));
       const pageBuilder = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})$/);
-      if (pageBuilder) { queue.get(pageBuilder[1]); return json(res, 200, queue.pageBuilder.read(pageBuilder[1])); }
+      if (pageBuilder) { const job = queue.get(pageBuilder[1]), number = builderAttempt(job.id), attempt = job.attempts.find(item => item.number === number); return json(res, 200, { ...queue.pageBuilder.read(job.id, { attempt: number }), mediaContext: { attempt: number, htmlRevision: attempt.htmlMedia?.revision || 0 } }); }
+      const selectedMedia = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/selection\/([a-f0-9]{64})$/);
+      if (selectedMedia) {
+        const local = queue.mediaPicker.preview(selectedMedia[1], selectedMedia[2]);
+        res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'");
+        res.writeHead(200, { 'Content-Type': local.mime, 'Content-Disposition': 'inline' }); res.end(local.bytes); return;
+      }
       const pageBuilderMedia = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/media\/([a-z0-9][a-z0-9-]{0,63})$/);
       if (pageBuilderMedia) {
-        queue.get(pageBuilderMedia[1]); const asset = queue.pageBuilder.media(pageBuilderMedia[1], pageBuilderMedia[2]);
+        const job = queue.get(pageBuilderMedia[1]), number = builderAttempt(job.id), asset = queue.pageBuilder.media(job.id, pageBuilderMedia[2], number);
         if (!asset) return json(res, 404, { error: 'Медиа не найдено' });
+        const kind = url.searchParams.get('kind') || 'original';
+        if (!['original', 'big'].includes(kind)) throw new Error('Неизвестный тип изображения');
+        const local = pageBuilderMediaFile(queue, job, asset, kind, number);
+        if (local) {
+          res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'");
+          res.writeHead(200, { 'Content-Type': local.mime, 'Content-Disposition': 'inline' });
+          if (local.bytes) { res.end(local.bytes); return; }
+          const stream = fs.createReadStream(local.file); stream.on('error', () => res.destroy()); stream.pipe(res); return;
+        }
         const svg = mediaPlaceholder(asset);
         res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Content-Length': svg.length }); res.end(svg); return;
       }
@@ -129,7 +207,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         const source = media[4] === 'source', item = source ? null : manifest.resources.find(r => r.status === 'downloaded' && r.object === media[4]);
         if (!source && !item) return json(res, 404, { error: 'Object не входит в manifest' });
         const file = safeFile(queue.root, safeFile(dir, path.join(dir, source ? 'source.html' : item.object)));
-        const inlineImage = item && ['image/png','image/jpeg','image/gif','image/webp','image/avif','image/bmp'].includes(item.mime);
+        const inlineImage = item && INLINE_IMAGES.has(item.mime);
         res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'");
         res.writeHead(200, { 'Content-Type': inlineImage ? item.mime : 'application/octet-stream', 'Content-Disposition': `${inlineImage ? 'inline' : 'attachment'}; filename="${source ? 'source.html' : item.sha256}"` });
         const stream = fs.createReadStream(file); stream.on('error', () => res.destroy()); stream.pipe(res); return;
@@ -175,4 +253,4 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
   return server;
 }
 
-module.exports = { createServer };
+module.exports = { createServer, INLINE_IMAGES };
