@@ -5,7 +5,7 @@ const { attemptDir } = require('../../pipeline/paths.cjs');
 const { atomicJson, safeFile, stableRead } = require('../../infrastructure/files.cjs');
 const { inventory } = require('./inventory.cjs');
 const { LIMITS, download } = require('./download.cjs');
-const { checkedPath, filename, extensions } = require('../page-builder/media-picker.cjs');
+const { checkedPath, filename, extensions, mediaMime, verifiedRasterMime, detectLegacyImages } = require('../../infrastructure/media.cjs');
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
 class HtmlMediaStage {
@@ -27,6 +27,7 @@ class HtmlMediaStage {
         if (bytes.length !== item.bytes || sha(bytes) !== item.sha256) throw new Error('Object checksum mismatch');
       }
     }
+    detectLegacyImages(this.queue.root, dir, manifest.resources, this.limits.maxFileBytes);
     return manifest;
   }
   project(attempt, manifest) {
@@ -42,16 +43,23 @@ class HtmlMediaStage {
     this.project(attempt, manifest); this.queue.save();
   }
   publishImage(job, attempt, item) {
-    if (item.status !== 'downloaded' || !extensions[item.mime]) return;
+    if (item.status !== 'downloaded' || !extensions[mediaMime(item)]) return;
     if (!/^[a-f0-9]{64}$/.test(item.sha256) || item.object !== `objects/${item.sha256}`) throw new Error('Object identity mismatch');
     const dir = this.directory(job, attempt), images = checkedPath(this.queue.root, path.join(dir, 'images'));
     const source = checkedPath(this.queue.root, path.join(dir, item.object)), target = path.join(images, filename(item));
     const bytes = stableRead(source, this.limits.maxFileBytes);
-    if (bytes.length !== item.bytes || sha(bytes) !== item.sha256) throw new Error('Object checksum mismatch');
+    if (bytes.length !== item.bytes || sha(bytes) !== item.sha256 || !verifiedRasterMime(item, bytes)) throw new Error('Object checksum/MIME mismatch');
     try { fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL); }
     catch (error) { if (error.code !== 'EEXIST') throw error; }
     const copied = stableRead(checkedPath(this.queue.root, target), this.limits.maxFileBytes);
     if (copied.length !== item.bytes || sha(copied) !== item.sha256) throw new Error('Файл в папке выбора изменён; восстановите медиа шага 2');
+  }
+  prepareLegacyImages(job, attempt, items) {
+    if (!items.length) return;
+    const dir = checkedPath(this.queue.root, this.directory(job, attempt)), images = path.join(dir, 'images');
+    try { fs.mkdirSync(images); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+    checkedPath(this.queue.root, images);
+    for (const item of items) this.publishImage(job, attempt, item);
   }
   create(job, attempt, bytes, origin) {
     if (bytes.length > this.limits.maxHtmlBytes || !bytes.length) throw new Error('HTML пуст или превышает лимит 8 MiB');
@@ -134,7 +142,7 @@ class HtmlMediaStage {
           if (item.status !== 'pending') continue;
           try {
             const existing = manifest.resources.find(r => r.status === 'downloaded' && r.resolvedUrl === item.resolvedUrl);
-            const result = existing ? Object.fromEntries(['status','finalUrl','redirects','mime','bytes','sha256','object'].map(k => [k, existing[k]])) : await this.download(item.resolvedUrl, path.join(this.directory(job, attempt), 'objects'), { limits: this.limits, remaining: this.limits.maxTotalBytes - (manifest.transferredBytes || 0), signal: controller.signal });
+            const result = existing ? Object.fromEntries(['status','finalUrl','redirects','mime','detectedMime','bytes','sha256','object'].map(k => [k, existing[k]])) : await this.download(item.resolvedUrl, path.join(this.directory(job, attempt), 'objects'), { limits: this.limits, remaining: this.limits.maxTotalBytes - (manifest.transferredBytes || 0), signal: controller.signal });
             if (!existing) manifest.transferredBytes = (manifest.transferredBytes || 0) + result.bytes;
             Object.assign(item, result);
           } catch (error) {

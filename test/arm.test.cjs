@@ -10,6 +10,7 @@ const { spawn } = require('node:child_process');
 const { Queue, createServer, acquireLock, createShutdownController } = require('../src/server.cjs');
 const { normalizeUrl, layout, buildArgs, buildPrompt, validateResult, stopTree, safeFile } = require('../src/lib.cjs');
 const { publishLease } = require('../src/launcher.cjs');
+const { loadFormatDuration } = require('./duration-format.cjs');
 
 test('frontend URL policy matches backend canonicalization and rejects unsafe addresses', () => {
   const vm = require('node:vm');
@@ -128,6 +129,126 @@ test('retry preserves orphaned attempt reservation after crash before state save
   const recovered = new Queue({ root, autoStart: false }); recovered.retry(job.id);
   assert.equal(recovered.jobs[0].attempts.at(-1).number, 3);
   assert.equal(fs.readFileSync(path.join(orphanDir, 'evidence.txt'), 'utf8'), 'preserve me');
+});
+
+test('add preparation/save failure rolls back the entire batch and queue order while preserving reserved directories', t => {
+  for (const failure of ['prepare', 'save']) {
+    const { root, queue, children } = setup(t);
+    queue.add('https://existing.reestr35.ru');
+    const existing = queue.jobs[0]; existing.attempts[0].status = 'failed'; queue.save();
+    const previousOrder = queue.nextQueueOrder, durable = fs.readFileSync(queue.stateFile);
+    const save = queue.save, prepare = queue.stage.prepareAttempt, reserved = []; let saves = 0;
+    queue.stage.prepareAttempt = function(job, attempt) {
+      reserved.push(layout(root, job, attempt).dir);
+      if (failure === 'prepare' && reserved.length === 2) throw new Error('fixture prepare failure');
+      return prepare.call(this, job, attempt);
+    };
+    queue.save = function() { saves++; throw new Error('fixture save failure'); };
+    try {
+      assert.throws(() => queue.add('https://first.reestr35.ru\nhttps://second.reestr35.ru'), new RegExp(`fixture ${failure} failure`));
+    } finally { queue.save = save; queue.stage.prepareAttempt = prepare; }
+    assert.equal(saves, failure === 'save' ? 1 : 0);
+    assert.deepEqual(queue.jobs, [existing]); assert.equal(queue.nextQueueOrder, previousOrder);
+    assert.deepEqual(fs.readFileSync(queue.stateFile), durable);
+    assert.equal(reserved.length, 2); assert.ok(reserved.every(dir => fs.existsSync(dir)));
+    assert.ok(fs.existsSync(path.join(reserved[0], 'job.json')));
+    queue.pump(); assert.equal(children.length, 0, 'rejected batch cannot be dispatched');
+    const result = queue.add('https://first.reestr35.ru\nhttps://second.reestr35.ru');
+    assert.equal(result.added.length, 2);
+    assert.deepEqual(queue.jobs.slice(1).map(job => job.attempts[0].queueOrder), [previousOrder + 1, previousOrder + 2]);
+    assert.ok(reserved.every(dir => fs.existsSync(dir)), 'successful retry preserves previous orphan directories');
+  }
+});
+
+test('retry save failure retains old attempt and reserves the rejected attempt number', t => {
+  const { root, queue, children } = setup(t); queue.add('https://a.reestr35.ru');
+  const job = queue.jobs[0], previous = job.attempts[0]; previous.status = 'failed'; queue.save();
+  const durable = fs.readFileSync(queue.stateFile), save = queue.save;
+  queue.save = () => { throw new Error('fixture retry save'); };
+  assert.throws(() => queue.retry(job.id), /fixture retry save/);
+  queue.save = save;
+  assert.deepEqual(job.attempts, [previous]); assert.deepEqual(fs.readFileSync(queue.stateFile), durable);
+  const orphanDir = layout(root, job, { number: 2 }).dir;
+  assert.ok(fs.existsSync(path.join(orphanDir, 'job.json')));
+  fs.writeFileSync(path.join(orphanDir, 'evidence.txt'), 'preserve rejected reservation');
+  queue.pump(); assert.equal(children.length, 0);
+  queue.retry(job.id);
+  assert.equal(job.attempts.at(-1).number, 3);
+  assert.equal(fs.readFileSync(path.join(orphanDir, 'evidence.txt'), 'utf8'), 'preserve rejected reservation');
+});
+
+test('add saves once per batch and snapshots share the latest attempt summary', t => {
+  const { queue } = setup(t), save = queue.save; let saves = 0;
+  queue.save = function() { saves++; return save.call(this); };
+  queue.add('https://a.reestr35.ru\nhttps://b.reestr35.ru\nhttps://a.reestr35.ru');
+  assert.equal(saves, 1);
+  const unchanged = queue.add('https://a.reestr35.ru\ninvalid'); assert.equal(saves, 1);
+  assert.deepEqual(unchanged.added, []); assert.deepEqual(unchanged.duplicates, ['https://a.reestr35.ru/']);
+  assert.equal(unchanged.invalid.length, 1); assert.equal(unchanged.invalid[0].input, 'invalid');
+  const job = queue.jobs[0]; job.attempts[0].status = 'failed'; queue.retry(job.id);
+  const calls = [];
+  queue.pageBuilder = { summary(id, attempt) { calls.push([id, attempt]); return { status: 'unreviewed', revision: attempt }; } };
+  const snapshot = queue.snapshot('token');
+  assert.deepEqual(calls, [[job.id, 1], [job.id, 2], [queue.jobs[1].id, 1]]);
+  for (const projected of snapshot.jobs) assert.deepEqual(projected.pageBuilder, projected.attempts.at(-1).pageBuilder);
+  assert.equal(snapshot.csrfToken, 'token'); assert.equal(snapshot.concurrency, 2);
+});
+
+test('maximum 200 URL batch publishes state once and retains API/FIFO order', t => {
+  const { queue } = setup(t), save = queue.save; let saves = 0;
+  queue.save = function() { saves++; return save.call(this); };
+  const urls = Array.from({ length: 200 }, (_, index) => `https://batch-${index}.reestr35.ru/`);
+  const result = queue.add(urls.join('\n'));
+  assert.equal(saves, 1); assert.deepEqual(Object.keys(result).sort(), ['added', 'duplicates', 'invalid']);
+  assert.deepEqual(result.added, queue.jobs.map(job => job.id)); assert.deepEqual(result.duplicates, []); assert.deepEqual(result.invalid, []);
+  assert.deepEqual(queue.jobs.map(job => job.url), urls);
+  assert.deepEqual(queue.jobs.map(job => job.attempts[0].queueOrder), Array.from({ length: 200 }, (_, index) => index + 1));
+  assert.deepEqual(JSON.parse(fs.readFileSync(queue.stateFile)).jobs, queue.jobs);
+});
+
+test('missing media preview uses a neutral SVG and escapes the supplied label', async t => {
+  const { queue } = setup(t); queue.add('https://a.reestr35.ru');
+  const job = queue.jobs[0];
+  queue.pageBuilder.media = () => ({ id: 'empty-image', alt: '<script>label</script>' });
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); t.after(() => server.close());
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/page-builder/${job.id}/media/empty-image?attempt=1`);
+  assert.equal(response.status, 200); assert.match(response.headers.get('content-type'), /image\/svg\+xml/);
+  const svg = await response.text();
+  assert.match(svg, /Предпросмотр изображения недоступен/); assert.doesNotMatch(svg, /Mori Cinema|<script>/);
+  assert.match(svg, /&lt;script&gt;label&lt;\/script&gt;/);
+});
+
+test('media previews verify current bytes and reject forged detected MIME before inline delivery', async t => {
+  const { root, queue } = setup(t); queue.add('https://a.reestr35.ru');
+  const job = queue.jobs[0], attempt = job.attempts[0], dir = path.join(root, 'media-fixture');
+  attempt.htmlMedia = { revision: 1 };
+  fs.mkdirSync(path.join(dir, 'objects'), { recursive: true });
+  const asset = { id: 'image', originalUrl: 'https://a.reestr35.ru/image.bin' }, manifest = { resources: [] };
+  queue.pageBuilder.media = () => asset;
+  queue.stage.media.read = () => manifest; queue.stage.media.directory = () => dir;
+  const install = bytes => {
+    const sha256 = require('node:crypto').createHash('sha256').update(bytes).digest('hex');
+    const item = { status: 'downloaded', originalUrl: asset.originalUrl, mime: 'application/octet-stream', detectedMime: 'image/png', bytes: bytes.length, sha256, object: `objects/${sha256}` };
+    manifest.resources = [item]; fs.writeFileSync(path.join(dir, item.object), bytes); return item;
+  };
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9WQAAAAASUVORK5CYII=', 'base64');
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const urls = item => [`${base}/api/page-builder/${job.id}/media/image?attempt=1`, `${base}/api/html-media/${job.id}/1/1/${item.object}`];
+  const item = install(png);
+  for (const url of urls(item)) {
+    const response = await fetch(url); assert.equal(response.status, 200); assert.equal(response.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), png);
+  }
+  const changed = Buffer.from(png); changed[changed.length - 1] ^= 1; fs.writeFileSync(path.join(dir, item.object), changed);
+  for (const url of urls(item)) {
+    const response = await fetch(url); assert.equal(response.status, 400); assert.match(await response.text(), /checksum mismatch/);
+  }
+  const forged = install(Buffer.from('<html><script>alert(1)</script></html>'));
+  for (const url of urls(forged)) {
+    const response = await fetch(url); assert.equal(response.status, 400);
+    assert.notEqual(response.headers.get('content-type'), 'image/png'); assert.notEqual(response.headers.get('content-disposition'), 'inline');
+  }
 });
 
 test('failed stop is retryable and cancellation intent survives a successful exit', async t => {
@@ -348,10 +469,7 @@ test('pause/resume API has conflict, exact body, CSRF and Origin protection', as
 });
 
 test('attempt duration advances only for active attempts and terminal durations are stable', () => {
-  const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
-  const code = source.match(/function formatDuration\(attempt, timestamp = Date.now\(\)\) \{[\s\S]*?(?=\n  function renderDuration)/)?.[0];
-  assert.ok(code);
-  const duration = require('node:vm').runInNewContext(`${code}; formatDuration`, { ACTIVE_STATUSES: new Set(['running', 'validating', 'stopping']) });
+  const duration = loadFormatDuration();
   const startedAt = '2026-01-01T00:00:00Z', activeSince = Date.parse(startedAt);
   assert.equal(duration({ startedAt, activeDurationMs: 3600000, activeSince, status: 'running' }, activeSince + 61000), '01:01:01');
   assert.equal(duration({ startedAt, activeDurationMs: 42000, finishedAt: '2026-02-01T00:00:42Z', status: 'complete' }, Date.now()), '00:00:42');

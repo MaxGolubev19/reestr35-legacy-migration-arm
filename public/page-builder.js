@@ -530,7 +530,26 @@
     const section = target.kind === 'section' ? document.common : [document.common, ...document.tabs].find(item => item.id === target.sectionId);
     return target.kind === 'block' ? section?.blocks.find(item => item.id === target.id) : section;
   }
+  let savingControls = null, savingLabel = '';
   function savingUi(busy) {
+    if (busy && !savingControls) {
+      savingControls = [...fields.querySelectorAll('input, textarea, select, button, [contenteditable]'), ...reviewFooter.querySelectorAll('input, textarea, select, button, [contenteditable]')].map(control => ({ control, disabled: control.disabled, contenteditable: control.getAttribute('contenteditable') }));
+      savingLabel = save.textContent;
+      for (const { control } of savingControls) {
+        if ('disabled' in control) control.disabled = true;
+        if (control.hasAttribute('contenteditable')) control.setAttribute('contenteditable', 'false');
+      }
+      fields.setAttribute('aria-disabled', 'true'); reviewFooter.setAttribute('aria-disabled', 'true');
+      save.textContent = 'Сохранение…';
+    } else if (!busy && savingControls) {
+      for (const { control, disabled, contenteditable } of savingControls) {
+        if ('disabled' in control) control.disabled = disabled;
+        if (contenteditable === null) control.removeAttribute('contenteditable'); else control.setAttribute('contenteditable', contenteditable);
+      }
+      savingControls = null;
+      fields.removeAttribute('aria-disabled'); reviewFooter.removeAttribute('aria-disabled');
+      save.textContent = savingLabel;
+    }
     save.disabled = busy; save.classList.toggle('btn-loading', busy); modalElement.toggleAttribute('aria-busy', busy);
     modalElement.querySelectorAll('[data-bs-dismiss="modal"]').forEach(control => { control.disabled = busy; control.setAttribute('aria-disabled', String(busy)); });
   }

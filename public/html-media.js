@@ -122,7 +122,7 @@
     try {
       const manifest = await json(prefix + 'manifest'); if (version !== generation) return;
       const gallery = node('div', undefined, 'row g-3 mb-3'), documents = node('ul', undefined, 'media-items'), external = node('div', undefined, 'row g-3 mb-3'), issues = node('ul', undefined, 'media-items');
-      const raster = item => ['image/png','image/jpeg','image/gif','image/webp','image/avif','image/bmp'].includes(item.mime);
+      const raster = item => ['image/png','image/jpeg','image/gif','image/webp','image/avif','image/bmp'].includes(item.detectedMime || item.mime);
       const images = manifest.resources.filter(item => item.status === 'downloaded' && raster(item)).map(item => ({ ...item, url: prefix + item.object }));
       for (const item of manifest.resources) {
         if (item.status === 'downloaded') {
@@ -166,7 +166,14 @@
       ];
       for (const [id, title, content] of sections) if (content.childElementCount) accordion.append(accordionSection(id, title, content, content.childElementCount));
       if (accordion.childElementCount) container.append(accordion);
-    } catch (failure) { if (version === generation) error(failure.message); }
+    } catch (failure) {
+      if (version === generation) {
+        // The same snapshot may arrive on the next poll. Retry it after a
+        // transient failure, while the generation guard keeps old responses out.
+        key = '';
+        error(failure.message);
+      }
+    }
   }
   window.HtmlMedia = { render };
 })();

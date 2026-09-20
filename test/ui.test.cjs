@@ -862,6 +862,44 @@ test('technical area follows steps and attempts, preserves modern capture eviden
   assert.deepEqual(errors, []);
 });
 
+test('HTML media retries a failed manifest once per render and ignores stale responses', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'html-media-retry-ui-'));
+  const queue = new Queue({ root, autoStart: false });
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage(), requests = [];
+  const manifest = label => ({ resources: [{ id: 1, status: 'downloaded', originalUrl: label, resolvedUrl: label, mime: 'application/octet-stream', detectedMime: 'image/png', object: 'objects/test.png', bytes: 1 }] });
+  let releaseRetry, retryArrived, releaseStale, staleArrived;
+  const retryGate = new Promise(resolve => { releaseRetry = resolve; }), arrived = new Promise(resolve => { retryArrived = resolve; });
+  const staleGate = new Promise(resolve => { releaseStale = resolve; }), staleStarted = new Promise(resolve => { staleArrived = resolve; });
+  await page.route('**/api/html-media/retry-job/1/*/manifest', async route => {
+    const revision = Number(new URL(route.request().url()).pathname.split('/').at(-2)); requests.push(revision);
+    if (revision === 1 && requests.filter(value => value === 1).length === 1) return route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Временная ошибка"}' });
+    if (revision === 1) { retryArrived(); await retryGate; }
+    if (revision === 2) { staleArrived(); await staleGate; }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(manifest(revision === 3 ? 'https://example.org/new.png' : 'https://example.org/old.png')) });
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+  const render = revision => page.evaluate(async revision => {
+    const attempt = { number: 1, status: 'complete', htmlMedia: { revision, source: { bytes: 1024 }, total: 1, pending: 0 } };
+    const job = { id: 'retry-job', attempts: [attempt] };
+    await window.HtmlMedia.render(job, attempt, { csrfToken: '', refresh() {} });
+  }, revision);
+  await render(1);
+  assert.match(await page.locator('#html-media-content .alert-danger').innerText(), /Временная ошибка/);
+  const firstRetry = render(1), duplicate = render(1); await arrived;
+  assert.deepEqual(requests, [1, 1], 'duplicate render during an in-flight retry starts no extra request');
+  releaseRetry(); await Promise.all([firstRetry, duplicate]);
+  assert.equal(await page.locator('#html-media-content [aria-label="Открыть изображение https://example.org/old.png"]').count(), 1, 'successful retry renders the same revision');
+  const stale = render(2); await staleStarted;
+  const newer = render(3); await newer;
+  releaseStale(); await stale;
+  assert.deepEqual(requests, [1, 1, 2, 3]);
+  assert.equal(await page.locator('#html-media-content [aria-label="Открыть изображение https://example.org/new.png"]').count(), 1, 'detected raster MIME renders as an image');
+  assert.equal(await page.locator('#html-media-content [aria-label="Открыть изображение https://example.org/old.png"]').count(), 0, 'old manifest cannot append after a newer revision');
+});
+
 test('new empty page can add and delete its only tab at 320px', { timeout: 30000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-empty-tabs-ui-'));
   const queue = new Queue({ root, autoStart: false }); queue.add('https://new-page.reestr35.ru/');
@@ -1117,10 +1155,25 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   const builderApiPattern = `**/api/page-builder/${job.id}?attempt=*`, delayedSaveHandler = async route => { if (route.request().method() !== 'POST') return route.continue(); markDelayedSaveArrived(); await delayedSaveGate; await route.continue(); };
   await page.route(builderApiPattern, delayedSaveHandler); const delayedCommon = page.getByRole('button', { name: /^MORI CINEMA · Годовикова, 37\./ }); await delayedCommon.click(); await page.locator('#builder-title').fill('MORI CINEMA · атомарное сохранение'); await page.locator('#page-builder-save').click(); await delayedSaveArrived;
   const cancelSave = page.getByRole('button', { name: 'Отмена', exact: true }), closeSave = page.getByRole('button', { name: 'Отменить и закрыть', exact: true }); assert.equal(await cancelSave.isDisabled(), true); assert.equal(await closeSave.isDisabled(), true); assert.equal(await page.locator('#page-builder-modal').getAttribute('aria-busy'), '');
+  assert.equal(await page.locator('#page-builder-save').innerText(), 'Сохранение…');
+  assert.equal(await page.locator('#page-builder-fields input, #page-builder-fields textarea, #page-builder-fields select, #page-builder-fields button, .builder-review-footer select').evaluateAll(controls => controls.every(control => control.disabled)), true, 'all draft editors and media actions are disabled during POST');
   await cancelSave.evaluate(node => node.click()); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'Cancel cannot interrupt an in-flight save'); await page.keyboard.press('Escape'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'Escape cannot interrupt an in-flight save'); await closeSave.evaluate(node => node.click()); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'close cannot interrupt an in-flight save');
   await page.getByRole('button', { name: /^Быстрые действия\./ }).evaluate(node => node.click()); assert.equal(await page.locator('#builder-title').inputValue(), 'MORI CINEMA · атомарное сохранение', 'another block cannot replace the pending draft');
   releaseDelayedSave(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); await page.unroute(builderApiPattern, delayedSaveHandler); await page.waitForFunction(() => document.querySelector('#page-builder-content > .builder-section')?.textContent.includes('MORI CINEMA · атомарное сохранение'));
   stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 5); assert.equal(stored.document.common.blocks[0].title, 'MORI CINEMA · атомарное сохранение'); assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'common-hero', 'completed delayed save renders and restores focus to its opener');
+  let releaseFailedSave, markFailedSaveArrived; const failedSaveGate = new Promise(resolve => { releaseFailedSave = resolve; }), failedSaveArrived = new Promise(resolve => { markFailedSaveArrived = resolve; });
+  const failedSaveHandler = async route => { if (route.request().method() !== 'POST') return route.continue(); markFailedSaveArrived(); await failedSaveGate; await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Временная ошибка"}' }); };
+  await page.route(builderApiPattern, failedSaveHandler); await commonHero.click(); await page.locator('#builder-title').fill('Черновик после ошибки'); await page.locator('#page-builder-save').click(); await failedSaveArrived;
+  assert.equal(await page.locator('#builder-title').isDisabled(), true);
+  releaseFailedSave(); await page.waitForFunction(() => document.querySelector('#page-builder-form-error').textContent.includes('Временная ошибка'));
+  assert.equal(await page.locator('#builder-title').isEnabled(), true, 'failed POST restores draft editing');
+  assert.equal(await page.locator('#builder-add-image').isEnabled(), true, 'failed POST restores media actions');
+  assert.equal(await page.locator('.builder-native-media-picker').first().isEnabled(), true, 'failed POST restores the native media picker');
+  assert.equal(await page.locator('#builder-review-status').isEnabled(), true, 'failed POST restores review control');
+  assert.equal(await page.locator('#page-builder-save').innerText(), 'Сохранить');
+  await page.locator('#builder-title').fill('Ещё правка'); assert.equal(await page.locator('#builder-title').inputValue(), 'Ещё правка');
+  await page.unroute(builderApiPattern, failedSaveHandler); await cancelSave.click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  assert.equal(queue.pageBuilder.read(job.id).revision, 5, 'failed save and cancelled draft leave durable data unchanged');
   const edit = page.locator('.builder-tab-panel .builder-block-open').first(); await edit.focus(); const editHandle = await edit.elementHandle(); await edit.click(); await page.waitForSelector('#page-builder-modal.show'); await page.waitForFunction(() => document.activeElement?.closest('#page-builder-modal')); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); assert.equal(await editHandle.evaluate(node => node.isConnected), true, 'unchanged polling keeps the opener node alive'); await page.keyboard.press('Escape'); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); assert.equal(await editHandle.evaluate(node => document.activeElement === node), true, 'Escape restores focus after multiple polls');
   for (const width of [1440, 390, 375, 360, 320]) {
     await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 }); await page.locator('.builder-block').filter({ hasText: 'Вакансии кинотеатра' }).click(); await page.waitForSelector('#page-builder-modal.show');

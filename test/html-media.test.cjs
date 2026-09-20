@@ -1,5 +1,10 @@
 'use strict';
-const test = require('node:test'), assert = require('node:assert/strict');
+const nodeTest = require('node:test'), assert = require('node:assert/strict');
+const caseProfile = process.env.ARM_TEST_HTML_MEDIA_CASES || 'all';
+if (!['all', 'backend', 'browser'].includes(caseProfile)) throw new Error(`Unknown HTML media case profile: ${caseProfile}`);
+let browserCaseCount = 0;
+const test = (...args) => { if (caseProfile !== 'browser') nodeTest(...args); };
+const browserTest = (...args) => { browserCaseCount++; if (caseProfile !== 'backend') nodeTest(...args); };
 const fs = require('node:fs'), path = require('node:path'), http = require('node:http'), crypto = require('node:crypto');
 const { Readable, PassThrough } = require('node:stream');
 const { chromium } = require('playwright');
@@ -145,7 +150,7 @@ test('HTML recovery preserves queued FIFO and explicit pause; completed QA enter
   for (const [file, expected] of ctx.proof) assert.equal(hash(fs.readFileSync(file)), expected);
 });
 
-test('Mori iframe previews render origin-dependent players without ambient credentials, parent access or top navigation', { timeout: 90000 }, async t => {
+browserTest('Mori iframe previews render origin-dependent players without ambient credentials, parent access or top navigation', { timeout: 90000 }, async t => {
   const live = process.env.ARM_LIVE_EMBEDS === '1';
   const source = fs.readFileSync(path.resolve(__dirname, '../src/resources/html/mori-cinema.reestr35.ru.html'), 'utf8');
   const mori = inventory(source, 'https://mori-cinema.reestr35.ru/').filter(item => item.occurrence.tag === 'iframe');
@@ -221,7 +226,7 @@ test('Mori iframe previews render origin-dependent players without ambient crede
   await page.screenshot({path:path.join(testOutput(),`mori-${live?'live':'fixture'}-modal-375.png`)});
 });
 
-test('embed policy rejects unsafe URLs and CSP blocks private, self and off-policy iframe redirects', async t => {
+browserTest('embed policy rejects unsafe URLs and CSP blocks private, self and off-policy iframe redirects', async t => {
   const policy = require('../public/embed-policy.js');
   for (const url of ['file:///secret','javascript:alert(1)','http://127.1/','http://localhost/','http://a.localhost/','http://10.1.2.3/','http://169.254.169.254/','http://[::1]/','http://[::ffff:127.0.0.1]/','https://u:p@rutube.ru/play/embed/a/','https://rutube.ru.evil.example/','https://rutube.ru:8443/']) assert.equal(policy.inspect(url,'http://127.0.0.1:4318').allowed,false,url);
   assert.equal(policy.inspect('http://www.youtube.com/embed/a').url,'https://www.youtube.com/embed/a');
@@ -281,10 +286,46 @@ test('production download validates every inline raster MIME and refuses Flash, 
   for (const [url, item] of Object.entries(content)) {
     if (url.startsWith('/good-') || ['/binary-png','/zip'].includes(url)) {
       const result = await fixture.fetchAsset('https://public.example' + url, directory); assert.equal(result.status, 'downloaded', url); assert.equal(result.mime, item.mime); assert.equal(result.sha256, hash(item.bytes));
+      assert.equal(result.detectedMime, url === '/binary-png' ? 'image/png' : signatures[item.mime] ? item.mime : undefined);
     } else await assert.rejects(fixture.fetchAsset('https://public.example' + url, directory), /MIME|signature|Flash/, url);
   }
   assert.equal(fs.readdirSync(directory).some(name => name.endsWith('.tmp')), false);
 });
+browserTest('octet-stream PNG keeps declared MIME and passes download, image UI, picker and persisted editor preview', { timeout: 30000 }, async t => {
+  const fixture = await fixtureServer(t, { '/binary.png': { mime: 'application/octet-stream', bytes: PNG } });
+  const { queue, job, attempt } = completed(t, { mediaDownload: fixture.fetchAsset });
+  await queue.stage.media.upload(job, attempt, 0, Readable.from([Buffer.from('<img src="/binary.png"><a href="/binary.png">Duplicate</a>')]));
+  queue.pump(); await queue.active.get(job.id).completion;
+  const manifest = queue.stage.media.read(job, attempt, true), item = manifest.resources[0];
+  assert.equal(item.mime, 'application/octet-stream'); assert.equal(item.detectedMime, 'image/png');
+  assert.equal(manifest.resources.length, 2);
+  assert.ok(manifest.resources.every(resource => resource.detectedMime === 'image/png'), 'deduplicated resources retain detected MIME');
+  assert.equal(fixture.hits.length, 1);
+  const directory = path.join(queue.stage.media.directory(job, attempt), 'images'), names = fs.readdirSync(directory);
+  assert.equal(names.length, 1); assert.match(names[0], /\.png$/); assert.deepEqual(fs.readFileSync(path.join(directory, names[0])), PNG);
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`, endpoint = `${base}/api/page-builder/${job.id}`;
+  const response = await fetch(`${base}/api/html-media/${job.id}/1/1/${item.object}`);
+  assert.equal(response.headers.get('content-type'), 'image/png'); assert.match(response.headers.get('content-disposition'), /^inline/);
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG);
+  const browser = await chromium.launch({ channel: 'chrome', headless: true }); t.after(() => browser.close());
+  const page = await browser.newPage(); page.setDefaultTimeout(5000);
+  await page.goto(base); await page.locator('#jobs-body tr').first().click(); await page.locator('#stage-step-2').click();
+  await page.locator('#html-media-accordion summary').first().click();
+  await page.getByRole('button', { name: /^Открыть изображение/ }).first().click();
+  await page.waitForFunction(() => document.querySelector('.media-full-image')?.naturalWidth > 0);
+  const stored = queue.pageBuilder.read(job.id), state = await (await fetch(base + '/api/state')).json();
+  const headers = { origin: base, 'sec-fetch-site': 'same-origin', 'x-csrf-token': state.csrfToken, 'content-type': 'application/octet-stream', 'x-page-revision': String(stored.revision), 'x-media-attempt': '1', 'x-html-revision': '1', 'x-image-name': encodeURIComponent(names[0]) };
+  const picked = await fetch(endpoint + '/pick-media', { method: 'POST', headers, body: PNG }); assert.equal(picked.status, 200);
+  const selected = await picked.json(), preview = await fetch(base + selected.preview);
+  assert.equal(preview.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await preview.arrayBuffer()), PNG);
+  stored.document.common.blocks.push({ id: 'binary-block', type: 'big-media', title: '', review: { status: 'unreviewed', reason: '' }, media: [{ id: 'binary-image', originalUrl: selected.url, originalMedia: selected.media }] });
+  queue.pageBuilder.write(job.id, stored.revision, stored.document, 1);
+  const saved = await fetch(endpoint + '/media/binary-image'); assert.equal(saved.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await saved.arrayBuffer()), PNG);
+  assert.equal(queue.stage.media.read(job, attempt).resources[0].mime, 'application/octet-stream', 'display and selection never rewrite declared MIME');
+});
+
 test('SSRF rejects private/mapped/metadata/mixed DNS, credentials and protocols; redirects revalidate; size/type/timeout/redirect limits', async t => {
   for (const address of ['127.0.0.1','10.0.0.1','169.254.169.254','192.168.1.1','100.64.0.1','0.0.0.0','224.0.0.1','::1','::ffff:127.0.0.1','fe80::1','fc00::1']) assert.equal(publicAddress(address), false, address);
   for (const value of ['http://localhost/x','file:///x','http://a:b@public.com/x','http://127.1','http://[::1]/']) await assert.rejects(resolvePublic(new URL(value)));
@@ -342,6 +383,45 @@ test('legacy unfinished HTML revision rebuilds images on resume, while a finishe
   await assert.rejects(queue.mediaPicker.pickPrepared(job.id, request), /Папка изображений не найдена/);
   assert.equal(fs.existsSync(images), false, 'opening a completed revision never recreates images');
 });
+test('completed legacy octet-stream PNG is projected and selectable without rewriting source evidence', async t => {
+  for (const missingImages of [false, true]) await t.test(missingImages ? 'missing images folder' : 'empty images folder', async t => {
+    const { queue, job, attempt } = completed(t);
+    const manifest = queue.stage.media.create(job, attempt, Buffer.from('<img src="/legacy.png">'), 'test');
+    const sha256 = hash(PNG), dir = queue.stage.media.directory(job, attempt), images = path.join(dir, 'images'), object = path.join(dir, 'objects', sha256);
+    fs.writeFileSync(object, PNG);
+    Object.assign(manifest.resources[0], { status: 'downloaded', mime: 'application/octet-stream', bytes: PNG.length, sha256, object: `objects/${sha256}` });
+    manifest.status = 'complete'; queue.stage.media.publish(job, attempt, manifest); attempt.status = 'complete'; queue.save();
+    if (missingImages) fs.rmdirSync(images);
+    const evidence = ['manifest.json', 'source.html', `objects/${sha256}`].map(name => { const file = path.join(dir, name); return { file, bytes: fs.readFileSync(file), mtime: fs.statSync(file).mtimeMs }; });
+    const assertEvidence = () => { for (const item of evidence) { assert.deepEqual(fs.readFileSync(item.file), item.bytes); assert.equal(fs.statSync(item.file).mtimeMs, item.mtime); } };
+    const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    const base = `http://127.0.0.1:${server.address().port}`, route = `${base}/api/html-media/${job.id}/1/1`;
+    const projected = await (await fetch(route + '/manifest')).json();
+    assert.equal(projected.resources[0].mime, 'application/octet-stream'); assert.equal(projected.resources[0].detectedMime, 'image/png');
+    assertEvidence(); assert.equal(fs.existsSync(images), !missingImages, 'reading metadata creates no files');
+    const response = await fetch(`${route}/objects/${sha256}`);
+    assert.equal(response.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG);
+    const stored = queue.pageBuilder.read(job.id), request = { revision: stored.revision, attempt: 1, htmlRevision: 1 };
+    let chosenName;
+    queue.mediaPicker.openDialog = async directory => {
+      assert.equal(directory, images); const names = fs.readdirSync(directory); assert.equal(names.length, 1);
+      chosenName = names[0]; assert.match(chosenName, /\.png$/); assert.deepEqual(fs.readFileSync(path.join(directory, chosenName)), PNG);
+      return path.join(directory, chosenName);
+    };
+    const selected = await queue.mediaPicker.pickPrepared(job.id, request);
+    assert.equal(selected.media.filename, chosenName); assertEvidence();
+    stored.document.common.blocks.push({ id: 'legacy-block', type: 'big-media', title: '', review: { status: 'unreviewed', reason: '' }, media: [{ id: 'legacy-image', originalUrl: selected.url, originalMedia: selected.media }] });
+    queue.pageBuilder.write(job.id, stored.revision, stored.document, 1);
+    const preview = await fetch(`${base}/api/page-builder/${job.id}/media/legacy-image`);
+    assert.equal(preview.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await preview.arrayBuffer()), PNG); assertEvidence();
+    const altered = Buffer.from(PNG); altered[altered.length - 1] ^= 1; fs.writeFileSync(object, altered);
+    assert.throws(() => queue.stage.media.read(job, attempt), /checksum/);
+    assert.throws(() => queue.mediaPicker.resolve(job.id, selected.media), /checksum/);
+    fs.writeFileSync(object, PNG);
+  });
+});
+
 test('legacy running HTML revision without images recovers before automatic queued start after restart', async t => {
   const ctx = completed(t), { queue, job, attempt } = ctx;
   const manifest = queue.stage.media.create(job, attempt, Buffer.from('<img src="/photo.png">'), 'test');
@@ -390,7 +470,7 @@ test('durable object checkpoint survives failed state projection and is not fetc
   ctx.queue.resume(ctx.job.id); ctx.queue.pump(); await ctx.queue.active.get(ctx.job.id).completion;
   assert.equal(ctx.attempt.status, 'complete'); assert.deepEqual(fixture.hits, ['/first.png','/second.png']);
 });
-test('shared modal restores exact HTML/image trigger after checkpoint polling, with revision, disabled and hidden guards', { timeout: 30000 }, async t => {
+browserTest('shared modal restores exact HTML/image trigger after checkpoint polling, with revision, disabled and hidden guards', { timeout: 30000 }, async t => {
   const fixture = await fixtureServer(t), ctx = completed(t, { mediaDownload: fixture.fetchAsset }), server = createServer(ctx.queue);
   const source = Buffer.from('<img src="/first.png"><img src="/second.png">');
   await ctx.queue.stage.media.upload(ctx.job, ctx.attempt, 0, Readable.from([source]));
@@ -426,7 +506,7 @@ test('shared modal restores exact HTML/image trigger after checkpoint polling, w
   await page.waitForFunction(element => !element.isConnected, previousAttempt); await close(); assert.equal(await html.evaluate(node => document.activeElement === node), false, 'another attempt must not receive old modal focus');
   assert.deepEqual(errors, []);
 });
-test('missing HTML warning retains focus and tooltip across another running job duration heartbeat', { timeout: 15000 }, async t => {
+browserTest('missing HTML warning retains focus and tooltip across another running job duration heartbeat', { timeout: 15000 }, async t => {
   const ctx = completed(t); ctx.queue.add('https://running.reestr35.ru/');
   const running = ctx.queue.jobs[1], attempt = running.attempts[0];
   Object.assign(attempt, { status: 'running', startedAt: new Date().toISOString() }); ctx.queue.save();
@@ -455,7 +535,7 @@ test('missing HTML warning retains focus and tooltip across another running job 
   assert.deepEqual(errors, []);
 });
 
-test('missing HTML warning is keyboard accessible and upload resumes automatically; iframe gallery previews, modal copy and cleanup', { timeout: 30000 }, async t => {
+browserTest('missing HTML warning is keyboard accessible and upload resumes automatically; iframe gallery previews, modal copy and cleanup', { timeout: 30000 }, async t => {
   const fixture = await fixtureServer(t), ctx = completed(t, { mediaDownload: fixture.fetchAsset }), server = createServer(ctx.queue);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); t.after(() => { server.closeAllConnections(); server.close(); });
   const browser = await chromium.launch({ channel: 'chrome', headless: true }); t.after(() => browser.close());
@@ -554,7 +634,7 @@ test('missing HTML upload queues behind existing work and leaves rejected upload
   assert.equal(ctx.queue.stage.media.uploads.size, 0); assert.equal(ctx.queue.active.size, 0);
 });
 
-test('real offline editors, simplified read-only trees/folding, neutral actions, gallery parity and responsive modal navigation', { timeout: 90000 }, async t => {
+browserTest('real offline editors, simplified read-only trees/folding, neutral actions, gallery parity and responsive modal navigation', { timeout: 90000 }, async t => {
   const fixture = await fixtureServer(t), ctx = completed(t, { mediaDownload: fixture.fetchAsset }), server = createServer(ctx.queue);
   const source = Buffer.from('<section><h2>Heading</h2><div><img src="/first.png"><img src="/second.png"><iframe src="https://example.com/embed"></iframe><object data="legacy.swf"></object></div></section>');
   await ctx.queue.stage.media.upload(ctx.job, ctx.attempt, 0, Readable.from([source])); ctx.queue.pump(); await ctx.queue.active.get(ctx.job.id).completion;
@@ -654,7 +734,7 @@ test('real offline editors, simplified read-only trees/folding, neutral actions,
   assert.ok(network.some(url => url.endsWith('/vendor/editors/editors.js'))); assert.ok(network.every(url => url.startsWith(origin + '/'))); assert.deepEqual(errors, []);
   fs.writeFileSync(path.join(testOutput(), 'editors-geometry.json'), JSON.stringify(geometry, null, 2));
 });
-test('HTML card, modal actions, sequential stage guards and desktop/mobile geometry', { timeout: 60000 }, async t => {
+browserTest('HTML card, modal actions, sequential stage guards and desktop/mobile geometry', { timeout: 60000 }, async t => {
   const fixture = await fixtureServer(t), ctx = completed(t, { mediaDownload: fixture.fetchAsset }), server = createServer(ctx.queue);
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); t.after(() => { server.closeAllConnections(); server.close(); });
   const browser = await chromium.launch({ channel: 'chrome', headless: true }); t.after(() => browser.close()); const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = []; page.on('pageerror', e => errors.push(e.message)); page.setDefaultTimeout(5000);
@@ -725,3 +805,4 @@ test('HTML card, modal actions, sequential stage guards and desktop/mobile geome
   assert.equal(await page.locator('#stage-two-panel button').count(), 1 + await page.getByRole('button', { name: /^Открыть изображение/ }).count(), 'only HTML and image cards, no duplicate control buttons');
   assert.deepEqual(errors, []);
 });
+if (browserCaseCount !== 8) throw new Error(`Expected 8 explicitly marked HTML media browser cases, found ${browserCaseCount}`);

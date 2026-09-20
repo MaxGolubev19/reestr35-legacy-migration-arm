@@ -4,7 +4,8 @@ const path = require('node:path');
 const http = require('node:http');
 const crypto = require('node:crypto');
 const { APP_ROOT } = require('../data-dir.cjs');
-const { safeFile } = require('../infrastructure/files.cjs');
+const { safeFile, stableRead } = require('../infrastructure/files.cjs');
+const { extensions, mediaMime, verifiedRasterMime } = require('../infrastructure/media.cjs');
 const { attemptDir } = require('../pipeline/paths.cjs');
 const { origins: embedOrigins } = require('../../public/embed-policy.js');
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
@@ -31,9 +32,15 @@ function mediaPlaceholder(asset) {
   let name = 'Медиа';
   if (asset.originalUrl || asset.bigUrl) { const filename = new URL(asset.originalUrl || asset.bigUrl).pathname.split('/').at(-1); if (filename) { try { name = decodeURIComponent(filename); } catch { name = filename; } } }
   const label = (asset.alt || name).slice(0, 80), hue = parseInt(crypto.createHash('sha256').update(asset.id).digest('hex').slice(0, 4), 16) % 360;
-  return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" role="img" aria-label="${xml(label)}"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="hsl(${hue} 70% 34%)"/><stop offset="1" stop-color="hsl(${(hue + 45) % 360} 75% 17%)"/></linearGradient></defs><rect width="800" height="450" fill="url(#g)"/><path d="M0 360 180 210l105 90 125-140 230 200 80-70 80 70v90H0z" fill="white" opacity=".18"/><circle cx="650" cy="105" r="48" fill="white" opacity=".2"/><text x="40" y="385" fill="white" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="600">${xml(name.slice(0, 42))}</text><text x="40" y="420" fill="white" opacity=".8" font-family="Segoe UI,Arial,sans-serif" font-size="18">Mori Cinema · локальный макет медиа</text></svg>`);
+  return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" role="img" aria-label="${xml(label)}"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="hsl(${hue} 70% 34%)"/><stop offset="1" stop-color="hsl(${(hue + 45) % 360} 75% 17%)"/></linearGradient></defs><rect width="800" height="450" fill="url(#g)"/><path d="M0 360 180 210l105 90 125-140 230 200 80-70 80 70v90H0z" fill="white" opacity=".18"/><circle cx="650" cy="105" r="48" fill="white" opacity=".2"/><text x="40" y="385" fill="white" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="600">${xml(name.slice(0, 42))}</text><text x="40" y="420" fill="white" opacity=".8" font-family="Segoe UI,Arial,sans-serif" font-size="18">Предпросмотр изображения недоступен</text></svg>`);
 }
-const INLINE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp']);
+const INLINE_IMAGES = new Set(Object.keys(extensions));
+function readMediaObject(queue, dir, item) {
+  if (!/^[a-f0-9]{64}$/.test(item.sha256) || item.object !== `objects/${item.sha256}`) throw new Error('Object identity mismatch');
+  const bytes = stableRead(safeFile(queue.root, safeFile(dir, path.join(dir, item.object))), queue.stage.media.limits.maxFileBytes);
+  if (bytes.length !== item.bytes || crypto.createHash('sha256').update(bytes).digest('hex') !== item.sha256) throw new Error('Object checksum mismatch');
+  return { bytes, mime: verifiedRasterMime(item, bytes) };
+}
 function pageBuilderMediaFile(queue, job, asset, kind = 'original', attemptNumber) {
   const reference = asset[`${kind}Media`];
   if (reference) return queue.mediaPicker.resolve(job.id, reference, asset[`${kind}Url`]);
@@ -42,11 +49,13 @@ function pageBuilderMediaFile(queue, job, asset, kind = 'original', attemptNumbe
   let manifest;
   try { manifest = queue.stage.media.read(job, attempt, true); } catch { return null; }
   const urls = new Set([asset[`${kind}Url`]].filter(Boolean));
-  const item = manifest.resources.find(resource => resource.status === 'downloaded' && INLINE_IMAGES.has(resource.mime)
+  const item = manifest.resources.find(resource => resource.status === 'downloaded' && INLINE_IMAGES.has(mediaMime(resource))
     && [resource.originalUrl, resource.resolvedUrl, resource.finalUrl].some(value => urls.has(value)));
   if (!item) return null;
   const dir = queue.stage.media.directory(job, attempt);
-  return { file: safeFile(queue.root, safeFile(dir, path.join(dir, item.object))), mime: item.mime };
+  const local = readMediaObject(queue, dir, item);
+  if (!local.mime) throw new Error('Object MIME mismatch');
+  return local;
 }
 
 function createServer(queue, { onShutdown = async () => {} } = {}) {
@@ -207,9 +216,10 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         const source = media[4] === 'source', item = source ? null : manifest.resources.find(r => r.status === 'downloaded' && r.object === media[4]);
         if (!source && !item) return json(res, 404, { error: 'Object не входит в manifest' });
         const file = safeFile(queue.root, safeFile(dir, path.join(dir, source ? 'source.html' : item.object)));
-        const inlineImage = item && INLINE_IMAGES.has(item.mime);
+        const local = item ? readMediaObject(queue, dir, item) : null, inlineImage = !!local?.mime;
         res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'");
-        res.writeHead(200, { 'Content-Type': inlineImage ? item.mime : 'application/octet-stream', 'Content-Disposition': `${inlineImage ? 'inline' : 'attachment'}; filename="${source ? 'source.html' : item.sha256}"` });
+        res.writeHead(200, { 'Content-Type': inlineImage ? local.mime : 'application/octet-stream', 'Content-Disposition': `${inlineImage ? 'inline' : 'attachment'}; filename="${source ? 'source.html' : item.sha256}"` });
+        if (local) { res.end(local.bytes); return; }
         const stream = fs.createReadStream(file); stream.on('error', () => res.destroy()); stream.pipe(res); return;
       }
       const logs = url.pathname.match(/^\/api\/logs\/([a-f0-9-]{36})\/([1-9][0-9]*)$/);

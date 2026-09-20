@@ -4,7 +4,7 @@ const { HtmlMediaStage } = require('./html-media/index.cjs');
 class Workflow extends CaptureQaStage {
   constructor(queue, options) { super(queue, options); this.media = new HtmlMediaStage(queue, options); }
   afterQa(job, attempt) {
-    if (job.attempts.at(-1) !== attempt || attempt.workflow !== 2 || !attempt.captureSealed || attempt.status !== 'complete' || attempt.phase === 'html-media' || !this.launchFinished(job, attempt)) return false;
+    if (job.attempts.at(-1) !== attempt || attempt.workflow !== 2 || !attempt.captureSealed || attempt.finalizationError || attempt.status !== 'complete' || attempt.phase === 'html-media' || !this.launchFinished(job, attempt)) return false;
     this.media.enter(job, attempt); return true;
   }
   restoreAttempt(job, attempt) { if (attempt.phase === 'html-media') { this.captureIntegrity(job, attempt); return this.media.restore(job, attempt); } super.restoreAttempt(job, attempt); this.afterQa(job, attempt); }

@@ -32,6 +32,7 @@ class PageQueue {
     Object.assign(this.runtime.env, { TMP: tempDir, TEMP: tempDir, TMPDIR: tempDir });
     this.stateFile = path.join(root, 'state.json');
     this.active = new Map();
+    this.pendingFinalizations = new Map();
     this.closing = false;
     if (typeof stageFactory !== 'function') throw new Error('PageQueue requires a stageFactory');
     this.stage = stageFactory(this, stageOptions);
@@ -50,6 +51,7 @@ class PageQueue {
         if (!Number.isInteger(attempt.number) || attempt.number < 1) throw new Error('Некорректная попытка');
         restoreDuration(attempt);
         this.stage.restoreAttempt(job, attempt);
+        if (attempt.finalizationError) attempt.status = 'interrupted';
       }
     }
     this.save();
@@ -94,15 +96,22 @@ class PageQueue {
     if (entries.length > 200) throw new Error('Не более 200 URL за один запрос');
     const result = { added: [], duplicates: [], invalid: [] };
     const known = new Set(this.jobs.map(job => job.url));
-    for (const input of entries) {
-      let url;
-      try { url = normalizeUrl(input); } catch (error) { result.invalid.push({ input, error: error.message }); continue; }
-      if (known.has(url)) { result.duplicates.push(url); continue; }
-      const job = { id: crypto.randomUUID(), url, createdAt: now(), attempts: [] };
-      this.newAttempt(job);
-      this.jobs.push(job); known.add(url); this.save(); result.added.push(job.id);
+    const prepared = [], previousCount = this.jobs.length, previousOrder = this.nextQueueOrder;
+    try {
+      for (const input of entries) {
+        let url;
+        try { url = normalizeUrl(input); } catch (error) { result.invalid.push({ input, error: error.message }); continue; }
+        if (known.has(url)) { result.duplicates.push(url); continue; }
+        const job = { id: crypto.randomUUID(), url, createdAt: now(), attempts: [] };
+        this.newAttempt(job);
+        prepared.push(job); known.add(url); result.added.push(job.id);
+      }
+      if (prepared.length) { this.jobs.push(...prepared); this.save(); }
+    } catch (error) {
+      // Directories remain reserved evidence even when the entire batch is rejected.
+      this.jobs.splice(previousCount); this.nextQueueOrder = previousOrder;
+      throw error;
     }
-    this.save();
     if (this.autoStart) this.pump();
     return result;
   }
@@ -124,8 +133,11 @@ class PageQueue {
   get(id) { const job = this.jobs.find(item => item.id === id); if (!job) throw Object.assign(new Error('Задание не найдено'), { statusCode: 404 }); return job; }
   retry(id) {
     const job = this.get(id);
+    if (this.pendingFinalizations.has(id)) throw conflict('Завершение попытки ещё не сохранено; запись будет повторена.');
     if (!(TERMINAL.has(last(job).status) || last(job).status === 'paused') || this.active.has(id) || !this.stage.launchFinished(job, last(job))) throw conflict('Повтор доступен после доказанного завершения текущей попытки');
-    this.newAttempt(job); this.save(); if (this.autoStart) this.pump();
+    this.newAttempt(job);
+    try { this.save(); } catch (error) { job.attempts.pop(); throw error; }
+    if (this.autoStart) this.pump();
   }
   pause(id) {
     const job = this.get(id), attempt = last(job);
@@ -136,22 +148,29 @@ class PageQueue {
   }
   resume(id) {
     const job = this.get(id), attempt = last(job);
+    if (this.pendingFinalizations.has(id)) throw conflict('Завершение попытки ещё не сохранено; запись будет повторена.');
     if (!['paused', 'interrupted'].includes(attempt.status) || this.active.has(id)) throw conflict('Возобновление доступно для приостановленной или прерванной попытки.');
     try { this.stage.validateResume(job, attempt); } catch (error) { throw conflict(error.message); }
     const previous = structuredClone(attempt);
     Object.assign(attempt, { status: 'queued', queuedAt: now(), queueOrder: ++this.nextQueueOrder });
     this.stage.prepareResume(attempt);
+    delete attempt.finalizationError;
     try { this.save(); } catch (error) { Object.assign(attempt, previous); throw error; }
     if (this.autoStart) this.pump();
   }
   pump() {
     if (this.closing) return;
+    for (const [id, finalize] of this.pendingFinalizations || []) {
+      if (!finalize()) return;
+      this.pendingFinalizations.delete(id);
+    }
     this.stage.recoverPending();
-    for (const job of this.jobs) this.stage.recoverJob(job);
+    for (const job of this.jobs) if (!last(job).finalizationError) this.stage.recoverJob(job);
     while (this.active.size + this.stage.occupiedSlots() < this.concurrency) {
       const queued = this.jobs.filter(job => last(job).status === 'queued' && this.stage.isRunnable(last(job), this.clock())).sort((a, b) => last(a).queueOrder - last(b).queueOrder);
       if (!queued.length) return;
       this.launch(queued[0]);
+      if (this.pendingFinalizations?.size) return;
     }
   }
   launch(job) { return this.stage.start(job, last(job)); }
@@ -203,12 +222,15 @@ class PageQueue {
   }
   snapshot(csrfToken) {
     this.stage.refreshSnapshot();
-    return { csrfToken, concurrency: this.concurrency, jobs: this.jobs.map(job => ({ ...job, status: last(job).status,
-      ...this.stage.jobProjection(job),
-      ...(this.pageBuilder ? { pageBuilder: this.pageBuilder.summary(job.id) } : {}),
-      isActive: this.active.has(job.id) && this.active.get(job.id).exitCode === null,
-      attempts: job.attempts.map(attempt => ({ ...attempt, ...(this.pageBuilder ? { pageBuilder: this.pageBuilder.summary(job.id, attempt.number) } : {}), files: (attempt.files || []).map(file => ({ ...file,
-        url: `/api/files/${job.id}/${attempt.number}/${encodeURIComponent(file.name)}` })) })) })) };
+    return { csrfToken, concurrency: this.concurrency, jobs: this.jobs.map(job => {
+      const projection = this.stage.jobProjection(job);
+      const attempts = job.attempts.map(attempt => ({ ...attempt, ...(this.pageBuilder ? { pageBuilder: this.pageBuilder.summary(job.id, attempt.number) } : {}), files: (attempt.files || []).map(file => ({ ...file,
+        url: `/api/files/${job.id}/${attempt.number}/${encodeURIComponent(file.name)}` })) }));
+      return { ...job, status: last(job).status, ...projection,
+        ...(this.pendingFinalizations.has(job.id) ? { canContinueQa: false, canResume: false, canPause: false, canRecapture: false } : {}),
+        ...(this.pageBuilder ? { pageBuilder: attempts.at(-1).pageBuilder } : {}),
+        isActive: this.active.has(job.id) && this.active.get(job.id).exitCode === null, attempts };
+    }) };
   }
 }
 module.exports = { PageQueue };

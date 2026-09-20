@@ -8,13 +8,18 @@ const suites = {
   full: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder', 'ui', 'capture', 'capture-resume', 'portability', 'cli-isolation'],
   backend: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder'],
   'html-media': ['html-media'],
-  ui: ['ui'], capture: ['capture', 'capture-resume'], portability: ['portability'], cli: ['cli-isolation'],
+  ui: ['html-media', 'ui'], capture: ['capture', 'capture-resume'], portability: ['portability'], cli: ['cli-isolation'],
+  native: ['native-media-dialog'],
+  'beget-contract': ['beget-contract.integration'],
 };
 function configuration(suite = 'full', environment = process.env) {
   if (!Object.hasOwn(suites, suite)) throw new Error(`Unknown test suite: ${suite}`);
   const runtime = resolveRuntime();
   const root = dataRoot(environment), temp = dataSubdir('tmp', root);
-  const env = { ...runtime.env, ...environment, TMP: temp, TEMP: temp, TMPDIR: temp };
+  const env = { ...runtime.env, ...environment, TMP: temp, TEMP: temp, TMPDIR: temp,
+    ARM_TEST_HTML_MEDIA_CASES: suite === 'backend' ? 'backend' : suite === 'ui' ? 'browser' : 'all',
+    ARM_TEST_NATIVE_DIALOG: suite === 'native' ? '1' : '0',
+    ARM_TEST_BEGET_CONTRACT: suite === 'beget-contract' ? '1' : '0' };
   // Pass the environment before Node workers import Playwright: its temporary
   // browser profiles and artifacts must use the same portable data directory.
   return { command: runtime.node, args: ['--test', ...suites[suite].map(name => path.join(__dirname, `${name}.test.cjs`))],

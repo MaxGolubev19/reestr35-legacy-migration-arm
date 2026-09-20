@@ -1,9 +1,7 @@
 'use strict';
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { stableRead } = require('../../infrastructure/files.cjs');
-const { validateContent } = require('../html-media/download.cjs');
-const extensions = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/avif': 'avif', 'image/bmp': 'bmp' };
+const { verifiedRasterMime, extensions, mediaMime, detectLegacyImages, checkedPath, readChecked, filename, provenance } = require('../../infrastructure/media.cjs');
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
 const dialogScript = `
@@ -207,33 +205,6 @@ class WindowsDialogWorker {
   }
   async shutdown() { this.closed = true; await this.stopCurrent(); }
 }
-// Reject all links (including links that point back inside the root). Recheck
-// around the descriptor-based read so a path substitution cannot grant access.
-function checkedPath(root, target) {
-  const base = path.resolve(root), absolute = path.resolve(target), relative = path.relative(base, absolute);
-  if (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) throw new Error('Файл вне разрешённой папки шага 2');
-  let current = base;
-  for (const part of ['', ...relative.split(path.sep)]) {
-    if (part) current = path.join(current, part);
-    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('Ссылки и junction в папке медиа запрещены');
-  }
-  if (fs.realpathSync(absolute).toLowerCase() !== absolute.toLowerCase()) throw new Error('Подмена пути медиа');
-  return absolute;
-}
-function readChecked(root, file, limit) {
-  const checked = checkedPath(root, file), bytes = stableRead(checked, limit);
-  checkedPath(root, file); return bytes;
-}
-function filename(item) {
-  let basename = 'image';
-  try { basename = decodeURIComponent(new URL(item.resolvedUrl || item.originalUrl).pathname.split('/').at(-1) || 'image'); } catch {}
-  basename = basename.replace(/\.[^.]*$/, '').replace(/[^\p{L}\p{N}_-]+/gu, '-').slice(0, 70) || 'image';
-  return `${basename}-${item.sha256.slice(0, 16)}.${extensions[item.mime]}`;
-}
-function provenance(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'attempt,filename,revision,sha256' || !Number.isSafeInteger(value.attempt) || value.attempt < 1 || !Number.isSafeInteger(value.revision) || value.revision < 1 || !/^[a-f0-9]{64}$/.test(value.sha256) || typeof value.filename !== 'string' || !/^[\p{L}\p{N}_-]+\.(png|jpg|gif|webp|avif|bmp)$/u.test(value.filename) || value.filename.length > 100) throw new Error('Некорректное происхождение медиа');
-  return { attempt: value.attempt, revision: value.revision, sha256: value.sha256, filename: value.filename };
-}
 class MediaPicker {
   constructor(queue) { this.queue = queue; this.tokens = new Map(); this.dialogWorker = new WindowsDialogWorker(); this.openDialog = (directory, signal) => this.dialogWorker.choose(directory, signal); this.dialogBusy = false; this.dialogChild = null; this.dialogPromise = null; this.dialogAbort = null; }
   warmup() { return this.dialogWorker.start(); }
@@ -251,11 +222,12 @@ class MediaPicker {
     const dir = this.queue.stage.media.directory(job, attempt, ref.revision);
     const manifest = JSON.parse(readChecked(this.queue.root, path.join(dir, 'manifest.json'), 24 * 1024 * 1024));
     if (manifest.jobId !== job.id || manifest.attempt !== ref.attempt || manifest.revision !== ref.revision) throw new Error('Происхождение manifest изменено');
-    const item = manifest.resources.find(item => item.status === 'downloaded' && extensions[item.mime] && item.sha256 === ref.sha256 && filename(item) === ref.filename && (!url || [item.originalUrl, item.resolvedUrl, item.finalUrl].includes(url)));
+    detectLegacyImages(this.queue.root, dir, manifest.resources, this.queue.stage.media.limits.maxFileBytes);
+    const item = manifest.resources.find(item => item.status === 'downloaded' && extensions[mediaMime(item)] && item.sha256 === ref.sha256 && filename(item) === ref.filename && (!url || [item.originalUrl, item.resolvedUrl, item.finalUrl].includes(url)));
     if (!item || item.object !== `objects/${ref.sha256}`) throw new Error('Изображение не входит в manifest шага 2');
     const bytes = readChecked(this.queue.root, path.join(dir, item.object), this.queue.stage.media.limits.maxFileBytes);
-    if (bytes.length !== item.bytes || hash(bytes) !== ref.sha256 || !validateContent(item.mime, bytes.subarray(0, 4096))) throw new Error('Изображение изменено или не соответствует SHA/MIME');
-    return { bytes, mime: item.mime, url: item.resolvedUrl || item.originalUrl, dir };
+    if (bytes.length !== item.bytes || hash(bytes) !== ref.sha256 || !verifiedRasterMime(item, bytes)) throw new Error('Изображение изменено или не соответствует SHA/MIME');
+    return { bytes, mime: mediaMime(item), url: item.resolvedUrl || item.originalUrl, dir };
   }
   selectionContext(jobId, request) {
     if (this.closed || this.queue.closing) throw conflict('Приложение завершает работу; выбор изображения недоступен');
@@ -266,7 +238,8 @@ class MediaPicker {
     const manifestBytes = readChecked(this.queue.root, path.join(dir, 'manifest.json'), 24 * 1024 * 1024);
     const manifest = JSON.parse(manifestBytes);
     if (manifest.jobId !== job.id || manifest.attempt !== attempt.number || manifest.revision !== revision) throw conflict('Медиа шага 2 изменились; откройте редактор снова');
-    return { job, attempt, revision, dir, manifest, manifestHash: hash(manifestBytes) };
+    const legacyImages = detectLegacyImages(this.queue.root, dir, manifest.resources, this.queue.stage.media.limits.maxFileBytes);
+    return { job, attempt, revision, dir, manifest, legacyImages, manifestHash: hash(manifestBytes) };
   }
   assertCurrent(jobId, request, selected) {
     const current = this.context(jobId, request.revision, request.attempt);
@@ -274,6 +247,9 @@ class MediaPicker {
   }
   async pickPrepared(jobId, request, requestSignal) {
     const selected = this.selectionContext(jobId, request);
+    this.assertCurrent(jobId, request, selected);
+    if (requestSignal?.aborted) throw abortedDialog();
+    this.queue.stage.media.prepareLegacyImages(selected.job, selected.attempt, selected.legacyImages);
     const target = path.join(selected.dir, 'images');
     if (!fs.existsSync(target)) throw new Error('Папка изображений не найдена; откройте редактор снова');
     const directory = checkedPath(this.queue.root, target);
@@ -309,9 +285,9 @@ class MediaPicker {
     const selected = this.selectionContext(jobId, request);
     if (typeof name !== 'string' || !/^[\p{L}\p{N}_-]+\.(png|jpg|gif|webp|avif|bmp)$/u.test(name) || name.length > 100) throw new Error('Файл не входит в список изображений шага 2');
     if (!Buffer.isBuffer(bytes) || !bytes.length || bytes.length > this.queue.stage.media.limits.maxFileBytes) throw new Error('Размер выбранного изображения недопустим');
-    const item = selected.manifest.resources.find(value => value.status === 'downloaded' && extensions[value.mime] && filename(value) === name);
+    const item = selected.manifest.resources.find(value => value.status === 'downloaded' && extensions[mediaMime(value)] && filename(value) === name);
     if (!item) throw new Error('Файл не входит в список изображений шага 2');
-    if (bytes.length !== item.bytes || hash(bytes) !== item.sha256 || !validateContent(item.mime, bytes.subarray(0, 4096))) throw new Error('Выбранное изображение не совпадает с медиа шага 2');
+    if (bytes.length !== item.bytes || hash(bytes) !== item.sha256 || !verifiedRasterMime(item, bytes)) throw new Error('Выбранное изображение не совпадает с медиа шага 2');
     const ref = { attempt: selected.attempt.number, revision: selected.revision, sha256: item.sha256, filename: name };
     const verified = this.resolve(jobId, ref);
     this.assertCurrent(jobId, request, selected);

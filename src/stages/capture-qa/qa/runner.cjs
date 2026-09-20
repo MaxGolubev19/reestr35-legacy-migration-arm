@@ -12,6 +12,61 @@ const { buildQaPrompt, isCurrentPolicy } = require('./policy.cjs');
 const now = () => new Date().toISOString();
 const last = job => job.attempts.at(-1);
 
+function cleanupQa(attempt, qaDir) {
+  if (!qaDir) return;
+  try { fs.rmSync(qaDir, { recursive: true, force: true }); }
+  catch (error) {
+    attempt.qaCleanupError = `Не удалось удалить временный каталог QA: ${error.message}`;
+    console.error(attempt.qaCleanupError);
+  }
+}
+
+// Checkpoints and completion authority are independent of result/state projections.
+// Retry required writes before allowing the scheduler to dispatch more work.
+function finalizeQa(queue, job, attempt, p, qaDir) {
+  cleanupQa(attempt, qaDir);
+  const previousError = attempt.error;
+  let result, resultWritten = false, advanced = false, finalStatus, closeMessage;
+  const finalize = () => {
+    let operation = 'result';
+    try {
+      if (!result) {
+        queue.stage.refreshArtifacts(job, attempt);
+        attempt.status = attempt.cancellationRequested ? 'cancelled' : attempt.pauseRequested ? 'paused' : queue.stage.outcome(job, attempt);
+        result = structuredClone(attempt);
+      }
+      if (!resultWritten) { atomicJson(path.join(p.dir, 'result.json'), result); resultWritten = true; }
+      delete attempt.finalizationError;
+      operation = 'transition';
+      if (!advanced) {
+        attempt.status = result.status;
+        queue.stage.afterQa?.(job, attempt);
+        finalStatus = attempt.status; advanced = true;
+      }
+      attempt.status = finalStatus;
+      if (attempt.error === closeMessage) {
+        if (previousError) attempt.error = previousError; else delete attempt.error;
+      }
+      operation = 'state';
+      queue.save();
+      return true;
+    } catch (error) {
+      const message = `Завершение QA (${operation}) не сохранено; запись будет повторена: ${error.message}`;
+      if (message !== closeMessage) console.error(message);
+      closeMessage = message;
+      attempt.status = 'interrupted'; attempt.error = message;
+      attempt.finalizationError = { operation, message: error.message };
+      try { queue.save(); } catch (failure) { attempt.finalizationError.stateError = failure.message; }
+      return false;
+    }
+  };
+  queue.pendingFinalizations.set(job.id, finalize);
+  if (finalize()) {
+    queue.pendingFinalizations.delete(job.id);
+    try { queue.pump(); } catch (error) { console.error('QA queue continuation:', error.message); }
+  }
+}
+
 // Executes one QA pass. A checkpoint is durable before its tool acknowledgement.
 function launchQa(queue, job, attempt) {
     const p = paths(queue.root, job, attempt), qa = queue.stage.qaState(job, attempt);
@@ -19,7 +74,7 @@ function launchQa(queue, job, attempt) {
     try {
       const evidence = checkManifest(queue.root, job, attempt, qa.manifest);
       session = nextReview(qa.manifest, qa.progress);
-      if (!session) { attempt.status = queue.stage.outcome(job, attempt); queue.stage.afterQa?.(job, attempt); queue.save(); return; }
+      if (!session) { finalizeQa(queue, job, attempt, p); return; }
       const progress = { ...qa.progress, generation: session.generation, policy: session.policy };
       atomicJson(p.progress, progress); qa.progress = progress;
       qaDir = stageBatch(p.hostDir, session, queue.root);
@@ -62,7 +117,12 @@ function launchQa(queue, job, attempt) {
         onLog: text => fs.appendFileSync(path.join(p.dir, 'stderr.log'), text),
       });
       child.armLaunch = launch; child.armInterrupt = () => child.interrupt(); queue.active.set(job.id, child);
-      const monitor = queue.setTimer(() => queue.tick(job, attempt, child).catch(error => { if (queue.stage.ownsStopCompletion(job, attempt, child)) { attempt.error = error.message; queue.save(); } }), Math.min(1000, queue.idleTimeoutMs));
+      const monitor = queue.setTimer(() => queue.tick(job, attempt, child).catch(error => {
+        if (queue.stage.ownsStopCompletion(job, attempt, child)) {
+          attempt.error = error.message;
+          try { queue.save(); } catch (failure) { console.error('QA monitor state:', failure.message); }
+        }
+      }), Math.min(1000, queue.idleTimeoutMs));
       monitor?.unref?.(); queue.monitors.set(job.id, monitor);
       child.once('close', code => {
         queue.qaServers.delete(appServer);
@@ -77,16 +137,17 @@ function launchQa(queue, job, attempt) {
         attempt.exitCode = code; attempt.finishedAt = now();
         if (child.failure) attempt.error = child.failure.message;
         queue.stage.launchFinished(job, attempt);
-        queue.stage.refreshArtifacts(job, attempt);
-        attempt.status = attempt.cancellationRequested ? 'cancelled' : attempt.pauseRequested ? 'paused' : queue.stage.outcome(job, attempt);
-        fs.rmSync(qaDir, { recursive: true, force: true });
-        atomicJson(path.join(p.dir, 'result.json'), attempt); queue.stage.afterQa?.(job, attempt); queue.save(); queue.pump();
+        finalizeQa(queue, job, attempt, p, qaDir);
       });
     } catch (error) {
       if (appServer && !queue.active.has(job.id)) appServer.shutdown().finally(() => queue.qaServers.delete(appServer)).catch(failure => console.error('QA shutdown:', failure.message));
-      if (qaDir && !queue.active.has(job.id)) fs.rmSync(qaDir, { recursive: true, force: true });
-      if (launch && !queue.active.has(job.id)) publishLease(p.dir, launch, { status: 'finished', proof: 'qa-setup-failed', finishedAt: now() });
-      attempt.error = error.message; attempt.status = queue.stage.outcome(job, attempt); attempt.finishedAt = now(); queue.save();
+      if (!queue.active.has(job.id)) cleanupQa(attempt, qaDir);
+      if (launch && !queue.active.has(job.id)) {
+        try { publishLease(p.dir, launch, { status: 'finished', proof: 'qa-setup-failed', finishedAt: now() }); }
+        catch (failure) { attempt.error = `QA setup lease: ${failure.message}; ${error.message}`; }
+      }
+      attempt.error ||= error.message; attempt.status = 'interrupted'; attempt.finishedAt = now();
+      try { queue.save(); } catch (failure) { console.error('QA setup state:', failure.message); }
     }
 }
 module.exports = { launchQa };

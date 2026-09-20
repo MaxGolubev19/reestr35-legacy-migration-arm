@@ -55,7 +55,7 @@ test('retry isolates documents, revisions, progress and media while historical a
 test('legacy migration binds to the last existing attempt before retry and preserves original bytes', async t => {
   const { queue, job } = await fixture(t, { existing: false });
   job.attempts[0].status = 'paused'; queue.retry(job.id);
-  const legacy = queue.pageBuilder.legacyFile(job.id), payload = { revision: 7, updatedAt: new Date().toISOString(), document: require('../src/stages/page-builder/store.cjs').sourceData() };
+  const legacy = queue.pageBuilder.legacyFile(job.id), payload = { revision: 7, updatedAt: new Date().toISOString(), document: require('./page-builder-fixture.cjs').sourceData() };
   fs.writeFileSync(legacy, JSON.stringify(payload)); const bytes = fs.readFileSync(legacy);
   job.attempts[1].status = 'paused'; queue.retry(job.id);
   assert.equal(queue.pageBuilder.read(job.id, { attempt: 2 }).revision, 7);
@@ -72,7 +72,7 @@ test('legacy migration binds to the last existing attempt before retry and prese
 test('interrupted legacy publication recovers its fixed owner without overwriting a conflicting target', async t => {
   const { queue, job } = await fixture(t, { existing: false });
   const store = queue.pageBuilder, legacy = store.legacyFile(job.id);
-  const payload = { revision: 4, updatedAt: new Date().toISOString(), document: require('../src/stages/page-builder/store.cjs').sourceData() };
+  const payload = { revision: 4, updatedAt: new Date().toISOString(), document: require('./page-builder-fixture.cjs').sourceData() };
   fs.writeFileSync(legacy, JSON.stringify(payload));
   const marker = path.join(store.root, job.id, 'legacy-binding.json'); fs.mkdirSync(path.dirname(marker), { recursive: true });
   const binding = { attempt: 1, sha256: crypto.createHash('sha256').update(fs.readFileSync(legacy)).digest('hex'), complete: false };
@@ -225,12 +225,12 @@ test('structural validation rejects duplicate block IDs, unknown types and overf
   assert.deepEqual(queue.pageBuilder.read(job.id), initial, 'invalid structures do not consume revision or alter disk');
 });
 
-test('canonical type catalog matches contract 1.0 views and defaults; scalar and media schemas reject invalid writes', async t => {
+test('portable type catalog has fixed IDs, views and defaults; scalar and media schemas reject invalid writes', async t => {
   const expected = { 'big-media': ['default', 'hero', 'compact'], table: ['default'], service: ['default', 'media-left', 'media-right', 'plain'], content: ['default', 'narrow', 'note'], grid: ['default', 'gallery', 'catalog', 'compact', 'promo', 'news', 'services', 'list'], 'data-table': ['default', 'compact'], links: ['links', 'documents'], sections: ['list', 'columns', 'contacts'], embed: ['default', 'wide', 'map'], 'rich-content': ['default', 'wide', 'compact'] };
   assert.deepEqual(Object.fromEntries(BLOCK_TYPES.map(type => [type.name, type.views])), expected);
+  assert.deepEqual(BLOCK_TYPES.map(({ name, id, default_view }) => ({ name, id, default_view })),
+    Object.entries(expected).map(([name, views], index) => ({ name, id: index + 1, default_view: views[0] })));
   assert.deepEqual(BLOCK_TYPES.map(type => type.label), ['Изображение / баннер', 'Таблица с текстом и изображениями', 'Описание услуги', 'Текст с изображениями', 'Карточки / галерея', 'Таблица данных', 'Ссылки и документы', 'Список разделов', 'Видео, карта или виджет', 'HTML-фрагмент']);
-  const source = path.resolve(__dirname, '../../../Beget/website/local/php_interface/config/company-block-contract.v1.json');
-  if (fs.existsSync(source)) { const contract = JSON.parse(fs.readFileSync(source)); assert.equal(contract.version, '1.0'); assert.deepEqual(BLOCK_TYPES.map(({ name, id, views, default_view }) => ({ name, id, views, default_view })), contract.types.map(({ name, id, views, default_view }) => ({ name, id, views, default_view }))); }
   const { queue, job } = await fixture(t), initial = queue.pageBuilder.read(job.id);
   for (const type of BLOCK_TYPES) for (const view of type.views) {
     const doc = structuredClone(initial.document), block = doc.common.blocks[0]; Object.assign(block, { type: type.name, view, text: 'Текст' }); if (type.name === 'rich-content') block.reason = 'Сохранение разметки';

@@ -1,8 +1,9 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
-const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
+const fs = require('node:fs'), path = require('node:path');
 const { PageQueue } = require('../src/pipeline/queue.cjs');
 const { testTempRoot } = require('./support.cjs');
+const { loadFormatDuration } = require('./duration-format.cjs');
 
 function setup(t, root, timestamp = 1000) {
   root ||= fs.mkdtempSync(path.join(testTempRoot(), 'duration-'));
@@ -57,9 +58,7 @@ test('legacy timestamps are never treated as active duration; preserved metadata
 });
 
 test('UI active duration freezes in paused/queued/complete and continues only a running interval', () => {
-  const source = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
-  const body = source.match(/function formatDuration\(attempt, timestamp = Date.now\(\)\) \{[\s\S]*?(?=\n  function renderDuration)/)[0];
-  const format = vm.runInNewContext(`${body}; formatDuration`);
+  const format = loadFormatDuration();
   const attempt = { activeDurationMs: 5000, activeSince: 10000, status: 'running' };
   assert.equal(format(attempt, 13000), '00:00:08');
   for (const status of ['paused', 'queued', 'complete']) assert.equal(format({ ...attempt, status }, 1000000), '00:00:05');

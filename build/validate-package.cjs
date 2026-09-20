@@ -20,6 +20,7 @@ const moduleFiles = [
   "src/infrastructure/files.cjs",
   "src/infrastructure/hash.cjs",
   "src/infrastructure/launcher.cjs",
+  "src/infrastructure/media.cjs",
   "src/infrastructure/process.cjs",
   "src/infrastructure/runtime.cjs",
   "src/infrastructure/server-lifecycle.cjs",

@@ -61,7 +61,7 @@ function start(t, count = 11, options = {}) { const ctx = setup(t, options); ctx
 function qa(ctx) { ctx.children[0].finish(0); const child = ctx.sessions.at(-1); child.bind(); return child; }
 function pass(child, count = child.config.files.length) { for (const file of child.config.files.slice(0, count)) child.record(file); }
 
-test('composed workflow enters paused HTML stage only after final QA process close and preserves capture result', t => {
+test('composed workflow pauses for missing HTML only after final QA process close and preserves capture result', t => {
   const ctx = start(t, 1, { stageFactory: require('../src/pipeline/registry.cjs').createStage });
   const child = qa(ctx); pass(child);
   assert.equal(ctx.attempt.phase, 'qa'); assert.equal(ctx.queue.snapshot('').jobs[0].isActive, true);
@@ -394,6 +394,77 @@ test('state projection failure after commit still acknowledges accepted durable 
   ctx.queue.save = () => { throw new Error('disk failure'); };
   assert.equal(child.record().reviewed, 1); assert.equal(loadQa(ctx.root, ctx.job, ctx.attempt).progress.checkpoints.length, 1); assert.equal(ctx.attempt.files.find(f => f.kind === 'png').qaStatus, 'passed');
   ctx.queue.save = save; child.finish(); assert.equal(ctx.attempt.status, 'complete');
+});
+
+test('QA close cleanup failure is diagnostic and still commits result/state and continues FIFO', t => {
+  const ctx = start(t, 1), child = qa(ctx); pass(child);
+  ctx.queue.add('https://next.reestr35.ru');
+  const original = fs.rmSync;
+  fs.rmSync = function(file, ...args) {
+    if (file === child.config.cwd) throw Object.assign(new Error('fixture cleanup EPERM'), { code: 'EPERM' });
+    return original.call(this, file, ...args);
+  };
+  try { assert.doesNotThrow(() => child.finish()); } finally { fs.rmSync = original; }
+  assert.equal(ctx.attempt.status, 'complete'); assert.match(ctx.attempt.qaCleanupError, /cleanup EPERM/);
+  assert.equal(ctx.queue.pendingFinalizations.size, 0); assert.equal(ctx.children.length, 2);
+  assert.equal(readLease(ctx.p.dir, readLaunch(ctx.p.dir)).status, 'finished');
+  assert.equal(loadQa(ctx.root, ctx.job, ctx.attempt).progress.checkpoints.length, 1);
+  const result = JSON.parse(fs.readFileSync(path.join(ctx.p.dir, 'result.json')));
+  assert.equal(result.status, 'complete'); assert.match(result.qaCleanupError, /cleanup EPERM/);
+  assert.equal(JSON.parse(fs.readFileSync(ctx.queue.stateFile)).jobs[0].attempts[0].status, 'complete');
+});
+
+test('QA close result/state failures retain completion and checkpoints and retry before dispatch', t => {
+  for (const operation of ['result', 'state']) {
+    const ctx = start(t, 1, { stageFactory: require('../src/pipeline/registry.cjs').createStage }), child = qa(ctx); pass(child);
+    ctx.queue.add('https://next.reestr35.ru');
+    const progress = fs.readFileSync(paths(ctx.root, ctx.job, ctx.attempt).progress);
+    const target = operation === 'state' ? ctx.queue.stateFile : path.join(ctx.p.dir, 'result.json'), original = fs.renameSync;
+    fs.renameSync = function(source, destination) {
+      if (destination === target) throw new Error(`fixture ${operation} failure`);
+      return original.call(this, source, destination);
+    };
+    try {
+      assert.doesNotThrow(() => child.finish());
+      assert.equal(ctx.attempt.status, 'interrupted'); assert.equal(ctx.attempt.finalizationError.operation, operation);
+      assert.equal(ctx.queue.active.size, 0); assert.equal(ctx.queue.monitors.size, 0); assert.equal(ctx.queue.pendingFinalizations.size, 1);
+      assert.equal(readLease(ctx.p.dir, readLaunch(ctx.p.dir)).status, 'finished');
+      assert.deepEqual(fs.readFileSync(paths(ctx.root, ctx.job, ctx.attempt).progress), progress);
+      assert.doesNotThrow(() => ctx.queue.pump()); assert.equal(ctx.children.length, 1);
+      const projected = ctx.queue.snapshot('').jobs[0];
+      assert.equal(projected.isActive, false); assert.equal(projected.canRecapture, false); assert.equal(projected.canResume, false);
+      assert.throws(() => ctx.queue.retry(ctx.job.id), { statusCode: 409 });
+      assert.throws(() => ctx.queue.resume(ctx.job.id), { statusCode: 409 });
+    } finally { fs.renameSync = original; }
+    ctx.queue.pump();
+    assert.equal(ctx.queue.pendingFinalizations.size, 0); assert.equal(ctx.children.length, 2);
+    assert.equal(ctx.attempt.phase, 'html-media'); assert.equal(ctx.attempt.status, 'paused');
+    assert.equal(ctx.attempt.finalizationError, undefined);
+    const result = JSON.parse(fs.readFileSync(path.join(ctx.p.dir, 'result.json')));
+    assert.equal(result.status, 'complete'); assert.equal(result.phase, 'qa');
+    assert.equal(JSON.parse(fs.readFileSync(ctx.queue.stateFile)).jobs[0].attempts[0].status, 'paused');
+    assert.deepEqual(fs.readFileSync(paths(ctx.root, ctx.job, ctx.attempt).progress), progress);
+  }
+});
+
+test('restart after QA result failure preserves diagnosis and resume reconstructs result without repeating reviews', t => {
+  const stageFactory = require('../src/pipeline/registry.cjs').createStage;
+  const ctx = start(t, 1, { stageFactory }), child = qa(ctx); pass(child);
+  const target = path.join(ctx.p.dir, 'result.json'), original = fs.renameSync;
+  fs.renameSync = function(source, destination) {
+    if (destination === target) throw new Error('fixture result restart');
+    return original.call(this, source, destination);
+  };
+  try { child.finish(); } finally { fs.renameSync = original; }
+  ctx.queue.closing = true;
+  const recovered = setup(t, { root: ctx.root, stageFactory }), job = recovered.queue.jobs[0], attempt = job.attempts[0];
+  assert.equal(attempt.status, 'interrupted'); assert.equal(attempt.finalizationError.operation, 'result');
+  assert.equal(attempt.phase, 'qa');
+  recovered.queue.pump(); assert.equal(recovered.sessions.length, 0); assert.equal(attempt.status, 'interrupted');
+  recovered.queue.resume(job.id); recovered.queue.pump();
+  assert.equal(attempt.status, 'paused'); assert.equal(attempt.phase, 'html-media'); assert.equal(recovered.sessions.length, 0);
+  assert.equal(JSON.parse(fs.readFileSync(target)).status, 'complete');
+  assert.equal(loadQa(ctx.root, job, attempt).progress.checkpoints.length, 1);
 });
 test('finished QA lease write/rename failure releases only proven completion, preserves checkpoints and retries publication', t => {
   for (const operation of ['writeFileSync', 'renameSync']) {
