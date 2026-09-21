@@ -16,17 +16,6 @@ async function body(req) {
   for await (const chunk of req) { size += chunk.length; if (size > 150 * 1024) throw new Error('Слишком большой запрос'); chunks.push(chunk); }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
-async function imageBody(req, limit) {
-  if (!/^application\/octet-stream(?:;|$)/i.test(req.headers['content-type'] || '')) throw Object.assign(new Error('Нужен application/octet-stream'), { statusCode: 415 });
-  if (Number(req.headers['content-length']) > limit) throw Object.assign(new Error('Изображение превышает допустимый размер'), { statusCode: 413 });
-  const chunks = []; let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > limit) throw Object.assign(new Error('Изображение превышает допустимый размер'), { statusCode: 413 });
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks, size);
-}
 const xml = value => String(value).replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[character]);
 function mediaPlaceholder(asset) {
   let name = 'Медиа';
@@ -35,6 +24,43 @@ function mediaPlaceholder(asset) {
   return Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" role="img" aria-label="${xml(label)}"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="hsl(${hue} 70% 34%)"/><stop offset="1" stop-color="hsl(${(hue + 45) % 360} 75% 17%)"/></linearGradient></defs><rect width="800" height="450" fill="url(#g)"/><path d="M0 360 180 210l105 90 125-140 230 200 80-70 80 70v90H0z" fill="white" opacity=".18"/><circle cx="650" cy="105" r="48" fill="white" opacity=".2"/><text x="40" y="385" fill="white" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="600">${xml(name.slice(0, 42))}</text><text x="40" y="420" fill="white" opacity=".8" font-family="Segoe UI,Arial,sans-serif" font-size="18">Предпросмотр изображения недоступен</text></svg>`);
 }
 const INLINE_IMAGES = new Set(Object.keys(extensions));
+function safeDownloadName(value) {
+  if (typeof value !== 'string') return null;
+  const name = value.trim();
+  if (!name || Buffer.byteLength(name, 'utf8') > 240 || /[\p{Cc}\p{Cf}\p{Cs}<>:"/\\|?*]/u.test(value)
+    || /^\.|[. ]$/.test(name) || /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name)) return null;
+  return name;
+}
+function downloadName(item) {
+  const declared = safeDownloadName(item.occurrence?.downloadFilename);
+  if (declared) return declared;
+  for (const value of [item.resolvedUrl, item.originalUrl]) {
+    try {
+      const name = safeDownloadName(decodeURIComponent(new URL(value).pathname.split('/').at(-1)));
+      if (name) return name;
+    } catch {}
+  }
+  const suffix = {
+    __proto__: null,
+    'application/pdf': 'pdf', 'text/plain': 'txt', 'text/csv': 'csv', 'application/rtf': 'rtf', 'text/rtf': 'rtf',
+    'application/msword': 'doc', 'application/vnd.ms-excel': 'xls', 'application/vnd.ms-powerpoint': 'ppt',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+    'application/zip': 'zip', 'application/x-zip-compressed': 'zip', 'application/gzip': 'gz',
+    'application/vnd.rar': 'rar', 'application/x-7z-compressed': '7z', 'application/x-tar': 'tar',
+    'audio/mpeg': 'mp3', 'audio/wav': 'wav', 'audio/ogg': 'ogg', 'video/ogg': 'ogg',
+    'video/mp4': 'mp4', 'audio/mp4': 'm4a', 'video/webm': 'webm', 'audio/webm': 'webm', 'video/quicktime': 'mov',
+    'image/svg+xml': 'svg', 'image/tiff': 'tiff', 'image/vnd.microsoft.icon': 'ico',
+  }[mediaMime(item)];
+  return `Файл${suffix ? '.' + suffix : ''}`;
+}
+function downloadDisposition(item) {
+  const name = downloadName(item), suffix = name.match(/\.[a-z0-9]{1,12}$/i)?.[0] || '';
+  const ascii = /^[a-z0-9 ._()-]+$/i.test(name) ? name : `file${suffix}`;
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16).toUpperCase());
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
 function readMediaObject(queue, dir, item) {
   if (!/^[a-f0-9]{64}$/.test(item.sha256) || item.object !== `objects/${item.sha256}`) throw new Error('Object identity mismatch');
   const bytes = stableRead(safeFile(queue.root, safeFile(dir, path.join(dir, item.object))), queue.stage.media.limits.maxFileBytes);
@@ -82,6 +108,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
       if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== `http://${host}`)) return json(res, 403, { error: 'Разрешён только локальный origin' });
       if (req.headers['sec-fetch-site'] === 'cross-site') return json(res, 403, { error: 'Cross-site запрос запрещён' });
       const url = new URL(req.url, `http://${host}`);
+      if (queue.stage.media.deletion.failed && !['/api/health', '/api/shutdown'].includes(url.pathname)) throw Object.assign(new Error('Удаление медиа требует восстановления при запуске'), { statusCode: 503 });
       const builderAttempt = (jobId, writing = false) => {
         const job = queue.get(jobId), value = url.searchParams.get('attempt');
         if (value === null && writing && job.attempts.length > 1) throw conflict('Требуется номер попытки шага 3');
@@ -104,35 +131,50 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
           req.setTimeout(60000, () => req.destroy());
           return json(res, 200, await queue.stage.media.upload(job, attempt, revision, req));
         }
-        const picker = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/pick-media$/);
-        if (picker) {
-          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Выбор разрешён только из локального интерфейса' });
-          const number = key => { const value = req.headers[key]; if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('Некорректный контекст выбора изображения'); return Number(value); };
-          const request = { revision: number('x-page-revision'), attempt: number('x-media-attempt'), htmlRevision: number('x-html-revision') };
-          const encoded = req.headers['x-image-name'];
-          if (typeof encoded !== 'string' || encoded.length > 1024) throw new Error('Некорректное имя изображения');
-          let name; try { name = decodeURIComponent(encoded); } catch { throw new Error('Некорректное имя изображения'); }
-          // Check CAS before accepting bytes, then check it again after the read.
-          queue.mediaPicker.selectionContext(picker[1], request);
+        const addFile = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/add-(image|document)$/);
+        if (addFile) {
+          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Добавление файла разрешено только из локального интерфейса' });
+          if (!/^application\/octet-stream(?:;|$)/i.test(req.headers['content-type'] || '')) return json(res, 415, { error: 'Нужен application/octet-stream' });
+          const number = key => { const value = req.headers[`x-${key}`]; if (typeof value !== 'string' || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('Некорректный контекст добавления файла'); return Number(value); };
+          const request = { attempt: number('attempt'), revision: number('builder-revision'), htmlRevision: number('html-revision') };
+          let name; try { name = decodeURIComponent(req.headers['x-file-name']); } catch { throw new Error('Некорректное имя файла'); }
           req.setTimeout(60000, () => req.destroy());
-          const bytes = await imageBody(req, queue.stage.media.limits.maxFileBytes);
-          return json(res, 200, queue.mediaPicker.choose(picker[1], request, name, bytes));
+          return json(res, 200, await queue.stage.media.addFile(addFile[1], request, name, addFile[2], req));
         }
         const data = await body(req);
-        const preparedMedia = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/pick-prepared-media$/);
-        if (preparedMedia) {
+        const deleteMedia = url.pathname.match(/^\/api\/html-media\/([a-f0-9-]{36})\/([1-9][0-9]*)\/([1-9][0-9]*)\/delete$/);
+        if (deleteMedia) {
+          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Удаление медиа разрешено только из локального интерфейса' });
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).sort().join(',') !== 'checkpoint,resourceId,revision') throw new Error('Некорректный запрос удаления медиа');
+          return json(res, 200, queue.stage.media.deletion.commit(deleteMedia[1], { ...data, attempt: Number(deleteMedia[2]), htmlRevision: Number(deleteMedia[3]) }));
+        }
+        const addFrame = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/add-frame$/);
+        if (addFrame) {
+          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Добавление фрейма разрешено только из локального интерфейса' });
+          if (!data || Object.keys(data).sort().join(',') !== 'attempt,code,htmlRevision,revision') throw new Error('Некорректный запрос добавления фрейма');
+          const { code, ...request } = data;
+          return json(res, 200, queue.stage.media.addFrame(addFrame[1], request, code));
+        }
+        const chooseDocument = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/choose-document$/);
+        if (chooseDocument) {
+          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Выбор документа разрешён только из локального интерфейса' });
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).sort().join(',') !== 'attempt,htmlRevision,resourceId,revision') throw new Error('Некорректный выбор документа');
+          const { resourceId, ...request } = data;
+          return json(res, 200, queue.documentPicker.choose(chooseDocument[1], request, resourceId));
+        }
+        const chooseFrame = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/choose-frame$/);
+        if (chooseFrame) {
+          if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Выбор фрейма разрешён только из локального интерфейса' });
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).sort().join(',') !== 'attempt,htmlRevision,resourceId,revision') throw new Error('Некорректный выбор фрейма');
+          const { resourceId, ...request } = data;
+          return json(res, 200, queue.framePicker.choose(chooseFrame[1], request, resourceId));
+        }
+        const chooseMedia = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/choose-media$/);
+        if (chooseMedia) {
           if (req.headers.origin !== `http://${host}` || req.headers['sec-fetch-site'] !== 'same-origin') return json(res, 403, { error: 'Выбор изображения разрешён только из локального интерфейса' });
-          const controller = new AbortController();
-          const disconnect = () => { if (!res.writableEnded) controller.abort(); };
-          res.once('close', disconnect);
-          try {
-            const selected = await queue.mediaPicker.pickPrepared(preparedMedia[1], data, controller.signal);
-            if (controller.signal.aborted || res.destroyed) return;
-            return json(res, 200, selected);
-          } catch (error) {
-            if (controller.signal.aborted || res.destroyed) return;
-            throw error;
-          } finally { res.removeListener('close', disconnect); }
+          if (!data || typeof data !== 'object' || Array.isArray(data) || !['attempt,htmlRevision,name,revision', 'attempt,htmlRevision,name,resourceId,revision'].includes(Object.keys(data).sort().join(','))) throw new Error('Некорректный выбор изображения');
+          const { name, resourceId, ...request } = data;
+          return json(res, 200, queue.mediaPicker.choose(chooseMedia[1], request, name, resourceId));
         }
         if (url.pathname === '/api/shutdown') {
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length) throw new Error('Этот запрос принимает только пустой JSON-объект');
@@ -153,11 +195,16 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
           if (!data || Object.keys(data).some(key => key !== 'urls')) throw new Error('Разрешено только поле urls');
           return json(res, 200, queue.add(data.urls));
         }
+        if (url.pathname === '/api/jobs/reorder') {
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length !== 2 ||
+              !Object.hasOwn(data, 'expected') || !Object.hasOwn(data, 'order')) throw new Error('Разрешены только expected и order');
+          return json(res, 200, queue.reorderJobs(data.expected, data.order));
+        }
         const pageBuilder = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})$/);
         if (pageBuilder) {
           queue.get(pageBuilder[1]);
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(key => !['revision', 'document'].includes(key)) || Object.keys(data).length !== 2) throw new Error('Разрешены только revision и document');
-          return json(res, 200, queue.pageBuilder.write(pageBuilder[1], data.revision, data.document, builderAttempt(pageBuilder[1], true)));
+          return json(res, 200, queue.framePicker.describeDocument(pageBuilder[1], queue.pageBuilder.write(pageBuilder[1], data.revision, data.document, builderAttempt(pageBuilder[1], true))));
         }
         const action = url.pathname.match(/^\/api\/jobs\/([a-f0-9-]{36})\/(retry|pause|resume|continue-qa)$/);
         if (action) {
@@ -178,8 +225,39 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         return;
       }
       if (url.pathname === '/api/state') return json(res, 200, queue.snapshot(csrfToken));
+      const deleteImpact = url.pathname.match(/^\/api\/html-media\/([a-f0-9-]{36})\/([1-9][0-9]*)\/([1-9][0-9]*)\/delete-impact$/);
+      if (deleteImpact) {
+        if ([...url.searchParams.keys()].sort().join(',') !== 'checkpoint,resourceId,revision') throw new Error('Некорректный контекст удаления медиа');
+        const request = { attempt: Number(deleteImpact[2]), htmlRevision: Number(deleteImpact[3]),
+          checkpoint: Number(url.searchParams.get('checkpoint')), resourceId: Number(url.searchParams.get('resourceId')), revision: Number(url.searchParams.get('revision')) };
+        return json(res, 200, queue.stage.media.deletion.impact(deleteImpact[1], request));
+      }
       const pageBuilder = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})$/);
-      if (pageBuilder) { const job = queue.get(pageBuilder[1]), number = builderAttempt(job.id), attempt = job.attempts.find(item => item.number === number); return json(res, 200, { ...queue.pageBuilder.read(job.id, { attempt: number }), mediaContext: { attempt: number, htmlRevision: attempt.htmlMedia?.revision || 0 } }); }
+      if (pageBuilder) { const job = queue.get(pageBuilder[1]), number = builderAttempt(job.id); return json(res, 200, queue.framePicker.describeDocument(job.id, queue.pageBuilder.read(job.id, { attempt: number }))); }
+      const frameCatalog = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/frame-catalog$/);
+      const documentCatalog = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/document-catalog$/);
+      if (documentCatalog) {
+        if ([...url.searchParams.keys()].sort().join(',') !== 'attempt,htmlRevision,revision') throw new Error('Некорректный контекст выбора документа');
+        const request = Object.fromEntries(['revision', 'attempt', 'htmlRevision'].map(key => [key, Number(url.searchParams.get(key))]));
+        return json(res, 200, queue.documentPicker.catalog(documentCatalog[1], request));
+      }
+      if (frameCatalog) {
+        if ([...url.searchParams.keys()].sort().join(',') !== 'attempt,htmlRevision,revision') throw new Error('Некорректный контекст выбора фрейма');
+        const request = Object.fromEntries(['revision', 'attempt', 'htmlRevision'].map(key => [key, Number(url.searchParams.get(key))]));
+        return json(res, 200, queue.framePicker.catalog(frameCatalog[1], request));
+      }
+      const catalog = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/media-catalog$/);
+      const catalogImage = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/catalog\/([^/]+)$/);
+      if (catalog || catalogImage) {
+        const number = key => { const value = url.searchParams.get(key); if (!value || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) throw new Error('Некорректный контекст выбора изображения'); return Number(value); };
+        const request = { revision: number('revision'), attempt: number('attempt'), htmlRevision: number('htmlRevision') };
+        const jobId = (catalog || catalogImage)[1];
+        if (catalog) return json(res, 200, queue.mediaPicker.catalog(jobId, request));
+        let name; try { name = decodeURIComponent(catalogImage[2]); } catch { throw new Error('Некорректное имя изображения'); }
+        const image = queue.mediaPicker.catalogImage(jobId, request, name, url.searchParams.has('resourceId') ? number('resourceId') : undefined);
+        res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'");
+        res.writeHead(200, { 'Content-Type': image.mime, 'Content-Disposition': 'inline', 'Content-Length': image.bytes.length }); res.end(image.bytes); return;
+      }
       const selectedMedia = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/selection\/([a-f0-9]{64})$/);
       if (selectedMedia) {
         const local = queue.mediaPicker.preview(selectedMedia[1], selectedMedia[2]);
@@ -213,12 +291,16 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
           let text; try { text = new TextDecoder(manifest.source.encoding || 'utf-8').decode(bytes); } catch { text = bytes.toString('utf8'); }
           return json(res, 200, { text });
         }
-        const source = media[4] === 'source', item = source ? null : manifest.resources.find(r => r.status === 'downloaded' && r.object === media[4]);
+        const source = media[4] === 'source', selectors = url.searchParams.getAll('resourceId');
+        if (selectors.length && (source || selectors.length !== 1 || !/^[1-9][0-9]*$/.test(selectors[0]) || !Number.isSafeInteger(Number(selectors[0])))) throw new Error('Некорректный resourceId');
+        const selectedId = selectors.length ? Number(selectors[0]) : null;
+        const item = source ? null : manifest.resources.find(r => r.status === 'downloaded' && r.object === media[4] && (selectedId === null || r.id === selectedId));
         if (!source && !item) return json(res, 404, { error: 'Object не входит в manifest' });
         const file = safeFile(queue.root, safeFile(dir, path.join(dir, source ? 'source.html' : item.object)));
         const local = item ? readMediaObject(queue, dir, item) : null, inlineImage = !!local?.mime;
         res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'");
-        res.writeHead(200, { 'Content-Type': inlineImage ? local.mime : 'application/octet-stream', 'Content-Disposition': `${inlineImage ? 'inline' : 'attachment'}; filename="${source ? 'source.html' : item.sha256}"` });
+        const disposition = source ? 'attachment; filename="source.html"' : inlineImage ? `inline; filename="${item.sha256}"` : downloadDisposition(item);
+        res.writeHead(200, { 'Content-Type': inlineImage ? local.mime : 'application/octet-stream', 'Content-Disposition': disposition });
         if (local) { res.end(local.bytes); return; }
         const stream = fs.createReadStream(file); stream.on('error', () => res.destroy()); stream.pipe(res); return;
       }

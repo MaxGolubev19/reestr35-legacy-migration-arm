@@ -50,7 +50,9 @@
     shutdownRequested: false,
     shutdownError: false,
     submitting: false,
-    pendingActions: new Map()
+    pendingActions: new Map(),
+    jobDragId: null,
+    jobReorderPending: false
   };
 
   const el = Object.fromEntries([
@@ -287,8 +289,10 @@
   }
 
   function renderJobs() {
+    if (state.jobDragId || state.jobReorderPending) return;
     const focused = el["jobs-body"].contains(document.activeElement) ? document.activeElement : null;
     const focusedWarning = focused?.dataset.jobWarning;
+    const focusedDrag = focused?.dataset.jobDrag;
     const focusedId = focused?.dataset.jobAction || focused?.dataset.jobSecondaryAction || focused?.dataset.jobSelect || focusedWarning;
     const focusedAction = Boolean(focused?.dataset.jobAction || focused?.dataset.jobSecondaryAction);
     const focusedOperation = focused?.dataset.action;
@@ -297,7 +301,7 @@
     if (!state.jobs.length) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
-      cell.colSpan = 2;
+      cell.colSpan = 3;
       cell.className = "text-secondary text-center py-5";
       cell.textContent = "Очередь пуста";
       row.append(cell);
@@ -313,6 +317,35 @@
       row.setAttribute("role", "button");
       row.setAttribute("aria-label", `Открыть результаты задания ${job.url || job.id}`);
       if (job.id === state.selectedJobId) row.classList.add("table-active");
+
+      const handleCell = document.createElement("td");
+      handleCell.className = "job-drag-cell";
+      const handle = document.createElement("button");
+      handle.type = "button";
+      handle.className = "job-drag-handle";
+      handle.draggable = true;
+      handle.dataset.jobDrag = job.id;
+      handle.setAttribute("aria-label", `Переставить задачу ${job.url || job.id}`);
+      handle.title = "Перетащить задачу; стрелки вверх и вниз меняют порядок";
+      handle.innerHTML = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 5h.01M15 5h.01M9 12h.01M15 12h.01M9 19h.01M15 19h.01"/></svg>';
+      handle.addEventListener("click", event => event.stopPropagation());
+      handle.addEventListener("keydown", event => {
+        event.stopPropagation();
+        if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+        event.preventDefault();
+        const rows = [...el["jobs-body"].querySelectorAll("tr[data-job-id]")];
+        const index = rows.findIndex(item => item.dataset.jobId === job.id);
+        const neighbour = rows[index + (event.key === "ArrowUp" ? -1 : 1)];
+        if (neighbour) void moveJob(job.id, neighbour.dataset.jobId, event.key === "ArrowDown", true);
+      });
+      handle.addEventListener("dragstart", event => {
+        if (state.jobReorderPending) { event.preventDefault(); return; }
+        state.jobDragId = job.id;
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", job.id);
+      });
+      handle.addEventListener("dragend", () => { state.jobDragId = null; renderJobs(); });
+      handleCell.append(handle);
 
       const urlCell = document.createElement("td");
       const url = document.createElement("span");
@@ -334,7 +367,24 @@
       statusCell.append(actions);
 
       statusCell.className = "text-end";
-      row.append(urlCell, statusCell);
+      row.append(handleCell, urlCell, statusCell);
+      row.addEventListener("dragover", event => {
+        if (!state.jobDragId || state.jobDragId === job.id) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        row.classList.toggle("job-drop-after", event.clientY > row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2);
+        row.classList.toggle("job-drop-before", !row.classList.contains("job-drop-after"));
+      });
+      row.addEventListener("dragleave", () => row.classList.remove("job-drop-before", "job-drop-after"));
+      row.addEventListener("drop", event => {
+        if (!state.jobDragId || state.jobDragId === job.id) return;
+        event.preventDefault(); event.stopPropagation();
+        const sourceId = state.jobDragId;
+        const after = event.clientY > row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2;
+        state.jobDragId = null;
+        row.classList.remove("job-drop-before", "job-drop-after");
+        void moveJob(sourceId, job.id, after, false);
+      });
       const select = () => selectJob(job.id);
       row.addEventListener("click", select);
       row.addEventListener("keydown", event => {
@@ -344,11 +394,39 @@
       });
       el["jobs-body"].append(row);
     });
+    if (focusedDrag) el["jobs-body"].querySelector(`[data-job-drag="${focusedDrag}"]`)?.focus({ preventScroll: true });
     if (focusedId) {
       const controls = [...el["jobs-body"].querySelectorAll("[data-job-action], [data-job-secondary-action], [data-job-select], [data-job-warning]")];
       const target = controls.find(control => (focusedWarning ? control.dataset.jobWarning : focusedAction ? (control.dataset.jobAction || control.dataset.jobSecondaryAction) : control.dataset.jobSelect) === focusedId &&
         (!focusedAction || control.dataset.action === focusedOperation) && !control.disabled) || controls.find(control => control.dataset.jobSelect === focusedId);
       target?.focus({ preventScroll: true });
+    }
+  }
+
+  async function moveJob(sourceId, targetId, after, restoreFocus) {
+    if (state.jobReorderPending) return;
+    const expected = state.jobs.map(job => job.id).reverse();
+    const order = expected.filter(id => id !== sourceId);
+    const targetIndex = order.indexOf(targetId);
+    if (targetIndex < 0 || !expected.includes(sourceId)) return;
+    order.splice(targetIndex + (after ? 1 : 0), 0, sourceId);
+    if (order.every((id, index) => id === expected[index])) { renderJobs(); return; }
+    state.jobReorderPending = true;
+    showGlobalError("");
+    let reorderError = null;
+    try {
+      await api("/api/jobs/reorder", { method: "POST", body: JSON.stringify({ expected, order }) });
+    } catch (error) {
+      reorderError = error;
+    } finally {
+      if (state.refreshPromise) {
+        try { await state.refreshPromise; } catch (error) { reorderError ||= error; }
+      }
+      state.jobReorderPending = false;
+      try { await refreshState(); }
+      catch (error) { reorderError ||= error; renderJobs(); }
+      if (reorderError) showGlobalError(`Не удалось переставить задачу: ${reorderError.message}`);
+      if (restoreFocus) el["jobs-body"].querySelector(`[data-job-drag="${sourceId}"]`)?.focus({ preventScroll: true });
     }
   }
 
@@ -534,7 +612,7 @@
     const job = state.jobs.find(candidate => candidate.id === state.selectedJobId);
     const attempt = job && selectedAttempt(job);
     el["attempt-duration"].textContent = formatDuration(attempt);
-    el["attempt-duration"].title = attempt?.durationIncomplete ? "Известное активное время. История ранних интервалов неполна; время на паузе и в очереди не учитывается." : "Активное время работы без пауз и ожидания в очереди";
+    el["attempt-duration"].title = "Активное время работы";
   }
 
   function selectedAttempt(job) {
@@ -599,6 +677,7 @@
   }
 
   function renderState(data, generation = state.refreshGeneration) {
+    if (state.jobDragId || state.jobReorderPending) return;
     state.csrfToken = typeof data.csrfToken === "string" ? data.csrfToken : "";
     const jobs = Array.isArray(data.jobs) ? data.jobs : [];
     const fingerprint = JSON.stringify(jobs);

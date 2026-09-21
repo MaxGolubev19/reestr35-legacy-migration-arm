@@ -15,7 +15,7 @@ async function resolvePublic(url, resolver = dns.lookup) {
   if (!answers.length || answers.some(a => !publicAddress(a.address))) throw new Error('DNS содержит непубличный IP');
   return answers;
 }
-async function download(input, directory, { limits = LIMITS, remaining = limits.maxTotalBytes, signal, resolver = dns.lookup, request = (url, options, callback) => (url.protocol === 'https:' ? https : http).request(url, options, callback) } = {}) {
+async function download(input, directory, { limits = LIMITS, remaining = limits.maxTotalBytes, signal, resolver = dns.lookup, request = (url, options, callback) => (url.protocol === 'https:' ? https : http).request(url, options, callback), allowUrl = () => true } = {}) {
   if (remaining <= 0) throw new Error('Лимит суммарного размера');
   const temp = path.join(directory, crypto.randomUUID() + '.tmp');
   let current = new URL(input), redirects = [], response, bytes = 0;
@@ -25,6 +25,7 @@ async function download(input, directory, { limits = LIMITS, remaining = limits.
   const hash = crypto.createHash('sha256');
   try {
     for (;;) {
+      if (!allowUrl(current)) throw new Error('Адрес ресурса не разрешён');
       const answers = await Promise.race([resolvePublic(current, resolver), new Promise((_, reject) => { controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }); if (controller.signal.aborted) reject(controller.signal.reason); })]);
       response = await new Promise((resolve, reject) => {
         // Pin the vetted DNS answer into this socket; no second resolver/rebinding.

@@ -71,7 +71,7 @@
       const button = element('button', name); button.type = 'button'; button.className = 'btn btn-sm btn-outline-secondary'; button.addEventListener('click', () => format(before, after, fallback, line)); toolbar.append(button);
     }
     control.addEventListener('keydown', event => { if ((event.ctrlKey || event.metaKey) && ['b', 'i'].includes(event.key.toLowerCase())) { event.preventDefault(); const mark = event.key.toLowerCase() === 'b' ? '**' : '*'; format(mark, mark, 'текст'); } });
-    control.addEventListener('input', update); preview.id = 'builder-markdown-preview'; preview.className = 'builder-markdown-preview'; preview.setAttribute('role', 'region'); preview.setAttribute('aria-label', 'Предпросмотр Markdown');
+    control.addEventListener('input', update); preview.id = control.id === 'builder-content' ? 'builder-markdown-preview' : `${control.id}-markdown-preview`; preview.className = 'builder-markdown-preview'; preview.setAttribute('role', 'region'); preview.setAttribute('aria-label', 'Предпросмотр Markdown');
     wrap.append(toolbar, control, preview); update(); return wrap;
   }
   window.BuilderMarkdown = { render, plainText, editor };

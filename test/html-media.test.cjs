@@ -301,8 +301,8 @@ browserTest('octet-stream PNG keeps declared MIME and passes download, image UI,
   assert.equal(manifest.resources.length, 2);
   assert.ok(manifest.resources.every(resource => resource.detectedMime === 'image/png'), 'deduplicated resources retain detected MIME');
   assert.equal(fixture.hits.length, 1);
-  const directory = path.join(queue.stage.media.directory(job, attempt), 'images'), names = fs.readdirSync(directory);
-  assert.equal(names.length, 1); assert.match(names[0], /\.png$/); assert.deepEqual(fs.readFileSync(path.join(directory, names[0])), PNG);
+  const directory = queue.stage.media.directory(job, attempt);
+  assert.equal(fs.existsSync(path.join(directory, 'images')), false);
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => { server.closeAllConnections(); server.close(); });
   const base = `http://127.0.0.1:${server.address().port}`, endpoint = `${base}/api/page-builder/${job.id}`;
@@ -316,8 +316,11 @@ browserTest('octet-stream PNG keeps declared MIME and passes download, image UI,
   await page.getByRole('button', { name: /^Открыть изображение/ }).first().click();
   await page.waitForFunction(() => document.querySelector('.media-full-image')?.naturalWidth > 0);
   const stored = queue.pageBuilder.read(job.id), state = await (await fetch(base + '/api/state')).json();
-  const headers = { origin: base, 'sec-fetch-site': 'same-origin', 'x-csrf-token': state.csrfToken, 'content-type': 'application/octet-stream', 'x-page-revision': String(stored.revision), 'x-media-attempt': '1', 'x-html-revision': '1', 'x-image-name': encodeURIComponent(names[0]) };
-  const picked = await fetch(endpoint + '/pick-media', { method: 'POST', headers, body: PNG }); assert.equal(picked.status, 200);
+  const headers = { origin: base, 'sec-fetch-site': 'same-origin', 'x-csrf-token': state.csrfToken, 'content-type': 'application/json' };
+  const request = { revision: stored.revision, attempt: 1, htmlRevision: 1 };
+  const catalog = await (await fetch(endpoint + '/media-catalog?' + new URLSearchParams(request))).json();
+  assert.equal(catalog.images.length, 1);
+  const picked = await fetch(endpoint + '/choose-media', { method: 'POST', headers, body: JSON.stringify({ ...request, name: catalog.images[0].name }) }); assert.equal(picked.status, 200);
   const selected = await picked.json(), preview = await fetch(base + selected.preview);
   assert.equal(preview.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await preview.arrayBuffer()), PNG);
   stored.document.common.blocks.push({ id: 'binary-block', type: 'big-media', title: '', review: { status: 'unreviewed', reason: '' }, media: [{ id: 'binary-image', originalUrl: selected.url, originalMedia: selected.media }] });
@@ -344,9 +347,7 @@ test('pause at download boundary, restart and checkpoint resume preserve downloa
   assert.equal(ctx.attempt.status, 'pausing'); assert.equal(ctx.queue.active.size, 1); server.release(); await ctx.queue.active.get(ctx.job.id).completion;
   assert.equal(ctx.attempt.status, 'paused'); assert.equal(ctx.attempt.htmlMedia.downloaded, 2); assert.equal(ctx.attempt.htmlMedia.pending, 1);
   const manifest = ctx.queue.stage.media.read(ctx.job, ctx.attempt, true), object = manifest.resources[0].object, mtime = fs.statSync(path.join(ctx.queue.stage.media.directory(ctx.job, ctx.attempt), object)).mtimeMs;
-  const firstImages = path.join(ctx.queue.stage.media.directory(ctx.job, ctx.attempt), 'images');
-  assert.equal(fs.readdirSync(firstImages).length, 2, 'stage 2 publishes downloaded images beside objects');
-  assert.deepEqual(fs.readFileSync(path.join(firstImages, fs.readdirSync(firstImages)[0])), PNG);
+  assert.equal(fs.existsSync(path.join(ctx.queue.stage.media.directory(ctx.job, ctx.attempt), 'images')), false, 'stage 2 keeps only verified objects');
   await ctx.queue.shutdown();
   const queue = new Queue({ root: ctx.root, autoStart: false, mediaDownload: server.fetchAsset }); t.after(() => queue.shutdown());
   const job = queue.jobs[0], attempt = job.attempts[0]; assert.equal(queue.snapshot('').jobs[0].canResume, true); queue.resume(job.id); queue.pump(); await queue.active.get(job.id).completion;
@@ -354,90 +355,121 @@ test('pause at download boundary, restart and checkpoint resume preserve downloa
   assert.equal(Object.hasOwn(queue.snapshot('').jobs[0].attempts[0].htmlMedia, 'resources'), false);
   for (const [file, expected] of ctx.proof) assert.equal(hash(fs.readFileSync(file)), expected);
   await queue.stage.media.upload(job, attempt, attempt.htmlMedia.revision, Readable.from([Buffer.from('<img src="/slow">')]));
-  const nextImages = path.join(queue.stage.media.directory(job, attempt), 'images');
-  assert.equal(fs.existsSync(nextImages), true, 'new HTML revision gets its own image folder');
-  assert.deepEqual(fs.readdirSync(nextImages), [], 'new revision does not inherit previous images');
+  assert.equal(fs.existsSync(path.join(queue.stage.media.directory(job, attempt), 'images')), false, 'new revision has no image copies');
   queue.resume(job.id); queue.pump(); await new Promise(resolve => setTimeout(resolve, 50)); await queue.shutdown();
   assert.equal(queue.active.size, 0); assert.equal(attempt.status, 'paused'); assert.equal(queue.stage.media.read(job, attempt).resources[0].status, 'pending');
 });
-test('legacy unfinished HTML revision rebuilds images on resume, while a finished revision is not repaired by opening the picker', async t => {
-  const ctx = completed(t), { queue, job, attempt } = ctx;
-  const manifest = queue.stage.media.create(job, attempt, Buffer.from('<img src="/photo.png">'), 'test');
-  const sha256 = hash(PNG), dir = queue.stage.media.directory(job, attempt), images = path.join(dir, 'images');
-  fs.writeFileSync(path.join(dir, 'objects', sha256), PNG);
-  Object.assign(manifest.resources[0], { status: 'downloaded', mime: 'image/png', bytes: PNG.length, sha256, object: `objects/${sha256}` });
-  manifest.status = 'paused'; queue.stage.media.publish(job, attempt, manifest); attempt.status = 'paused'; queue.save();
-  fs.renameSync(images, images + '.legacy');
-  assert.equal(fs.existsSync(images), false);
-  queue.resume(job.id);
-  assert.equal(fs.readdirSync(images).length, 1, 'resume restores the verified object into images');
-  assert.deepEqual(fs.readFileSync(path.join(images, fs.readdirSync(images)[0])), PNG);
-  queue.pump(); await queue.active.get(job.id)?.completion;
-  assert.equal(attempt.status, 'complete');
-  const saved = queue.stage.media.read(job, attempt, true), checkpoint = saved.checkpoint;
-  queue.stage.media.publishImage = () => { throw new Error('checkpoint must not rehash every image'); };
-  queue.stage.media.publish(job, attempt, saved);
-  assert.equal(saved.checkpoint, checkpoint + 1);
-  fs.renameSync(images, images + '.finished');
-  const request = { revision: queue.pageBuilder.read(job.id).revision, attempt: attempt.number, htmlRevision: attempt.htmlMedia.revision };
-  await assert.rejects(queue.mediaPicker.pickPrepared(job.id, request), /Папка изображений не найдена/);
-  assert.equal(fs.existsSync(images), false, 'opening a completed revision never recreates images');
-});
-test('completed legacy octet-stream PNG is projected and selectable without rewriting source evidence', async t => {
-  for (const missingImages of [false, true]) await t.test(missingImages ? 'missing images folder' : 'empty images folder', async t => {
-    const { queue, job, attempt } = completed(t);
-    const manifest = queue.stage.media.create(job, attempt, Buffer.from('<img src="/legacy.png">'), 'test');
-    const sha256 = hash(PNG), dir = queue.stage.media.directory(job, attempt), images = path.join(dir, 'images'), object = path.join(dir, 'objects', sha256);
-    fs.writeFileSync(object, PNG);
-    Object.assign(manifest.resources[0], { status: 'downloaded', mime: 'application/octet-stream', bytes: PNG.length, sha256, object: `objects/${sha256}` });
-    manifest.status = 'complete'; queue.stage.media.publish(job, attempt, manifest); attempt.status = 'complete'; queue.save();
-    if (missingImages) fs.rmdirSync(images);
-    const evidence = ['manifest.json', 'source.html', `objects/${sha256}`].map(name => { const file = path.join(dir, name); return { file, bytes: fs.readFileSync(file), mtime: fs.statSync(file).mtimeMs }; });
-    const assertEvidence = () => { for (const item of evidence) { assert.deepEqual(fs.readFileSync(item.file), item.bytes); assert.equal(fs.statSync(item.file).mtimeMs, item.mtime); } };
-    const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-    t.after(() => { server.closeAllConnections(); server.close(); });
-    const base = `http://127.0.0.1:${server.address().port}`, route = `${base}/api/html-media/${job.id}/1/1`;
-    const projected = await (await fetch(route + '/manifest')).json();
-    assert.equal(projected.resources[0].mime, 'application/octet-stream'); assert.equal(projected.resources[0].detectedMime, 'image/png');
-    assertEvidence(); assert.equal(fs.existsSync(images), !missingImages, 'reading metadata creates no files');
-    const response = await fetch(`${route}/objects/${sha256}`);
-    assert.equal(response.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG);
-    const stored = queue.pageBuilder.read(job.id), request = { revision: stored.revision, attempt: 1, htmlRevision: 1 };
-    let chosenName;
-    queue.mediaPicker.openDialog = async directory => {
-      assert.equal(directory, images); const names = fs.readdirSync(directory); assert.equal(names.length, 1);
-      chosenName = names[0]; assert.match(chosenName, /\.png$/); assert.deepEqual(fs.readFileSync(path.join(directory, chosenName)), PNG);
-      return path.join(directory, chosenName);
-    };
-    const selected = await queue.mediaPicker.pickPrepared(job.id, request);
-    assert.equal(selected.media.filename, chosenName); assertEvidence();
-    stored.document.common.blocks.push({ id: 'legacy-block', type: 'big-media', title: '', review: { status: 'unreviewed', reason: '' }, media: [{ id: 'legacy-image', originalUrl: selected.url, originalMedia: selected.media }] });
-    queue.pageBuilder.write(job.id, stored.revision, stored.document, 1);
-    const preview = await fetch(`${base}/api/page-builder/${job.id}/media/legacy-image`);
-    assert.equal(preview.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await preview.arrayBuffer()), PNG); assertEvidence();
-    const altered = Buffer.from(PNG); altered[altered.length - 1] ^= 1; fs.writeFileSync(object, altered);
-    assert.throws(() => queue.stage.media.read(job, attempt), /checksum/);
-    assert.throws(() => queue.mediaPicker.resolve(job.id, selected.media), /checksum/);
-    fs.writeFileSync(object, PNG);
-  });
+test('completed legacy octet-stream PNG stays selectable from its object without rewriting evidence', async t => {
+  const { queue, job, attempt } = completed(t);
+  const manifest = queue.stage.media.create(job, attempt, Buffer.from('<img src="/legacy.png">'), 'test');
+  const sha256 = hash(PNG), dir = queue.stage.media.directory(job, attempt), object = path.join(dir, 'objects', sha256);
+  fs.writeFileSync(object, PNG);
+  Object.assign(manifest.resources[0], { status: 'downloaded', mime: 'application/octet-stream', bytes: PNG.length, sha256, object: `objects/${sha256}` });
+  manifest.status = 'complete'; queue.stage.media.publish(job, attempt, manifest); attempt.status = 'complete'; queue.save();
+  const evidence = ['manifest.json', 'source.html', `objects/${sha256}`].map(name => { const file = path.join(dir, name); return { file, bytes: fs.readFileSync(file), mtime: fs.statSync(file).mtimeMs }; });
+  const assertEvidence = () => { for (const item of evidence) { assert.deepEqual(fs.readFileSync(item.file), item.bytes); assert.equal(fs.statSync(item.file).mtimeMs, item.mtime); } };
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`, route = `${base}/api/html-media/${job.id}/1/1`;
+  const projected = await (await fetch(route + '/manifest')).json();
+  assert.equal(projected.resources[0].mime, 'application/octet-stream'); assert.equal(projected.resources[0].detectedMime, 'image/png');
+  assertEvidence(); assert.equal(fs.existsSync(path.join(dir, 'images')), false);
+  const response = await fetch(`${route}/objects/${sha256}`);
+  assert.equal(response.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG);
+  const stored = queue.pageBuilder.read(job.id), request = { revision: stored.revision, attempt: 1, htmlRevision: 1 };
+  const catalog = queue.mediaPicker.catalog(job.id, request);
+  assert.equal(catalog.images.length, 1); assert.match(catalog.images[0].name, /\.png$/);
+  const selected = queue.mediaPicker.choose(job.id, request, catalog.images[0].name);
+  assertEvidence();
+  stored.document.common.blocks.push({ id: 'legacy-block', type: 'big-media', title: '', review: { status: 'unreviewed', reason: '' }, media: [{ id: 'legacy-image', originalUrl: selected.url, originalMedia: selected.media }] });
+  queue.pageBuilder.write(job.id, stored.revision, stored.document, 1);
+  const preview = await fetch(`${base}/api/page-builder/${job.id}/media/legacy-image`);
+  assert.equal(preview.headers.get('content-type'), 'image/png'); assert.deepEqual(Buffer.from(await preview.arrayBuffer()), PNG); assertEvidence();
+  const altered = Buffer.from(PNG); altered[altered.length - 1] ^= 1; fs.writeFileSync(object, altered);
+  assert.throws(() => queue.mediaPicker.resolve(job.id, selected.media), /checksum|изменено/);
 });
 
-test('legacy running HTML revision without images recovers before automatic queued start after restart', async t => {
+test('unfinished HTML revision resumes from objects without creating image copies', async t => {
   const ctx = completed(t), { queue, job, attempt } = ctx;
   const manifest = queue.stage.media.create(job, attempt, Buffer.from('<img src="/photo.png">'), 'test');
-  const sha256 = hash(PNG), dir = queue.stage.media.directory(job, attempt), images = path.join(dir, 'images');
+  const sha256 = hash(PNG), dir = queue.stage.media.directory(job, attempt);
   fs.writeFileSync(path.join(dir, 'objects', sha256), PNG);
   Object.assign(manifest.resources[0], { status: 'downloaded', mime: 'image/png', bytes: PNG.length, sha256, object: `objects/${sha256}` });
   manifest.status = 'running'; queue.stage.media.publish(job, attempt, manifest); attempt.status = 'running'; queue.save();
-  fs.renameSync(images, images + '.legacy');
   const restored = new Queue({ root: ctx.root, autoStart: false }); t.after(() => restored.shutdown());
   const recovered = restored.jobs[0].attempts[0];
-  assert.equal(recovered.status, 'queued');
-  assert.deepEqual(fs.readFileSync(path.join(images, fs.readdirSync(images)[0])), PNG, 'restore rebuilds images before scheduler launch');
+  assert.equal(recovered.status, 'queued'); assert.equal(fs.existsSync(path.join(dir, 'images')), false);
   restored.pump(); await restored.active.get(job.id)?.completion;
   assert.equal(recovered.status, 'complete');
   assert.equal(restored.stage.media.read(restored.jobs[0], recovered, true).status, 'complete');
+  assert.equal(fs.existsSync(path.join(dir, 'images')), false);
 });
+
+test('local non-raster downloads preserve safe filenames and reject header/path injection without bypassing object checks', async t => {
+  const { queue, job, attempt } = completed(t), bytes = Buffer.from('%PDF-1.7\nfixture'), sha256 = hash(bytes);
+  const manifest = queue.stage.media.create(job, attempt, Buffer.from('<a href="/manual.pdf" download>Manual</a>'), 'test');
+  const item = manifest.resources[0], dir = queue.stage.media.directory(job, attempt), object = path.join(dir, 'objects', sha256);
+  fs.writeFileSync(object, bytes);
+  Object.assign(item, { status: 'downloaded', mime: 'application/pdf', bytes: bytes.length, sha256, object: `objects/${sha256}` });
+  manifest.status = 'complete'; queue.stage.media.publish(job, attempt, manifest); attempt.status = 'complete'; queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}/api/html-media/${job.id}/1`, route = `${base}/1/objects/${sha256}`;
+  const cases = [
+    { label: 'Russian download attribute takes priority', declared: 'Прайс-лист 2026.pdf', expected: 'Прайс-лист 2026.pdf', ascii: 'file.pdf' },
+    { label: 'safe ASCII name', declared: 'manual (2026).pdf', expected: 'manual (2026).pdf', ascii: 'manual (2026).pdf' },
+    { label: 'RFC 5987 reserved characters', declared: "O'Brien(2026).pdf", expected: "O'Brien(2026).pdf", ascii: 'file.pdf' },
+    { label: 'decoded resolved URL path ignores query and fragment', resolved: 'https://fixture.reestr35.ru/docs/%D0%9F%D1%80%D0%B0%D0%B9%D1%81%20(2).pdf?name=wrong.exe#other', expected: 'Прайс (2).pdf', ascii: 'file.pdf' },
+    { label: 'original URL after unusable resolved basename', resolved: 'https://fixture.reestr35.ru/', original: 'https://fixture.reestr35.ru/original.pdf', expected: 'original.pdf', ascii: 'original.pdf' },
+    { label: 'MIME fallback', resolved: 'https://fixture.reestr35.ru/', original: 'invalid URL', expected: 'Файл.pdf', ascii: 'file.pdf' },
+    { label: 'unknown MIME fallback', resolved: 'https://fixture.reestr35.ru/', original: '', mime: 'application/octet-stream', expected: 'Файл', ascii: 'file' },
+    ...['bad\r\nX-Injected: yes.pdf', '../secret.pdf', '..\\secret.pdf', 'C:\\secret.pdf', 'nul.pdf', 'COM1.pdf', 'file\u0000.pdf', 'file\u202e.pdf', 'file\ud800.pdf', 'file.pdf.', '.', '..', 'a'.repeat(241) + '.pdf'].map(declared => ({ label: `unsafe attribute ${JSON.stringify(declared)}`, declared, expected: 'manual.pdf', ascii: 'manual.pdf' })),
+    ...['..%2Fsecret.pdf', '..%5Csecret.pdf', 'bad%0D%0AX-Injected%3Ayes.pdf', '%FF.pdf'].map(basename => ({ label: `unsafe encoded URL ${basename}`, resolved: `https://fixture.reestr35.ru/${basename}`, original: '', expected: 'Файл.pdf', ascii: 'file.pdf' })),
+  ];
+  for (const entry of cases) await t.test(entry.label, async () => {
+    Object.assign(item, { mime: entry.mime || 'application/pdf', resolvedUrl: entry.resolved ?? 'https://fixture.reestr35.ru/manual.pdf', originalUrl: entry.original ?? 'https://fixture.reestr35.ru/original.pdf', occurrence: { ...item.occurrence, downloadFilename: entry.declared || '' } });
+    queue.stage.media.publish(job, attempt, manifest);
+    const response = await fetch(route), disposition = response.headers.get('content-disposition');
+    assert.equal(response.status, 200);
+    const encoded = encodeURIComponent(entry.expected).replace(/['()*]/g, character => '%' + character.charCodeAt(0).toString(16).toUpperCase());
+    assert.equal(disposition, `attachment; filename="${entry.ascii}"; filename*=UTF-8''${encoded}`);
+    assert.equal(response.headers.get('x-injected'), null);
+    assert.equal(response.headers.get('content-type'), 'application/octet-stream');
+    assert.match(response.headers.get('content-security-policy'), /sandbox/);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+  });
+  assert.equal((await fetch(`${base}/2/objects/${sha256}`)).status, 404, 'stale revision remains rejected');
+  assert.equal((await fetch(`${base}/1/objects/${'0'.repeat(64)}`)).status, 404, 'unlisted objects remain inaccessible');
+  fs.writeFileSync(object, Buffer.from('%PDF-1.7\nchanged'));
+  const changed = await fetch(route); assert.equal(changed.status, 400); assert.match((await changed.json()).error, /checksum/);
+});
+
+test('local download resourceId selects an exact occurrence of shared bytes and rejects invalid selectors', async t => {
+  const { queue, job, attempt } = completed(t), bytes = Buffer.from('%PDF-1.7\nshared'), sha256 = hash(bytes);
+  const otherBytes = Buffer.from('%PDF-1.7\nother'), otherHash = hash(otherBytes);
+  const manifest = queue.stage.media.create(job, attempt, Buffer.from('<a href="/shared.pdf" download="Первое.pdf">First</a><a href="/shared.pdf" download="Второе.pdf">Second</a><a href="/other.pdf" download>Other</a><a href="/failed.pdf" download>Failed</a>'), 'test');
+  const dir = queue.stage.media.directory(job, attempt), object = path.join(dir, 'objects', sha256);
+  fs.writeFileSync(object, bytes); fs.writeFileSync(path.join(dir, 'objects', otherHash), otherBytes);
+  for (const item of manifest.resources) Object.assign(item, { status: item.id === 4 ? 'failed' : 'downloaded', mime: 'application/pdf', bytes: item.id === 3 ? otherBytes.length : bytes.length, sha256: item.id === 3 ? otherHash : sha256, object: `objects/${item.id === 3 ? otherHash : sha256}` });
+  manifest.status = 'ready_with_issues'; queue.stage.media.publish(job, attempt, manifest); attempt.status = 'complete'; queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}/api/html-media/${job.id}/1`, route = `${base}/1/objects/${sha256}`;
+  for (const [query, name] of [['', 'Первое.pdf'], ['?resourceId=1', 'Первое.pdf'], ['?resourceId=2', 'Второе.pdf']]) {
+    const response = await fetch(route + query);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-disposition'), `attachment; filename="file.pdf"; filename*=UTF-8''${encodeURIComponent(name)}`);
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+  }
+  for (const selector of ['', '0', '01', '-1', '1.1', '1e0', '9007199254740992', '1&resourceId=2', '1%0D%0A']) {
+    assert.equal((await fetch(`${route}?resourceId=${selector}`)).status, 400, `malformed selector ${selector}`);
+  }
+  for (const selector of ['3', '4', '999']) assert.equal((await fetch(`${route}?resourceId=${selector}`)).status, 404, `unavailable occurrence ${selector}`);
+  assert.equal((await fetch(`${base}/2/objects/${sha256}?resourceId=2`)).status, 404, 'selected occurrence cannot bypass revision');
+  fs.writeFileSync(object, Buffer.from('%PDF-1.7\nspoof!'));
+  const changed = await fetch(`${route}?resourceId=2`); assert.equal(changed.status, 400); assert.match((await changed.json()).error, /checksum/);
+});
+
 test('upload API authenticates Origin/CSRF and stale attempt/revision; source remains exact bytes and cannot execute same-origin', async t => {
   const ctx = completed(t), server = createServer(ctx.queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); t.after(() => { server.closeAllConnections(); server.close(); });
   const base = `http://127.0.0.1:${server.address().port}`, state = await (await fetch(base + '/api/state')).json(), route = `/api/html-media/${ctx.job.id}/1`;
@@ -746,7 +778,10 @@ browserTest('HTML card, modal actions, sequential stage guards and desktop/mobil
   const picker = page.waitForEvent('filechooser'); await page.locator('.html-source-card').click(); await (await picker).setFiles({ name: 'source.html', mimeType: 'text/html', buffer: source });
   await page.getByRole('button', { name: /^HTML ·/ }).click(); await page.waitForSelector('#media-modal-body .cm-content'); assert.equal(await page.evaluate(() => window.SOURCE_EXECUTED), undefined); assert.match(await page.evaluate(() => window.ArmEditors.text('media-modal-body')), /SOURCE_EXECUTED/);
   for (const modal of ['png','json','media']) {
-    assert.deepEqual(await page.locator(`#${modal}-modal .modal-actions button`).evaluateAll(nodes => nodes.map(node => [node.getAttribute('aria-label'), node.textContent, node.querySelectorAll('svg').length])), [['Копировать','',1],['Скачать','',1]]);
+    const expectedActions = [['Копировать','',1],['Скачать','',1]];
+    if (modal === 'media') expectedActions.push(['Удалить ресурс','',1]);
+    assert.deepEqual(await page.locator(`#${modal}-modal .modal-actions button`).evaluateAll(nodes => nodes.map(node => [node.getAttribute('aria-label'), node.textContent, node.querySelectorAll('svg').length])), expectedActions);
+    if (modal === 'media') assert.equal(await page.locator('#media-delete').isVisible(), false, 'source HTML cannot be deleted as a resource');
     assert.equal(await page.locator(`#${modal}-modal .modal-header`).evaluate(node => node.lastElementChild.classList.contains('btn-close') && node.lastElementChild.previousElementSibling.classList.contains('modal-actions')), true);
   }
   await page.locator('#media-copy').click(); await page.waitForFunction(() => document.querySelector('#media-action-status').textContent === 'Скопировано');
@@ -761,7 +796,7 @@ browserTest('HTML card, modal actions, sequential stage guards and desktop/mobil
   await page.locator('#media-copy').click(); await page.waitForFunction(() => document.querySelector('#media-action-status').textContent === 'Скопировано');
   for (const width of [1440,390,375,360,320]) {
     await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 });
-    assert.equal(await page.locator('#media-modal .modal-header').evaluate(node => { const header = node.getBoundingClientRect(), title = node.querySelector('.modal-title').getBoundingClientRect(), actions = [...node.querySelectorAll('button')].map(button => button.getBoundingClientRect()); return actions.every((rect, index) => rect.right <= header.right && rect.left >= title.right && (index === 0 || rect.left >= actions[index - 1].right)) && document.documentElement.scrollWidth <= innerWidth; }), true, `${width}: modal title and actions do not overlap`);
+    assert.equal(await page.locator('#media-modal .modal-header').evaluate(node => { const header = node.getBoundingClientRect(), title = node.querySelector('.modal-title').getBoundingClientRect(), actions = [...node.querySelectorAll('button')].filter(button => getComputedStyle(button).display !== 'none').map(button => button.getBoundingClientRect()); return actions.every((rect, index) => rect.right <= header.right && rect.left >= title.right && (index === 0 || rect.left >= actions[index - 1].right)) && document.documentElement.scrollWidth <= innerWidth; }), true, `${width}: modal title and actions do not overlap`);
     await page.screenshot({ path: path.join(testOutput(), `ui-html-modal-${width}.png`) });
   }
   await page.setViewportSize({ width: 1440, height: 1000 });

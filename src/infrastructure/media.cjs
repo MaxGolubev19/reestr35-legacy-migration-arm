@@ -103,8 +103,8 @@ function filename(item) {
   return `${basename}-${item.sha256.slice(0, 16)}.${extensions[mediaMime(item)]}`;
 }
 function provenance(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== 'attempt,filename,revision,sha256' || !Number.isSafeInteger(value.attempt) || value.attempt < 1 || !Number.isSafeInteger(value.revision) || value.revision < 1 || !/^[a-f0-9]{64}$/.test(value.sha256) || typeof value.filename !== 'string' || !/^[\p{L}\p{N}_-]+\.(png|jpg|gif|webp|avif|bmp)$/u.test(value.filename) || value.filename.length > 100) throw new Error('Некорректное происхождение медиа');
-  return { attempt: value.attempt, revision: value.revision, sha256: value.sha256, filename: value.filename };
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !['attempt,filename,revision,sha256', 'attempt,filename,resourceId,revision,sha256'].includes(Object.keys(value).sort().join(',')) || !Number.isSafeInteger(value.attempt) || value.attempt < 1 || !Number.isSafeInteger(value.revision) || value.revision < 1 || value.resourceId !== undefined && (!Number.isSafeInteger(value.resourceId) || value.resourceId < 1) || !/^[a-f0-9]{64}$/.test(value.sha256) || typeof value.filename !== 'string' || !/^[\p{L}\p{N}_-]+\.(png|jpg|gif|webp|avif|bmp)$/u.test(value.filename) || value.filename.length > 100) throw new Error('Некорректное происхождение медиа');
+  return { attempt: value.attempt, revision: value.revision, sha256: value.sha256, filename: value.filename, ...(value.resourceId === undefined ? {} : { resourceId: value.resourceId }) };
 }
 
 module.exports = { extensions, mediaMime, validateContent, detectRasterMime, verifiedRasterMime, detectLegacyImages, checkedPath, readChecked, filename, provenance };

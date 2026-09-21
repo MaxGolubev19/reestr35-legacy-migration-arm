@@ -424,6 +424,34 @@ test('pause/resume preserves an unstarted attempt, survives restart and resumes 
   queue.resume(a.id); assert.equal(pending.status, 'running', 'resume pumps immediately'); children[4].finish(1);
 });
 
+test('manual job order persists and changes only queued scheduling priority', async t => {
+  const { root, queue, children } = setup(t, { concurrency: 1 });
+  queue.add('https://a.reestr35.ru\nhttps://b.reestr35.ru\nhttps://c.reestr35.ru');
+  const [a, b, c] = queue.jobs;
+  queue.pump();
+  const activeOrder = a.attempts[0].queueOrder;
+  const expected = [c.id, b.id, a.id], order = [b.id, c.id, a.id];
+  assert.throws(() => queue.reorderJobs(expected, [b.id, b.id, a.id]), { statusCode: 409 });
+  assert.throws(() => queue.reorderJobs([a.id, b.id, c.id], order), { statusCode: 409 });
+  queue.reorderJobs(expected, order);
+  assert.deepEqual(queue.jobs.map(job => job.id).reverse(), order);
+  assert.equal(a.attempts[0].queueOrder, activeOrder);
+  assert.ok(b.attempts[0].queueOrder < c.attempts[0].queueOrder);
+  const restored = new Queue({ root, autoStart: false });
+  t.after(() => restored.shutdown());
+  assert.deepEqual(restored.jobs.map(job => job.id).reverse(), order);
+  assert.ok(restored.jobs.find(job => job.id === b.id).attempts[0].queueOrder < restored.jobs.find(job => job.id === c.id).attempts[0].queueOrder);
+  children[0].finish(1);
+  assert.equal(b.attempts[0].status, 'running');
+  const originalSave = queue.save;
+  queue.save = () => { throw new Error('save failed'); };
+  const durable = fs.readFileSync(queue.stateFile);
+  assert.throws(() => queue.reorderJobs(order, [c.id, b.id, a.id]), /save failed/);
+  queue.save = originalSave;
+  assert.deepEqual(queue.jobs.map(job => job.id).reverse(), order);
+  assert.deepEqual(fs.readFileSync(queue.stateFile), durable);
+});
+
 test('pause/resume invalid transitions and persistence failures do not mutate state', async t => {
   const { queue } = setup(t); queue.add('https://a.reestr35.ru');
   const job = queue.jobs[0], attempt = job.attempts[0];

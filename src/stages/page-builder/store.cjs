@@ -4,11 +4,14 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { atomicJson } = require('../../infrastructure/files.cjs');
 const { provenance } = require('../../infrastructure/media.cjs');
+const { provenance: frameProvenance } = require('./frame-picker.cjs');
+const { provenance: documentProvenance } = require('./document-picker.cjs');
 
 const VERSION = 1;
 const STATUSES = new Set(['unreviewed', 'passed', 'failed']);
-// Portable projection of company-block-contract.v1.json (1.0): only root scalar
-// payload fields. Nested rows/items/meta are intentionally outside this editor.
+// Portable projection of company-block-contract.v1.json (1.0): root scalar
+// payload fields and the supported block meta settings. Other nested data
+// remains outside this editor.
 const f = (name, label, kind = 'text', values) => ({ name, label, kind, ...(values ? { values } : {}) });
 const links = [f('link', 'Ссылка', 'link'), f('link_text', 'Текст ссылки')];
 const BLOCK_TYPES = [
@@ -48,8 +51,188 @@ function safeUrl(value, field, { required = false, link = false } = {}) {
 function media(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !validId(value.id)) throw new Error(`Некорректное медиа ${field}`);
   if (Object.keys(value).some(key => !['id', 'originalUrl', 'bigUrl', 'originalMedia', 'bigMedia', 'href', 'alt', 'caption'].includes(key))) throw new Error(`Неизвестное поле медиа ${field}`);
-  return { id: value.id, originalUrl: safeUrl(value.originalUrl, `${field}.originalUrl`), bigUrl: safeUrl(value.bigUrl, `${field}.bigUrl`), href: safeUrl(value.href, `${field}.href`, { link: true }), alt: limited(value.alt ?? '', `${field}.alt`, 500), caption: limited(value.caption ?? '', `${field}.caption`, 1000),
+  return { id: value.id, originalUrl: safeUrl(value.originalUrl, `${field}.originalUrl`, { link: true }), bigUrl: safeUrl(value.bigUrl, `${field}.bigUrl`, { link: true }), href: safeUrl(value.href, `${field}.href`, { link: true }), alt: limited(value.alt ?? '', `${field}.alt`, 500), caption: limited(value.caption ?? '', `${field}.caption`, 1000),
     ...(value.originalMedia ? { originalMedia: provenance(value.originalMedia) } : {}), ...(value.bigMedia ? { bigMedia: provenance(value.bigMedia) } : {}) };
+}
+const BANNER_META = {
+  ratio: ['auto', '16x9', '4x3', '3x2', '1x1', 'poster'],
+  fit: ['cover', 'contain'],
+  media_mode: ['intrinsic', 'fill'],
+  media_align: ['start', 'center', 'end']
+};
+const SERVICE_META = {
+  image_ratio: ['auto', '4x3', '3x2', '1x1'],
+  image_fit: ['cover', 'contain'],
+  action_style: ['link', 'primary'],
+  media_mode: ['intrinsic', 'fill'],
+  media_align: ['start', 'center', 'end']
+};
+const CONTENT_META = {
+  image_position: ['left', 'right', 'after'],
+  image_layout: ['split', 'flow'],
+  image_ratio: ['auto', '4x3', '3x2', '1x1'],
+  image_fit: ['cover', 'contain'],
+  media_mode: ['intrinsic', 'fill'],
+  media_align: ['start', 'center', 'end']
+};
+const GRID_META = {
+  image_ratio: ['auto', '16x9', '4x3', '3x2', '1x1', 'poster'],
+  image_fit: ['cover', 'contain'],
+  items_align: ['start', 'center', 'end'],
+  media_mode: ['intrinsic', 'fill'],
+  media_align: ['start', 'center', 'end']
+};
+const TABLE_CELL_META = {
+  align: ['left', 'center', 'right'],
+  media_mode: ['intrinsic', 'fill'],
+  media_align: ['start', 'center', 'end']
+};
+const TABLE_CELL_SETTINGS = ['colspan', 'rowspan', 'is_header', 'align', 'media_mode', 'media_width', 'media_align'];
+const legacyTableId = (kind, field) => `${kind}-${crypto.createHash('sha256').update(field).digest('hex').slice(0, 16)}`;
+function tableImageIds(value, field) {
+  if (!Array.isArray(value) || value.length < 2 || value.length > 12 || new Set(value).size !== value.length || value.some(item => !validId(item))) throw new Error(`Некорректное поле ${field}`);
+  return [...value];
+}
+function tableCellSetting(key, value, field) {
+  if (key === 'colspan' && (!Number.isInteger(value) || value < 1 || value > 12)
+    || key === 'rowspan' && (!Number.isInteger(value) || value < 1 || value > 100)
+    || key === 'is_header' && typeof value !== 'boolean'
+    || key === 'media_width' && (!Number.isInteger(value) || value < 48 || value > 1600)
+    || TABLE_CELL_META[key] && !TABLE_CELL_META[key].includes(value)) throw new Error(`Некорректное поле ${field}`);
+  return value;
+}
+function tableCell(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Некорректная ячейка ${field}`);
+  const allowed = new Set(['id', 'title', 'text', 'link', 'image_asset_id', 'image_asset_ids', 'meta', ...TABLE_CELL_SETTINGS]);
+  if (Object.keys(value).some(key => !allowed.has(key))) throw new Error(`Неизвестное поле ячейки ${field}`);
+  const id = value.id === undefined ? legacyTableId('cell', field) : value.id;
+  if (!validId(id)) throw new Error(`Некорректная ячейка ${field}`);
+  const rawMeta = value.meta === undefined ? {} : value.meta;
+  if (!rawMeta || typeof rawMeta !== 'object' || Array.isArray(rawMeta)) throw new Error(`Некорректное поле ${field}.meta`);
+  if (Object.keys(rawMeta).some(key => ![...TABLE_CELL_SETTINGS, 'image_asset_ids'].includes(key))) throw new Error(`Неизвестное поле ${field}.meta`);
+  const directSingle = value.image_asset_id !== undefined;
+  const directMultiple = value.image_asset_ids !== undefined;
+  const metaMultiple = rawMeta.image_asset_ids !== undefined;
+  if (Number(directSingle) + Number(directMultiple) + Number(metaMultiple) > 1) throw new Error(`Конфликт изображений ${field}`);
+  let imageIds = [];
+  if (directSingle) {
+    if (!validId(value.image_asset_id)) throw new Error(`Некорректное поле ${field}.image_asset_id`);
+    imageIds = [value.image_asset_id];
+  } else if (directMultiple) imageIds = tableImageIds(value.image_asset_ids, `${field}.image_asset_ids`);
+  else if (metaMultiple) imageIds = tableImageIds(rawMeta.image_asset_ids, `${field}.meta.image_asset_ids`);
+  const meta = {};
+  for (const key of TABLE_CELL_SETTINGS) {
+    const direct = value[key], nested = rawMeta[key];
+    if (direct !== undefined && nested !== undefined && direct !== nested) throw new Error(`Конфликт настроек ${field}.${key}`);
+    const setting = direct ?? nested;
+    if (setting !== undefined) meta[key] = tableCellSetting(key, setting, `${field}.meta.${key}`);
+  }
+  return { id, title: limited(value.title ?? '', `${field}.title`, 500), text: limited(value.text ?? '', `${field}.text`, 12000),
+    link: safeUrl(value.link, `${field}.link`, { link: true }),
+    ...(imageIds.length === 1 ? { image_asset_id: imageIds[0] } : imageIds.length > 1 ? { image_asset_ids: imageIds } : {}), meta };
+}
+function tableRow(value, field, count) {
+  const legacy = Array.isArray(value), row = legacy ? { cells: value } : value;
+  if (!row || typeof row !== 'object' || Array.isArray(row) || Object.keys(row).some(key => !['id', 'cells'].includes(key))) throw new Error(`Некорректная строка ${field}`);
+  const id = row.id === undefined ? legacyTableId('row', field) : row.id;
+  if (!validId(id) || !Array.isArray(row.cells) || !row.cells.length || row.cells.length > 100 || count.value + row.cells.length > 100) throw new Error(`Некорректная строка ${field}`);
+  count.value += row.cells.length;
+  return { id, cells: row.cells.map((cell, index) => tableCell(cell, `${field}.cells[${index}]`)) };
+}
+function gridItem(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !validId(value.id)) throw new Error(`Некорректный элемент ${field}`);
+  if (Object.keys(value).some(key => !['id', 'title', 'text', 'link', 'link_text', 'image_asset_id', 'badge', 'date', 'meta'].includes(key))) throw new Error(`Неизвестное поле элемента ${field}`);
+  const meta = value.meta === undefined ? {} : value.meta;
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) throw new Error(`Некорректное поле ${field}.meta`);
+  const normalized = {};
+  for (const [key, entry] of Object.entries(meta)) {
+    if (['badge', 'date'].includes(key)) normalized[key] = limited(entry, `${field}.meta.${key}`, 500);
+    else if (key === 'date_iso') { if (typeof entry !== 'string' || entry && !/^\d{4}-\d{2}-\d{2}$/.test(entry)) throw new Error(`Некорректное поле ${field}.meta.${key}`); normalized[key] = entry; }
+    else if (key === 'action_style') { if (!['link', 'primary'].includes(entry)) throw new Error(`Некорректное поле ${field}.meta.${key}`); normalized[key] = entry; }
+    else if (key === 'media_width') { if (!Number.isInteger(entry) || entry < 48 || entry > 1600) throw new Error(`Некорректное поле ${field}.meta.${key}`); normalized[key] = entry; }
+    else if (['media_mode', 'media_align'].includes(key) && GRID_META[key].includes(entry)) normalized[key] = entry;
+    else throw new Error(`Некорректное поле ${field}.meta.${key}`);
+  }
+  return { id: value.id, title: limited(value.title ?? '', `${field}.title`, 500), text: limited(value.text ?? '', `${field}.text`, 12000),
+    link: safeUrl(value.link, `${field}.link`, { link: true }), link_text: limited(value.link_text ?? '', `${field}.link_text`, 500),
+    image_asset_id: limited(value.image_asset_id ?? '', `${field}.image_asset_id`, 64), badge: limited(value.badge ?? '', `${field}.badge`, 500),
+    date: limited(value.date ?? '', `${field}.date`, 500), meta: normalized };
+}
+const EMBED_META = { map_height: true };
+function linkMeta(value, field, item = false) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Некорректное поле ${field}`);
+  const allowed = item ? ['kind', 'target', 'file_id', 'file_type', 'size', 'download'] : ['columns', 'compact'];
+  const result = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (!allowed.includes(key)) throw new Error(`Неизвестное поле ${field}.${key}`);
+    if (key === 'columns' && (!Number.isInteger(entry) || entry < 1 || entry > 3)
+      || key === 'file_id' && (!Number.isSafeInteger(entry) || entry < 1)
+      || ['compact', 'download'].includes(key) && typeof entry !== 'boolean'
+      || key === 'kind' && !['link', 'document'].includes(entry)
+      || key === 'target' && !['self', 'blank', '_self', '_blank'].includes(entry)) throw new Error(`Некорректное поле ${field}.${key}`);
+    result[key] = ['file_type', 'size'].includes(key) ? limited(entry, `${field}.${key}`, key === 'file_type' ? 10 : 100) : entry;
+  }
+  return result;
+}
+function linkItem(value, field) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !validId(value.id)) throw new Error(`Некорректный элемент ${field}`);
+  if (Object.keys(value).some(key => !['id', 'title', 'text', 'link', 'link_text', 'meta', 'sourceDocument'].includes(key))) throw new Error(`Неизвестное поле элемента ${field}`);
+  const result = { id: value.id, title: limited(value.title ?? '', `${field}.title`, 500), text: limited(value.text ?? '', `${field}.text`, 12000),
+    link: safeUrl(value.link, `${field}.link`, { link: true }), link_text: limited(value.link_text ?? '', `${field}.link_text`, 500), meta: linkMeta(value.meta === undefined ? {} : value.meta, `${field}.meta`, true) };
+  if (value.sourceDocument !== undefined) result.sourceDocument = documentProvenance(value.sourceDocument);
+  return result;
+}
+function sectionsMeta(value, field, item = false) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Некорректное поле ${field}`);
+  const result = {}, allowed = item ? ['kind', 'target'] : ['columns', 'compact', 'show_icons'];
+  for (const [key, entry] of Object.entries(value)) {
+    if (!allowed.includes(key)) throw new Error(`Неизвестное поле ${field}.${key}`);
+    if (key === 'columns' && (!Number.isInteger(entry) || entry < 1 || entry > 4)
+      || ['compact', 'show_icons'].includes(key) && typeof entry !== 'boolean'
+      || key === 'kind' && !['section', 'item', 'address', 'phone', 'email', 'hours'].includes(entry)
+      || key === 'target' && !['self', 'blank', '_self', '_blank'].includes(entry)) throw new Error(`Некорректное поле ${field}.${key}`);
+    result[key] = entry;
+  }
+  return result;
+}
+function sectionsItem(value, field, depth, ids, count) {
+  if (depth > 6 || !value || typeof value !== 'object' || Array.isArray(value) || !validId(value.id)) throw new Error(`Некорректный элемент ${field}`);
+  if (ids.has(value.id)) throw new Error('Дублирующийся id медиа или элемента');
+  ids.add(value.id);
+  if (++count.value > 100) throw new Error(`Слишком много элементов ${field}`);
+  if (Object.keys(value).some(key => !['id', 'title', 'text', 'link', 'link_text', 'meta', 'children'].includes(key))) throw new Error(`Неизвестное поле элемента ${field}`);
+  const children = value.children === undefined ? [] : value.children;
+  if (!Array.isArray(children)) throw new Error(`Некорректные элементы ${field}.children`);
+  return { id: value.id, title: limited(value.title ?? '', `${field}.title`, 500), text: limited(value.text ?? '', `${field}.text`, 12000),
+    link: safeUrl(value.link, `${field}.link`, { link: true }), link_text: limited(value.link_text ?? '', `${field}.link_text`, 500),
+    meta: sectionsMeta(value.meta === undefined ? {} : value.meta, `${field}.meta`, true),
+    children: children.map((child, index) => sectionsItem(child, `${field}.children[${index}]`, depth + 1, ids, count)) };
+}
+function blockMeta(value, field, type) {
+  if (type === 'links') return linkMeta(value, field);
+  if (type === 'sections') return sectionsMeta(value, field);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Некорректное поле ${field}`);
+  if (type === 'table') {
+    if (Object.keys(value).length) throw new Error(`Некорректное поле ${field}`);
+    return {};
+  }
+  const allowed = type === 'service' ? SERVICE_META : type === 'content' ? CONTENT_META : type === 'embed' ? EMBED_META : type === 'grid' ? GRID_META : BANNER_META;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (type === 'embed' && key === 'map_height') {
+      if (!Number.isInteger(item) || item < 280 || item > 720) throw new Error(`Некорректное поле ${field}.${key}`);
+    } else if (key === 'columns' && type === 'grid') {
+      if (!Number.isInteger(item) || item < 1 || item > 6) throw new Error(`Некорректное поле ${field}.${key}`);
+    } else if (key === 'item_max_width' && type === 'grid') {
+      if (!Number.isInteger(item) || item < 48 || item > 1600) throw new Error(`Некорректное поле ${field}.${key}`);
+    } else if (key === 'show_border' && type === 'grid') {
+      if (typeof item !== 'boolean') throw new Error(`Некорректное поле ${field}.${key}`);
+    } else if (key === 'media_width' && type !== 'embed') {
+      if (!Number.isInteger(item) || item < 48 || item > 1600) throw new Error(`Некорректное поле ${field}.${key}`);
+    } else if (!Array.isArray(allowed[key]) || !allowed[key].includes(item)) throw new Error(`Некорректное поле ${field}.${key}`);
+    result[key] = item;
+  }
+  return result;
 }
 function block(value, field) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !validId(value.id)) throw new Error(`Некорректный блок ${field}`);
@@ -57,15 +240,52 @@ function block(value, field) {
   if (!type) throw new Error(`Некорректный блок ${field}`);
   const view = value.view ?? legacy?.[1] ?? type.default_view;
   if (!type.views.includes(view)) throw new Error(`Некорректный вид отображения ${field}.view`);
-  const allowed = new Set(['id', 'type', 'view', 'title', 'text', 'description', 'content', 'settings', 'media', 'review', 'reviewedRevision', ...type.fields.map(item => item.name)]);
+  const allowed = new Set(['id', 'type', 'view', 'title', 'text', 'description', 'content', 'settings', 'media', 'review', 'reviewedRevision', ...(['big-media', 'table', 'service', 'content', 'embed', 'links', 'sections', 'grid'].includes(type.name) ? ['meta'] : []), ...(type.name === 'embed' ? ['sourceFrame'] : []), ...(['links', 'sections', 'grid'].includes(type.name) ? ['items'] : []), ...(type.name === 'table' ? ['rows'] : []), ...type.fields.map(item => item.name)]);
   if (Object.keys(value).some(key => !allowed.has(key))) throw new Error(`Неизвестное поле блока ${field}`);
   if (value.reviewedRevision !== undefined && (!Number.isSafeInteger(value.reviewedRevision) || value.reviewedRevision < 1)) throw new Error(`Некорректная reviewedRevision ${field}`);
-  if (!Array.isArray(value.media) || value.media.length > 12) throw new Error(`Некорректные медиа ${field}`);
+  // Grid items and their images are shared across views. Keep the same limit
+  // when a populated gallery changes to a view without an item editor.
+  if (!Array.isArray(value.media) || value.media.length > (type.name === 'table' ? 1200 : type.name === 'grid' ? 112 : 12)) throw new Error(`Некорректные медиа ${field}`);
   // Accept the retired description field in old documents, but omit it from
   // the normalized model and subsequent saves. Reading never rewrites disk.
   const result = { id: value.id, type: type.name, view, title: limited(value.title ?? '', `${field}.title`, 200), text: limited(value.text ?? value.content ?? '', `${field}.text`, 12000),
     content: limited(value.content || '', `${field}.content`, 12000),
     settings: limited(value.settings || '', `${field}.settings`, 4000), review: review(value.review, `${field}.review`), media: value.media.map((item, index) => media(item, `${field}.media[${index}]`)) };
+  if (value.sourceFrame !== undefined) result.sourceFrame = frameProvenance(value.sourceFrame);
+  if (value.meta !== undefined) result.meta = blockMeta(value.meta, `${field}.meta`, type.name);
+  if (type.name === 'links') {
+    const items = value.items === undefined ? [] : value.items;
+    if (!Array.isArray(items) || items.length > 100) throw new Error(`Некорректные элементы ${field}.items`);
+    result.items = items.map((item, index) => linkItem(item, `${field}.items[${index}]`));
+    result.meta ??= {};
+  }
+  if (type.name === 'sections') {
+    const items = value.items === undefined ? [] : value.items;
+    if (!Array.isArray(items)) throw new Error(`Некорректные элементы ${field}.items`);
+    const ids = new Set(), count = { value: 0 };
+    result.items = items.map((item, index) => sectionsItem(item, `${field}.items[${index}]`, 1, ids, count));
+    result.meta ??= {};
+  }
+  if (type.name === 'grid') {
+    const items = value.items === undefined ? [] : value.items;
+    if (!Array.isArray(items) || items.length > 100) throw new Error(`Некорректные элементы ${field}.items`);
+    result.items = items.map((item, index) => gridItem(item, `${field}.items[${index}]`));
+    const ids = new Set(result.media.map(asset => asset.id));
+    for (const item of result.items) if (item.image_asset_id && !ids.has(item.image_asset_id)) throw new Error(`Неизвестное изображение ${field}.items`);
+    result.meta ??= {};
+  }
+  if (type.name === 'table') {
+    const rows = value.rows === undefined ? [] : value.rows;
+    if (!Array.isArray(rows) || rows.length > 100) throw new Error(`Некорректные строки ${field}.rows`);
+    const count = { value: 0 };
+    result.rows = rows.map((row, index) => tableRow(row, `${field}.rows[${index}]`, count));
+    const mediaIds = new Set(result.media.map(asset => asset.id));
+    for (const cell of result.rows.flatMap(row => row.cells)) {
+      const imageIds = cell.image_asset_ids || (cell.image_asset_id ? [cell.image_asset_id] : []);
+      if (imageIds.some(id => !mediaIds.has(id))) throw new Error(`Неизвестное изображение ${field}.rows`);
+    }
+    result.meta ??= {};
+  }
   for (const spec of type.fields) {
     const item = value[spec.name]; if (item === undefined || item === '') continue;
     if (spec.kind === 'boolean') { if (typeof item !== 'boolean') throw new Error(`Некорректное поле ${field}.${spec.name}`); result[spec.name] = item; }
@@ -95,7 +315,12 @@ function validateDocument(value) {
   if (!/^[a-f0-9]{64}$/.test(document.source.htmlSha256)) throw new Error('Некорректный source.htmlSha256');
   for (const item of [document.common, ...document.tabs]) {
     if (ids.has(item.id)) throw new Error('Дублирующийся id раздела'); ids.add(item.id);
-    for (const child of item.blocks) { if (ids.has(child.id)) throw new Error('Дублирующийся id блока'); ids.add(child.id); for (const asset of child.media) { if (ids.has(asset.id)) throw new Error('Дублирующийся id медиа'); ids.add(asset.id); } }
+    for (const child of item.blocks) {
+      if (ids.has(child.id)) throw new Error('Дублирующийся id блока'); ids.add(child.id);
+      const visit = item => { if (ids.has(item.id)) throw new Error('Дублирующийся id медиа или элемента'); ids.add(item.id); for (const nested of item.children || []) visit(nested); };
+      for (const asset of [...child.media, ...(child.items || [])]) visit(asset);
+      for (const row of child.rows || []) { visit(row); for (const cell of row.cells) visit(cell); }
+    }
   }
   return document;
 }
@@ -158,11 +383,25 @@ class PageBuilderStore {
     return { ...this.validateStored(stored), attempt };
   }
   write(jobId, expectedRevision, document, attempt) {
+    this.assertWritable?.(jobId);
+    const prepared = this.prepareWrite(jobId, expectedRevision, document, attempt);
+    atomicJson(this.file(jobId, prepared.attempt), { revision: prepared.revision, updatedAt: prepared.updatedAt, document: prepared.document });
+    return prepared;
+  }
+  prepareWrite(jobId, expectedRevision, document, attempt) {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw Object.assign(new Error('Требуется revision'), { statusCode: 409 });
     const current = this.read(jobId, { attempt }); attempt = current.attempt;
     if (current.revision !== expectedRevision) throw Object.assign(new Error('Данные шага 3 уже изменены; обновите страницу'), { statusCode: 409 });
     const validated = validateDocument(document);
     if (validated.source.hostname !== current.document.source.hostname || validated.source.htmlSha256 !== current.document.source.htmlSha256) throw new Error('Происхождение исходного HTML неизменяемо');
+    // Old drafts may contain empty rich-content blocks. Keep them readable and
+    // let unrelated writes pass, but require both fields when that block is edited.
+    const existingBlocks = new Map([current.document.common, ...current.document.tabs].flatMap(section => section.blocks.map(block => [block.id, block])));
+    for (const block of [validated.common, ...validated.tabs].flatMap(section => section.blocks)) {
+      if (block.type !== 'rich-content' || JSON.stringify(block) === JSON.stringify(existingBlocks.get(block.id))) continue;
+      if (!block.text.trim()) throw new Error('Для HTML-фрагмента заполните HTML');
+      if (!block.reason?.trim()) throw new Error('Для HTML-фрагмента заполните обоснование');
+    }
     this.validateMedia?.(jobId, validated, current.document, attempt);
     const previous = new Map([current.document.common, ...current.document.tabs].flatMap(section => section.blocks.map(block => [block.id, { sectionId: section.id, block }])));
     const submitted = new Map([document.common, ...document.tabs].flatMap(section => section.blocks.map(block => [block.id, block])));
@@ -177,7 +416,7 @@ class PageBuilderStore {
       section.review = derivedReview(section.blocks);
     }
     const next = { revision: current.revision + 1, updatedAt: new Date().toISOString(), document: validated };
-    atomicJson(this.file(jobId, attempt), next); return { ...next, attempt, blockTypes: BLOCK_TYPES };
+    return { ...next, attempt, blockTypes: BLOCK_TYPES };
   }
   summary(jobId, attempt) {
     try { const stored = this.read(jobId, { create: false, attempt }); return stored ? { ...statusSummary(stored.document), revision: stored.revision } : { status: 'unreviewed', total: 0, passed: 0, failed: 0, unreviewed: 0, revision: 0 }; }

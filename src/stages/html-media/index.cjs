@@ -5,12 +5,16 @@ const { attemptDir } = require('../../pipeline/paths.cjs');
 const { atomicJson, safeFile, stableRead } = require('../../infrastructure/files.cjs');
 const { inventory } = require('./inventory.cjs');
 const { LIMITS, download } = require('./download.cjs');
-const { checkedPath, filename, extensions, mediaMime, verifiedRasterMime, detectLegacyImages } = require('../../infrastructure/media.cjs');
+const { detectLegacyImages, validateContent, detectRasterMime, readChecked } = require('../../infrastructure/media.cjs');
+const { inspectSource } = require('../../../public/embed-policy.js');
+const { parseFragment, serializeOuter } = require('parse5');
+const { MediaDeletion } = require('./deletion.cjs');
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
 class HtmlMediaStage {
   constructor(queue, { htmlResources = path.join(APP_ROOT, 'src/resources'), mediaDownload = download, mediaLimits = {} } = {}) {
     Object.assign(this, { queue, resources: htmlResources, download: mediaDownload, limits: { ...LIMITS, ...mediaLimits }, uploads: new Set() });
+    this.deletion = new MediaDeletion(this);
   }
   directory(job, attempt, revision = attempt.htmlMedia?.revision) {
     if (!Number.isSafeInteger(revision) || revision < 1) throw new Error('Нет HTML revision');
@@ -31,37 +35,95 @@ class HtmlMediaStage {
     return manifest;
   }
   project(attempt, manifest) {
-    const resources = manifest.resources;
+    const resources = manifest.resources.filter(item => item.status !== 'deleted');
     attempt.htmlMedia = { revision: manifest.revision, source: { bytes: manifest.source.bytes, sha256: manifest.source.sha256, origin: manifest.source.origin }, status: manifest.status,
       total: resources.length, downloaded: resources.filter(r => r.status === 'downloaded').length, pending: resources.filter(r => r.status === 'pending').length,
       issues: resources.filter(r => ['failed', 'unsupported'].includes(r.status)).length, external: resources.filter(r => r.status === 'external').length,
       bytes: resources.reduce((sum, r) => sum + (r.bytes || 0), 0), transferredBytes: manifest.transferredBytes || 0, checkpoint: manifest.checkpoint };
   }
   publish(job, attempt, manifest) {
+    this.deletion.assertReady();
     manifest.checkpoint = (manifest.checkpoint || 0) + 1;
     atomicJson(path.join(this.directory(job, attempt, manifest.revision), 'manifest.json'), manifest);
     this.project(attempt, manifest); this.queue.save();
   }
-  publishImage(job, attempt, item) {
-    if (item.status !== 'downloaded' || !extensions[mediaMime(item)]) return;
-    if (!/^[a-f0-9]{64}$/.test(item.sha256) || item.object !== `objects/${item.sha256}`) throw new Error('Object identity mismatch');
-    const dir = this.directory(job, attempt), images = checkedPath(this.queue.root, path.join(dir, 'images'));
-    const source = checkedPath(this.queue.root, path.join(dir, item.object)), target = path.join(images, filename(item));
-    const bytes = stableRead(source, this.limits.maxFileBytes);
-    if (bytes.length !== item.bytes || sha(bytes) !== item.sha256 || !verifiedRasterMime(item, bytes)) throw new Error('Object checksum/MIME mismatch');
-    try { fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL); }
-    catch (error) { if (error.code !== 'EEXIST') throw error; }
-    const copied = stableRead(checkedPath(this.queue.root, target), this.limits.maxFileBytes);
-    if (copied.length !== item.bytes || sha(copied) !== item.sha256) throw new Error('Файл в папке выбора изменён; восстановите медиа шага 2');
+  manualContext(jobId, request) {
+    this.deletion.assertReady();
+    if (this.queue.closing || !request || Object.keys(request).sort().join(',') !== 'attempt,htmlRevision,revision'
+      || !Object.values(request).every(value => Number.isSafeInteger(value) && value > 0)) throw conflict('Некорректный контекст добавления медиа');
+    const job = this.queue.get(jobId), attempt = job.attempts.find(value => value.number === request.attempt);
+    if (!attempt || job.attempts.at(-1) !== attempt || !['complete', 'paused', 'interrupted'].includes(attempt.status)
+      || this.queue.active.has(jobId) || attempt.htmlMedia?.revision !== request.htmlRevision
+      || this.queue.pageBuilder.read(jobId, { attempt: request.attempt, create: false })?.revision !== request.revision) throw conflict('Попытка, HTML или документ изменились; откройте редактор снова');
+    const dir = this.directory(job, attempt), manifestBytes = readChecked(this.queue.root, path.join(dir, 'manifest.json'), 24 * 1024 * 1024);
+    const manifest = JSON.parse(manifestBytes);
+    if (manifest.jobId !== jobId || manifest.attempt !== request.attempt || manifest.revision !== request.htmlRevision || !Array.isArray(manifest.resources)) throw conflict('Manifest шага 2 изменился');
+    return { job, attempt, dir, manifest, manifestHash: sha(manifestBytes) };
   }
-  prepareLegacyImages(job, attempt, items) {
-    if (!items.length) return;
-    const dir = checkedPath(this.queue.root, this.directory(job, attempt)), images = path.join(dir, 'images');
-    try { fs.mkdirSync(images); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    checkedPath(this.queue.root, images);
-    for (const item of items) this.publishImage(job, attempt, item);
+  commitManual(jobId, request, selected, item) {
+    const current = this.manualContext(jobId, request);
+    if (current.manifestHash !== selected.manifestHash) throw conflict('Manifest шага 2 изменился; откройте выбор снова');
+    if (selected.manifest.resources.length >= this.limits.maxResources) throw new Error('Лимит ресурсов шага 2');
+    item.id = Math.max(0, ...selected.manifest.resources.map(value => value.id)) + 1;
+    selected.manifest.resources.push(item);
+    this.publish(selected.job, selected.attempt, selected.manifest);
+    return { resourceId: item.id, checkpoint: selected.manifest.checkpoint };
+  }
+  async addFile(jobId, request, name, kind, stream) {
+    if (!['image', 'document'].includes(kind) || typeof name !== 'string' || !name || Buffer.byteLength(name, 'utf8') > 240
+      || /[\p{Cc}\p{Cf}\p{Cs}<>:"/\\|?*]/u.test(name) || /^\.|[. ]$/.test(name)
+      || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(name)) throw new Error('Некорректное имя или тип файла');
+    if (this.uploads.has(jobId)) throw conflict('Добавление медиа уже выполняется');
+    const selected = this.manualContext(jobId, request);
+    this.uploads.add(jobId);
+    try {
+      const chunks = []; let size = 0;
+      for await (const chunk of stream) { size += chunk.length; if (size > this.limits.maxFileBytes) throw new Error('Файл превышает лимит размера'); chunks.push(chunk); }
+      if (!size) throw new Error('Пустой файл');
+      const bytes = Buffer.concat(chunks), header = bytes.subarray(0, 4096), extension = name.match(/\.([a-z0-9]+)$/i)?.[1].toLowerCase();
+      const mimes = { pdf:'application/pdf', txt:'text/plain', csv:'text/csv', rtf:'application/rtf', doc:'application/msword', xls:'application/vnd.ms-excel', ppt:'application/vnd.ms-powerpoint',
+        docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document', xlsx:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        odt:'application/vnd.oasis.opendocument.text', ods:'application/vnd.oasis.opendocument.spreadsheet', zip:'application/zip', gz:'application/gzip', rar:'application/vnd.rar', '7z':'application/x-7z-compressed', tar:'application/x-tar',
+        mp3:'audio/mpeg', wav:'audio/wav', ogg:'audio/ogg', mp4:'video/mp4', m4a:'audio/mp4', webm:'video/webm', mov:'video/quicktime', svg:'image/svg+xml', tif:'image/tiff', tiff:'image/tiff', ico:'image/vnd.microsoft.icon' };
+      const raster = detectRasterMime(header), mime = kind === 'image' ? raster : mimes[extension];
+      if (kind === 'image' && (!raster || !({ png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', webp:'image/webp', avif:'image/avif', bmp:'image/bmp' })[extension] || ({ png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', webp:'image/webp', avif:'image/avif', bmp:'image/bmp' })[extension] !== raster)
+        || kind === 'document' && (!mime || raster || !validateContent(mime, header))) throw new Error('Формат файла и содержимое не совпадают');
+      const current = this.manualContext(jobId, request);
+      if (current.manifestHash !== selected.manifestHash) throw conflict('Manifest шага 2 изменился; откройте выбор снова');
+      const used = selected.manifest.resources.filter(item => item.status === 'downloaded').reduce((sum, item) => sum + (item.bytes || 0), 0);
+      if (used + size > this.limits.maxTotalBytes) throw new Error('Лимит суммарного размера медиа');
+      const digest = sha(bytes), object = `objects/${digest}`, destination = path.join(selected.dir, object);
+      if (fs.existsSync(destination)) { if (!readChecked(this.queue.root, destination, this.limits.maxFileBytes).equals(bytes)) throw new Error('Коллизия объекта медиа'); }
+      else { const temp = path.join(selected.dir, 'objects', `${crypto.randomUUID()}.tmp`); try { fs.writeFileSync(temp, bytes, { flag: 'wx' }); fs.renameSync(temp, destination); } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); } }
+      const nextId = Math.max(0, ...selected.manifest.resources.map(item => item.id)) + 1;
+      const localUrl = `/api/html-media/${jobId}/${request.attempt}/${request.htmlRevision}/${object}?resourceId=${nextId}`;
+      return this.commitManual(jobId, request, selected, { kind: 'asset', status: 'downloaded', manual: true, originalUrl: localUrl, resolvedUrl: localUrl,
+        occurrence: { tag: 'manual-upload', attribute: 'file', line: null, column: null, downloadFilename: name }, mime, bytes: size, sha256: digest, object });
+    } finally { this.uploads.delete(jobId); }
+  }
+  addFrame(jobId, request, code) {
+    if (this.uploads.has(jobId)) throw conflict('Добавление медиа уже выполняется');
+    const selected = this.manualContext(jobId, request);
+    if (typeof code !== 'string' || !code.trim() || code.length > 8192) throw new Error('Введите код iframe до 8192 символов');
+    const parseErrors = [], fragment = parseFragment(code.trim(), { onParseError: error => parseErrors.push(error.code) });
+    const elements = fragment.childNodes.filter(node => node.nodeName !== '#text' || node.value.trim());
+    if (elements.length !== 1 || elements[0].tagName !== 'iframe' || elements[0].childNodes.length) throw new Error('Нужен один iframe без вложенного содержимого');
+    const attrs = elements[0].attrs || [], allowed = new Set(['src', 'title', 'width', 'height', 'loading', 'allow', 'allowfullscreen', 'frameborder']);
+    if (attrs.filter(attr => attr.name === 'src').length !== 1) throw new Error('Код iframe должен содержать атрибут src');
+    const source = inspectSource(attrs.find(attr => attr.name === 'src').value);
+    if (!source.allowed) throw new Error(source.reason);
+    // Manual snippets are copied as text. Drop unknown attributes from the
+    // persisted copy, including event handlers and srcdoc.
+    const unknown = attrs.some(attr => !allowed.has(attr.name));
+    if (unknown) elements[0].attrs = attrs.filter(attr => allowed.has(attr.name));
+    const snippet = unknown || parseErrors.includes('duplicate-attribute') ? serializeOuter(elements[0]) : code;
+    this.uploads.add(jobId);
+    try { return this.commitManual(jobId, request, selected, { kind: 'external', status: 'external', manual: true, originalUrl: source.url, resolvedUrl: source.url,
+      occurrence: { tag: 'iframe', attribute: 'src', line: null, column: null }, snippet }); }
+    finally { this.uploads.delete(jobId); }
   }
   create(job, attempt, bytes, origin) {
+    this.deletion.assertReady();
     if (bytes.length > this.limits.maxHtmlBytes || !bytes.length) throw new Error('HTML пуст или превышает лимит 8 MiB');
     const root = path.join(attemptDir(this.queue.root, job, attempt), 'html-media'); fs.mkdirSync(root, { recursive: true });
     let revision = (attempt.htmlMedia?.revision || 0) + 1, dir;
@@ -74,7 +136,7 @@ class HtmlMediaStage {
       let text; try { text = new TextDecoder(charset).decode(bytes); } catch { text = bytes.toString('utf8'); }
       manifest.source.encoding = charset; manifest.resources = inventory(text, job.url, this.limits.maxResources);
       fs.writeFileSync(path.join(staging, 'source.html'), bytes, { flag: 'wx' });
-      fs.mkdirSync(path.join(staging, 'objects')); fs.mkdirSync(path.join(staging, 'images')); atomicJson(path.join(staging, 'manifest.json'), manifest);
+      fs.mkdirSync(path.join(staging, 'objects')); atomicJson(path.join(staging, 'manifest.json'), manifest);
       fs.renameSync(staging, dir); this.project(attempt, manifest);
     } finally { if (fs.existsSync(staging)) fs.rmSync(staging, { recursive: true, force: true }); }
     return manifest;
@@ -110,24 +172,15 @@ class HtmlMediaStage {
     if (attempt.htmlMedia?.revision) {
       try {
         const manifest = this.read(job, attempt, true);
-        if (attempt.status === 'queued') this.recoverImages(job, attempt, manifest);
         this.project(attempt, manifest);
         if (['complete', 'ready_with_issues'].includes(manifest.status)) attempt.status = 'complete';
       }
       catch (error) { attempt.status = 'interrupted'; attempt.error = error.message; }
     } else { const captureStatus = attempt.captureStatus; this.enter(job, attempt); attempt.captureStatus = captureStatus; }
   }
-  recoverImages(job, attempt, manifest) {
-    if (['complete', 'ready_with_issues'].includes(manifest.status)) return;
-    const dir = this.directory(job, attempt), images = path.join(dir, 'images');
-    checkedPath(this.queue.root, dir);
-    try { fs.mkdirSync(images); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    checkedPath(this.queue.root, images);
-    for (const item of manifest.resources) this.publishImage(job, attempt, item);
-  }
   validateResume(job, attempt) {
     if (this.uploads.has(job.id)) throw new Error('Загрузка HTML ещё выполняется');
-    this.recoverImages(job, attempt, this.read(job, attempt, true));
+    this.read(job, attempt, true);
   }
   start(job, attempt) {
     const queue = this.queue, controller = new AbortController();
@@ -150,7 +203,6 @@ class HtmlMediaStage {
             if (controller.signal.aborted) break;
             Object.assign(item, error.provenance || {}, { status: 'failed', error: error.message });
           }
-          if (item.status === 'downloaded') this.publishImage(job, attempt, item);
           this.publish(job, attempt, manifest);
         }
         const paused = attempt.pauseRequested || queue.closing;
@@ -170,6 +222,7 @@ class HtmlMediaStage {
   async upload(job, attempt, expectedRevision, request) {
     const queue = this.queue;
     const check = () => {
+      this.deletion.assertReady();
       if (queue.closing || job.attempts.at(-1) !== attempt || attempt.phase !== 'html-media' || !['paused','complete','interrupted'].includes(attempt.status) || queue.active.has(job.id) || (attempt.htmlMedia?.revision || 0) !== expectedRevision) throw conflict('Попытка или revision изменились; обновите страницу');
     };
     check(); if (this.uploads.has(job.id)) throw conflict('HTML уже загружается');

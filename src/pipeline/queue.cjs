@@ -90,6 +90,32 @@ class PageQueue {
     if (this.autoStart) this.pump();
     return { concurrency: this.concurrency };
   }
+  reorderJobs(expected, order) {
+    const current = this.jobs.map(job => job.id).reverse();
+    if (!Array.isArray(expected) || !Array.isArray(order) ||
+        expected.length !== current.length || order.length !== current.length ||
+        expected.some((id, index) => id !== current[index]) ||
+        new Set(order).size !== current.length || order.some(id => !current.includes(id))) {
+      throw conflict('Список задач изменился; обновите страницу и повторите перестановку.');
+    }
+    if (order.every((id, index) => id === current[index])) return { ok: true };
+    const previousJobs = this.jobs, previousOrder = this.nextQueueOrder;
+    const previousQueued = this.jobs.filter(job => last(job).status === 'queued').map(job => [last(job), last(job).queueOrder]);
+    const byId = new Map(this.jobs.map(job => [job.id, job]));
+    this.jobs = order.map(id => byId.get(id)).reverse();
+    for (const id of order) {
+      const attempt = last(byId.get(id));
+      if (attempt.status === 'queued') attempt.queueOrder = ++this.nextQueueOrder;
+    }
+    try { this.save(); }
+    catch (error) {
+      this.jobs = previousJobs; this.nextQueueOrder = previousOrder;
+      for (const [attempt, queueOrder] of previousQueued) attempt.queueOrder = queueOrder;
+      throw error;
+    }
+    if (this.autoStart) this.pump();
+    return { ok: true };
+  }
   add(urls) {
     if (typeof urls !== 'string' || urls.length > 128 * 1024) throw new Error('Передайте urls — текст до 128 KiB');
     const entries = urls.split(/\r?\n/).map(line => line.trim()).filter(Boolean);

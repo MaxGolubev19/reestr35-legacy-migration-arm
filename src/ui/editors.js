@@ -7,6 +7,7 @@ import htmlPlugin from 'prettier/plugins/html';
 import { createJSONEditor, Mode } from 'vanilla-jsoneditor';
 
 const viewers = new Map();
+const htmlTheme = EditorView.theme({ '&': { color: '#182433', backgroundColor: '#fff', fontSize: '13px' }, '.cm-gutters': { backgroundColor: '#f6f8fb', color: '#626976', borderColor: '#e6e7e9' }, '.cm-content': { fontFamily: 'Consolas, monospace' } });
 export function destroy(id) {
   const viewer = viewers.get(id); viewers.delete(id);
   if (viewer) { viewer.cancelled = true; Promise.resolve(viewer.destroy?.()).catch(() => {}); }
@@ -23,9 +24,20 @@ export async function showHtml(id, source) {
   if (warning) { const note = document.createElement('div'); note.className = 'alert alert-warning'; note.setAttribute('role', 'status'); note.textContent = warning; target.append(note); }
   const host = document.createElement('div'); host.className = 'editor-host'; target.append(host);
   const view = new EditorView({ parent: host, doc: viewer.text, extensions: [lineNumbers(), foldGutter(), highlightSpecialChars(), drawSelection(), syntaxHighlighting(defaultHighlightStyle, { fallback: true }), bracketMatching(), html(), EditorState.readOnly.of(true), EditorView.editable.of(false), EditorView.contentAttributes.of({ tabindex: '0', 'aria-label': 'HTML только для чтения' }), EditorView.lineWrapping,
-    EditorView.theme({ '&': { color: '#182433', backgroundColor: '#fff', fontSize: '13px' }, '.cm-gutters': { backgroundColor: '#f6f8fb', color: '#626976', borderColor: '#e6e7e9' }, '.cm-content': { fontFamily: 'Consolas, monospace' } })] });
+    htmlTheme] });
   viewer.destroy = () => { view.destroy(); target.replaceChildren(); delete target.dataset.viewer; }; target.dataset.viewer = 'codemirror6';
   return true;
+}
+export function editHtml(id, source = '', options = {}) {
+  destroy(id);
+  const target = document.getElementById(id), editor = { text: source };
+  viewers.set(id, editor); target.replaceChildren();
+  const host = document.createElement('div'); host.className = `editor-host ${options.hostClass || 'builder-frame-code-editor'}`; target.append(host);
+  const view = new EditorView({ parent: host, doc: source, extensions: [lineNumbers(), foldGutter(), highlightSpecialChars(), drawSelection(), syntaxHighlighting(defaultHighlightStyle, { fallback: true }), bracketMatching(), html(), EditorView.lineWrapping,
+    EditorView.contentAttributes.of({ 'aria-label': options.label || 'Код iframe' }), EditorView.updateListener.of(update => { if (update.docChanged) { editor.text = update.state.doc.toString(); options.onChange?.(editor.text); } }), htmlTheme] });
+  editor.destroy = () => { view.destroy(); target.replaceChildren(); delete target.dataset.viewer; };
+  target.dataset.viewer = 'codemirror6-editable';
+  if (options.focus !== false) view.focus();
 }
 export function showJson(id, json) {
   destroy(id); const target = document.getElementById(id); target.replaceChildren();
