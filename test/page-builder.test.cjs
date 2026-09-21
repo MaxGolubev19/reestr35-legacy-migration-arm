@@ -233,12 +233,70 @@ test('portable type catalog has fixed IDs, views and defaults; scalar and media 
   assert.deepEqual(BLOCK_TYPES.map(type => type.label), ['Изображение / баннер', 'Таблица с текстом и изображениями', 'Описание услуги', 'Текст с изображениями', 'Карточки / галерея', 'Таблица данных', 'Ссылки и документы', 'Список разделов', 'Видео, карта или виджет', 'HTML-фрагмент']);
   const { queue, job } = await fixture(t), initial = queue.pageBuilder.read(job.id);
   for (const type of BLOCK_TYPES) for (const view of type.views) {
-    const doc = structuredClone(initial.document), block = doc.common.blocks[0]; Object.assign(block, { type: type.name, view, text: 'Текст' }); if (type.name === 'rich-content') block.reason = 'Сохранение разметки';
+    const doc = structuredClone(initial.document), block = doc.common.blocks[0]; Object.assign(block, { type: type.name, view, text: 'Текст' }); if (type.name === 'rich-content') block.reason = 'Сохранение разметки'; if (type.name === 'data-table') block.media = [];
     assert.equal(validateDocument(doc).common.blocks[0].view, view); delete block.view; assert.equal(validateDocument(doc).common.blocks[0].view, type.default_view);
   }
   for (const change of [block => { block.type = 'unknown'; }, block => { block.view = 'unknown'; }, block => { block.link = 'javascript:alert(1)'; }, block => { block.media[0].bigUrl = 'file:///private'; }, block => { block.media[0].href = 'data:text/html,bad'; }, block => { block.media.push(structuredClone(block.media[0])); }, block => { block.media = Array.from({ length: 13 }, (_, index) => ({ ...block.media[0], id: `excess-${index}` })); }, block => { block.items = []; }]) {
     const doc = structuredClone(initial.document); change(doc.common.blocks[0]); assert.throws(() => queue.pageBuilder.write(job.id, initial.revision, doc)); assert.deepEqual(queue.pageBuilder.read(job.id), initial);
   }
+});
+
+test('data-table round trips columns, group rows and literal HTML cells with stable IDs and CAS', async t => {
+  const { queue, job, base, headers } = await fixture(t), initial = queue.pageBuilder.read(job.id), document = structuredClone(initial.document);
+  const block = document.common.blocks[0]; Object.assign(block, { type: 'data-table', view: 'compact', media: [], review: { status: 'unreviewed', reason: '' }, caption: '  Подпись  ', meta: { striped: false, bordered: true, sticky_header: true, min_width: 640 },
+    columns: [{ key: 'name', title: 'Название', width: 40, align: 'center', nowrap: true }, {}],
+    rows: [{ group: 'Группа' }, { cells: [{ value: ' **Markdown**\n<b>x</b>\n<script>invalid()</script> ', key: 'unrelated-key', align: 'right', colspan: 2, rowspan: 3, is_header: true, nowrap: false }, { value: '' }] }] });
+  const normalized = validateDocument(document), expected = normalized.common.blocks[0];
+  assert.deepEqual(validateDocument(normalized), normalized); assert.deepEqual(validateDocument(document), normalized);
+  assert.match(expected.columns[0].id, /^column-/); assert.match(expected.rows[0].id, /^row-/); assert.match(expected.rows[1].cells[0].id, /^cell-/);
+  assert.equal(expected.rows[1].cells[0].value, block.rows[1].cells[0].value); assert.deepEqual(expected.rows[1].cells[1], { id: expected.rows[1].cells[1].id, value: '' });
+  assert.deepEqual(expected.columns[1], { id: expected.columns[1].id, key: '', title: '' });
+  const response = await fetch(`${base}/api/page-builder/${job.id}`, { method: 'POST', headers, body: JSON.stringify({ revision: initial.revision, document }) }); assert.equal(response.status, 200, await response.clone().text());
+  const saved = await response.json(); assert.deepEqual(saved.document.common.blocks[0], expected); assert.deepEqual(queue.pageBuilder.read(job.id).document, saved.document);
+  assert.throws(() => queue.pageBuilder.write(job.id, initial.revision, document), /уже изменены/);
+  const reordered = structuredClone(saved.document), current = reordered.common.blocks[0]; current.columns.reverse(); current.rows.reverse(); current.rows[0].cells.reverse();
+  const second = queue.pageBuilder.write(job.id, saved.revision, reordered).document.common.blocks[0];
+  assert.deepEqual(second.columns.map(column => column.id), expected.columns.map(column => column.id).reverse()); assert.equal(second.rows[1].id, expected.rows[0].id); assert.equal(second.rows[0].cells[1].id, expected.rows[1].cells[0].id);
+});
+
+test('data-table legacy aliases normalize without rewriting disk; caption-only documents stay readable', async t => {
+  const { queue, job } = await fixture(t), stored = queue.pageBuilder.read(job.id), block = stored.document.common.blocks[0];
+  Object.assign(block, { type: 'data-table', view: 'default', media: [], meta: { caption: 'Старая подпись', columns: [{ key: 'a', title: 'A' }] }, rows: [{ group: 'Раздел' }, { cells: [{ value: '' }] }] });
+  const file = queue.pageBuilder.file(job.id); fs.writeFileSync(file, JSON.stringify(stored)); const bytes = fs.readFileSync(file);
+  const read = queue.pageBuilder.read(job.id), normalized = read.document.common.blocks[0]; assert.deepEqual(fs.readFileSync(file), bytes); assert.equal(read.revision, stored.revision);
+  assert.equal(normalized.caption, 'Старая подпись'); assert.deepEqual(normalized.meta, {}); assert.equal(normalized.columns[0].title, 'A');
+  assert.deepEqual(queue.pageBuilder.read(job.id), read);
+  const saved = queue.pageBuilder.write(job.id, read.revision, read.document); assert.deepEqual(saved.document.common.blocks[0], normalized);
+  const legacy = structuredClone(stored.document); Object.assign(legacy.common.blocks[0], { caption: 'Только подпись' }); delete legacy.common.blocks[0].rows; delete legacy.common.blocks[0].meta;
+  const captionOnly = validateDocument(legacy).common.blocks[0]; assert.deepEqual(captionOnly.columns, []); assert.deepEqual(captionOnly.rows, []); assert.deepEqual(captionOnly.meta, {});
+  const alias = structuredClone(stored.document); alias.common.blocks[0].caption = 'Другой текст'; alias.common.blocks[0].columns = [];
+  const preferred = validateDocument(alias).common.blocks[0]; assert.equal(preferred.caption, 'Другой текст'); assert.deepEqual(preferred.columns, []); assert.deepEqual(preferred.meta, {});
+});
+
+test('data-table rejects unknown fields, bad types, XOR violations, duplicate IDs and local resource limits without writes', async t => {
+  const { DATA_TABLE_LIMITS: limits } = require('../src/stages/page-builder/store.cjs');
+  assert.deepEqual(limits, { columns: 100, rows: 100, cells: 1000, key: 200, title: 500, value: 12000, caption: 1000 });
+  const { queue, job } = await fixture(t), initial = queue.pageBuilder.read(job.id), document = structuredClone(initial.document);
+  Object.assign(document.common.blocks[0], { type: 'data-table', view: 'default', media: [], caption: '', meta: {}, columns: [{ id: 'data-column', key: '', title: '' }], rows: [{ id: 'data-group', group: 'Группа' }, { id: 'data-row', cells: [{ id: 'data-cell', value: '' }] }] });
+  const changes = [b => b.unknown = true, b => b.meta.unknown = true, b => b.columns[0].unknown = true, b => b.rows[1].unknown = true, b => b.rows[1].cells[0].unknown = true, b => b.rows[1].cells[0].text = 'Скрытый текст', b => b.rows[0].drafts = { cells: [{ value: 'Скрытая ячейка' }] },
+    b => b.media = initial.document.common.blocks[0].media, b => b.columns = null, b => b.rows = null, b => b.meta = null, b => b.caption = null, b => { delete b.columns; b.meta = { columns: null }; },
+    b => b.rows[0].cells = [], b => delete b.rows[0].group, b => b.rows[0].group = '  ', b => b.rows[0].group = 1, b => b.rows[1].cells = [], b => b.rows[1].cells = {},
+    b => delete b.rows[1].cells[0].value, b => b.rows[1].cells[0].value = 2, b => b.columns[0].title = null, b => b.columns[0].key = 2,
+    b => b.columns[0].id = 'BAD', b => b.columns[0].id = b.id, b => b.rows[0].id = 'data-column', b => b.rows[1].cells[0].id = 'data-group',
+    b => b.caption = 'x'.repeat(limits.caption + 1), b => b.columns[0].title = 'x'.repeat(limits.title + 1), b => b.columns[0].key = 'x'.repeat(limits.key + 1), b => b.rows[0].group = 'x'.repeat(limits.title + 1), b => b.rows[1].cells[0].value = 'x'.repeat(limits.value + 1), b => b.rows[1].cells[0].key = 'x'.repeat(limits.key + 1),
+    b => b.columns = Array.from({ length: limits.columns + 1 }, () => ({ key: '', title: '' })), b => b.rows = Array.from({ length: limits.rows + 1 }, () => ({ group: 'g' })), b => b.rows = [{ cells: Array.from({ length: limits.cells + 1 }, () => ({ value: '' })) }]];
+  for (const key of ['striped', 'bordered', 'sticky_header']) for (const value of [0, 'true', null]) changes.push(b => b.meta[key] = value);
+  for (const value of [479, 1601, 480.5, '640', null]) changes.push(b => b.meta.min_width = value);
+  for (const value of [4, 81, 5.5, '40', null]) changes.push(b => b.columns[0].width = value);
+  for (const value of ['', 'start', null]) { changes.push(b => b.columns[0].align = value); changes.push(b => b.rows[1].cells[0].align = value); }
+  for (const key of ['colspan', 'rowspan']) for (const value of [0, key === 'colspan' ? 13 : 101, 1.5, '2', null]) changes.push(b => b.rows[1].cells[0][key] = value);
+  for (const value of [0, 'false', null]) { changes.push(b => b.columns[0].nowrap = value); changes.push(b => b.rows[1].cells[0].nowrap = value); changes.push(b => b.rows[1].cells[0].is_header = value); }
+  const bytes = fs.readFileSync(queue.pageBuilder.file(job.id));
+  for (const change of changes) { const invalid = structuredClone(document); change(invalid.common.blocks[0]); assert.throws(() => queue.pageBuilder.write(job.id, initial.revision, invalid), undefined, change.toString()); }
+  assert.deepEqual(fs.readFileSync(queue.pageBuilder.file(job.id)), bytes); assert.equal(queue.pageBuilder.read(job.id).revision, initial.revision);
+  const maximum = structuredClone(document), block = maximum.common.blocks[0]; block.columns = Array.from({ length: limits.columns }, () => ({ key: 'x'.repeat(limits.key), title: 'x'.repeat(limits.title), width: 80, nowrap: false }));
+  block.caption = 'x'.repeat(limits.caption); block.meta = { min_width: 1600, striped: true, bordered: false, sticky_header: false }; block.rows = Array.from({ length: limits.rows }, () => ({ cells: Array.from({ length: 10 }, () => ({ value: '', colspan: 12, rowspan: 100 })) })); block.rows[0].cells[0].value = 'x'.repeat(limits.value);
+  assert.equal(validateDocument(maximum).common.blocks[0].rows.flatMap(row => row.cells).length, limits.cells);
 });
 
 test('grid gallery items and image settings round trip with bounded references', async t => {
@@ -430,6 +488,7 @@ test('ordinary block fields are optional, empty media is safe, and failed review
     const document = structuredClone(stored.document);
     document.common.blocks = [{ id: 'empty-block', type: type.name, view, title: '', text: '', content: '', settings: '', media: [{ id: 'empty-image', originalUrl: '', bigUrl: '', href: '', alt: '', caption: '' }], review: { status: 'unreviewed', reason: '' }, ...Object.fromEntries(type.fields.map(field => [field.name, ''])) }];
     if (type.name === 'rich-content') Object.assign(document.common.blocks[0], { text: '<p>Текст</p>', reason: 'Сохранить порядок разметки' });
+    if (type.name === 'data-table') document.common.blocks[0].media = [];
     stored = queue.pageBuilder.write(job.id, stored.revision, document);
     assert.equal(stored.document.common.blocks[0].title, ''); assert.equal(stored.document.common.blocks[0].text, type.name === 'rich-content' ? '<p>Текст</p>' : '');
   }

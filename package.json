@@ -1,6 +1,6 @@
 {
   "name": "reestr35-capture-arm",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "private": true,
   "description": "Local capture queue with one app-server process per company QA pass and per-image checkpoints",
   "engines": {

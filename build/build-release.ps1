@@ -1,5 +1,5 @@
 #requires -Version 7.0
-param([string]$Version = '3.2.0')
+param([string]$Version = '3.3.0')
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $repo = Split-Path $PSScriptRoot

@@ -422,7 +422,7 @@
 @media (max-width: 575px) {
   .builder-simple-links { grid-template-columns: minmax(0, 1fr); }
   .builder-collapsible-item .builder-link-body, .builder-collapsible-item .builder-link-body:has(.builder-document-preview) { gap: .5rem; padding: .5rem; }
-  .builder-document-settings { width: calc(100% + 2rem); grid-template-columns: minmax(0, 1fr) 6rem; gap: .5rem; }
+  .builder-document-settings { width: 100%; grid-template-columns: minmax(0, 1fr) 6rem; gap: .5rem; }
 }
 @media (max-width: 360px) {
   .builder-link-body:has(.builder-document-preview) { grid-template-columns: 3rem minmax(0, 1fr); gap: .5rem; }

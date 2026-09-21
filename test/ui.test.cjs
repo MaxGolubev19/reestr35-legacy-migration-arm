@@ -48,6 +48,90 @@ async function tableCellDisclosurePatterns(page) {
   await page.setViewportSize({ width: 1440, height: 1000 }); return patterns;
 }
 
+test('data-table editor edits, reorders and validates nested data without media at every viewport', { timeout: 120000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-data-table-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = [], external = [], posts = [], origin = `http://127.0.0.1:${server.address().port}`;
+  page.on('pageerror', error => errors.push(error.message)); page.on('request', request => { if (!request.url().startsWith(origin)) external.push(request.url()); if (request.method() === 'POST' && request.url().includes('/api/page-builder/')) posts.push(request.postDataJSON()); });
+  await page.goto(origin); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const opener = page.locator('[data-builder-id="common-hero"]'), open = async () => { await opener.click(); await page.waitForSelector('#page-builder-modal.show'); }, close = async () => { await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); };
+  await open(); await page.locator('#builder-type').selectOption('data-table');
+  assert.equal(await page.locator('.builder-editor-placeholder,.builder-image-row').count(), 0); assert.equal(await page.locator('.builder-data-column,.builder-data-row,.builder-data-group').count(), 0);
+  assert.equal(await page.locator('#builder-add-data-group').count(), 0); assert.equal(await page.locator('label[for="builder-caption"]').innerText(), 'Подпись'); assert.doesNotMatch(await page.locator('.builder-data-table-editor').innerText(), /Ячейки соответствуют/);
+  assert.equal(await page.locator('#builder-data-striped').isChecked(), true); assert.equal(await page.locator('#builder-data-bordered').isChecked(), true); assert.equal(await page.locator('#builder-data-sticky_header').isChecked(), false); assert.equal(await page.locator('#builder-data-min_width').inputValue(), '');
+  await page.locator('#builder-title').fill('Таблица'); await page.locator('#builder-content').fill('Общий текст'); await page.locator('#builder-caption').fill('Подпись');
+  const shell = id => page.locator(`[data-data-id="${id}"]`), summary = id => shell(id).locator(':scope > details > summary'), control = (id, key) => page.locator(`#builder-data-${id}-${key}`);
+  await page.locator('#builder-add-data-column').click(); const columnA = await page.locator('.builder-data-column').first().getAttribute('data-data-id');
+  assert.equal(await shell(columnA).locator(':scope > details').evaluate(node => node.open), false); assert.equal(await summary(columnA).innerText(), 'Колонка'); assert.equal(await summary(columnA).evaluate(node => node === document.activeElement), true);
+  await summary(columnA).press('Enter'); await control(columnA, 'title').fill('<b>Название</b>'); await control(columnA, 'key').fill('name'); await control(columnA, 'align').selectOption('center'); await control(columnA, 'width').fill('4'); await control(columnA, 'nowrap').check();
+  assert.deepEqual(await shell(columnA).locator('.form-label').allInnerTexts(), ['Заголовок', 'Ключ', 'Выравнивание', 'Ширина, %', 'Не переносить текст']);
+  assert.equal(await summary(columnA).textContent(), '<b>Название</b>'); assert.equal(await summary(columnA).locator('b').count(), 0); await summary(columnA).click();
+  await page.locator('#page-builder-save').click(); assert.equal(posts.length, 0); assert.match(await page.locator('#page-builder-form-error').innerText(), /Ширина, %[\s\S]+5 до 80/); assert.equal(await control(columnA, 'width').evaluate(node => document.activeElement === node), true); assert.equal(await shell(columnA).locator(':scope > details').evaluate(node => node.open), true); await control(columnA, 'width').fill('40');
+  await page.locator('#builder-add-data-column').click(); const columnB = await page.locator('.builder-data-column').last().getAttribute('data-data-id'); assert.equal(await shell(columnA).locator(':scope > details').evaluate(node => node.open), true, 'adding preserves existing open cards'); await summary(columnB).click(); await control(columnB, 'title').fill('Цена'); await control(columnB, 'key').fill('price');
+  const reorder = async (selector, firstId, secondId) => {
+    const ids = () => page.locator(selector).evaluateAll(nodes => nodes.map(node => node.dataset.dataId));
+    await control(secondId, 'drag').focus(); await page.keyboard.press('ArrowUp'); assert.deepEqual(await ids(), [secondId, firstId]); assert.equal(await control(secondId, 'drag').evaluate(node => node === document.activeElement), true);
+    await page.keyboard.press('ArrowDown'); assert.deepEqual(await ids(), [firstId, secondId]);
+    await shell(firstId).locator(':scope > details').evaluate(node => node.open = false); await shell(secondId).locator(':scope > details').evaluate(node => node.open = false);
+    await control(secondId, 'drag').dragTo(shell(firstId), { targetPosition: { x: 15, y: 2 } }); assert.deepEqual(await ids(), [secondId, firstId]);
+  };
+  await reorder('.builder-data-column', columnA, columnB);
+  await page.locator('#builder-add-data-column').click(); const spareColumn = page.locator('.builder-data-column').last(); await spareColumn.locator(':scope > .builder-image-tools > .builder-delete').click(); assert.equal(await page.locator('.builder-data-column').count(), 2);
+  await page.locator('#builder-add-data-row').click(); const rowId = await page.locator('.builder-data-row').getAttribute('data-data-id'); assert.equal(await shell(rowId).locator(':scope > details').evaluate(node => node.open), false); await summary(rowId).click();
+  assert.equal(await shell(rowId).locator(':scope > details > .builder-table-cell-body > :first-child label').innerText(), 'Тип'); assert.equal(await control(rowId, 'type').inputValue(), 'row'); assert.deepEqual(await control(rowId, 'type').locator('option').allTextContents(), ['Строка', 'Группа']);
+  const cellA = await shell(rowId).locator('.builder-data-cell').getAttribute('data-data-id'); assert.equal(await shell(cellA).locator(':scope > details').evaluate(node => node.open), false); await summary(cellA).click();
+  const literal = ' <b>HTML</b>\n<img src="https://example.invalid/tracker"><script>throw 1</script> ';
+  assert.equal(await control(cellA, 'text').evaluate(node => node.open), false); assert.equal(await control(cellA, 'text').locator(':scope > summary').innerText(), 'Текст'); await control(cellA, 'text').locator(':scope > summary').click();
+  await control(cellA, 'value').fill('Markdown'); await control(cellA, 'value').evaluate(node => node.setSelectionRange(0, node.value.length)); await shell(cellA).getByRole('button', { name: 'Жирный', exact: true }).click(); assert.equal(await control(cellA, 'value').inputValue(), '**Markdown**'); assert.equal(await shell(cellA).locator('.builder-markdown-preview strong').innerText(), 'Markdown'); assert.equal(await summary(cellA).textContent(), 'Markdown');
+  await control(cellA, 'value').fill(literal); assert.equal(await summary(cellA).textContent(), 'HTML'); assert.equal(await control(cellA, 'value').evaluate(node => node.tagName), 'TEXTAREA'); assert.equal(await shell(cellA).locator('.builder-item-markdown').count(), 1); assert.equal(await shell(cellA).locator('script,img,.builder-markdown-preview b').count(), 0); assert.match(await shell(cellA).locator('.builder-markdown-preview').innerText(), /<b>HTML<\/b>/);
+  await control(cellA, 'settings').locator('summary').click(); await control(cellA, 'key').fill('unrelated-key'); assert.equal(await control(cellA, 'align').inputValue(), ''); await control(cellA, 'align').selectOption('right'); await control(cellA, 'colspan').fill('2'); await control(cellA, 'rowspan').fill('3'); await control(cellA, 'is_header').check(); await control(cellA, 'nowrap').check();
+  await control(rowId, 'add-cell').click(); const cellB = await shell(rowId).locator('.builder-data-cell').last().getAttribute('data-data-id'); assert.equal(await control(cellA, 'settings').evaluate(node => node.open), true, 'nested settings stay open'); assert.equal(await control(cellA, 'text').evaluate(node => node.open), true, 'Markdown section stays open'); assert.equal(await shell(cellB).locator(':scope > details').evaluate(node => node.open), false); await summary(cellB).click(); assert.equal(await control(cellB, 'text').evaluate(node => node.open), false); await control(cellB, 'text').locator(':scope > summary').click(); await control(cellB, 'value').fill('Вторая');
+  await reorder('.builder-data-cell', cellA, cellB); assert.equal(await control(cellA, 'settings').evaluate(node => node.open), true);
+  await control(columnA, 'drag').focus(); await page.keyboard.press('ArrowUp'); assert.deepEqual(await page.locator('.builder-data-cell').evaluateAll(nodes => nodes.map(node => node.dataset.dataId)), [cellB, cellA], 'moving columns never maps or reorders cells by key'); await page.keyboard.press('ArrowDown');
+  await control(rowId, 'type').selectOption('group'); assert.equal(await control(rowId, 'type').evaluate(node => node === document.activeElement), true); assert.equal(await shell(rowId).locator('.builder-data-cell').count(), 0); assert.equal(await summary(rowId).innerText(), 'Группа'); await control(rowId, 'group').fill('Черновик группы');
+  await control(rowId, 'type').selectOption('row'); assert.equal(await summary(rowId).innerText(), 'Строка'); assert.equal(await control(cellA, 'value').inputValue(), literal); assert.equal(await control(cellA, 'colspan').inputValue(), '2'); assert.deepEqual(await page.locator('.builder-data-cell').evaluateAll(nodes => nodes.map(node => node.dataset.dataId)), [cellB, cellA]);
+  await control(rowId, 'type').selectOption('group'); assert.equal(await control(rowId, 'group').inputValue(), 'Черновик группы'); await control(rowId, 'type').selectOption('row');
+  await page.locator('#builder-add-data-row').click(); const groupId = await page.locator('.builder-data-row').last().getAttribute('data-data-id'); assert.equal(await shell(groupId).locator(':scope > details').evaluate(node => node.open), false); await summary(groupId).click(); await control(groupId, 'type').selectOption('group');
+  assert.deepEqual(await shell(groupId).locator('.form-label').allInnerTexts(), ['Тип', 'Заголовок']); await summary(groupId).click();
+  await page.locator('#page-builder-save').click(); assert.equal(posts.length, 0); assert.match(await page.locator('#page-builder-form-error').innerText(), /Заголовок/); assert.equal(await control(groupId, 'group').evaluate(node => node === document.activeElement), true); await control(groupId, 'group').fill('Раздел'); assert.equal(await summary(groupId).innerText(), 'Раздел');
+  await reorder('.builder-data-rows > [data-data-id]', rowId, groupId);
+  await summary(rowId).click();
+  await page.locator('#builder-add-data-row').click(); const spareRow = page.locator('.builder-data-row').last(); await spareRow.locator(':scope > details > summary').click(); await spareRow.locator('.builder-data-cell > .builder-image-tools > .builder-delete').click(); assert.equal(await page.locator('.builder-data-row').count(), 1, 'deleting the last cell removes its row');
+  await control(rowId, 'add-cell').click(); const spareCell = shell(rowId).locator('.builder-data-cell').last(); await spareCell.locator(':scope > .builder-image-tools > .builder-delete').click(); assert.equal(await shell(rowId).locator('.builder-data-cell').count(), 2);
+  await page.locator('#builder-add-data-row').click(); const spareGroupId = await page.locator('.builder-data-row').last().getAttribute('data-data-id'); await summary(spareGroupId).click(); await control(spareGroupId, 'type').selectOption('group'); await shell(spareGroupId).locator(':scope > .builder-image-tools > .builder-delete').click(); assert.equal(await page.locator('.builder-data-group').count(), 1);
+  await page.locator('.builder-data-advanced > summary').click(); await page.locator('#builder-data-striped').uncheck(); await page.locator('#builder-data-bordered').uncheck(); await page.locator('#builder-data-sticky_header').check(); await page.locator('#builder-data-min_width').fill('479'); await page.locator('.builder-data-advanced > summary').click();
+  await page.locator('#page-builder-save').click(); assert.equal(posts.length, 0); assert.equal(await page.locator('#builder-data-min_width').evaluate(node => node === document.activeElement), true); await page.locator('#builder-data-min_width').fill('640');
+  await page.locator('#builder-data-min_width').fill(''); await page.locator('#builder-view').selectOption('default'); assert.equal(await page.locator('#builder-data-min_width').inputValue(), '', 'automatic width stays unset after rerender'); await page.locator('.builder-data-advanced > summary').click(); await page.locator('#builder-data-min_width').fill('640');
+  await page.locator('#builder-view').selectOption('compact'); await page.locator('#builder-view').selectOption('default'); await page.locator('#builder-view').selectOption('compact');
+  await page.locator('#builder-type').selectOption('content'); assert.equal(await page.locator('.builder-data-table-editor').count(), 0); await page.locator('#builder-type').selectOption('data-table'); assert.equal(await page.locator('#builder-view').inputValue(), 'compact'); assert.equal(await page.locator('#builder-caption').inputValue(), 'Подпись'); assert.equal(await control(cellA, 'value').inputValue(), literal); assert.equal(await page.locator('#builder-data-min_width').inputValue(), '640'); assert.equal(await page.locator('.builder-image-row').count(), 0);
+  assert.deepEqual(await page.locator('.builder-data-column').evaluateAll(nodes => nodes.map(node => node.dataset.dataId)), [columnB, columnA]); assert.deepEqual(await page.locator('.builder-data-cell').evaluateAll(nodes => nodes.map(node => node.dataset.dataId)), [cellB, cellA]);
+  await summary(rowId).click(); await control(rowId, 'type').selectOption('group'); assert.equal(await control(rowId, 'group').inputValue(), 'Черновик группы', 'inactive row drafts survive view and block-type switches'); await control(rowId, 'type').selectOption('row');
+  // All nested sections are opened deliberately to measure actual rendered controls.
+  await page.locator('.builder-data-table-editor details,.builder-data-advanced').evaluateAll(nodes => nodes.forEach(node => node.open = true));
+  await control(cellB, 'value').fill(''); assert.equal(await summary(cellB).innerText(), 'Ячейка');
+  for (const width of disclosureWidths) {
+    await page.setViewportSize({ width, height: 1000 });
+    const geometry = await page.locator('.builder-data-table-editor').evaluate(editor => [...editor.querySelectorAll('[data-data-id]')].map(shell => {
+      const summary = shell.querySelector(':scope > details > summary'), tools = shell.querySelector(':scope > .builder-image-tools'), body = shell.querySelector(':scope > details > .builder-table-cell-body'); const a = shell.getBoundingClientRect(), b = tools.getBoundingClientRect(), c = summary.getBoundingClientRect();
+      return { client: shell.clientWidth, scroll: shell.scrollWidth, left: a.left, right: a.right, toolsRight: b.right, toolsWidth: b.width, reserved: parseFloat(getComputedStyle(summary).paddingRight), bodyClient: body.clientWidth, bodyScroll: body.scrollWidth, summaryWidth: c.width };
+    }));
+    for (const item of geometry) { assert.ok(item.scroll <= item.client + 1 && item.bodyScroll <= item.bodyClient + 1, `${width}px no card overflow ${JSON.stringify(item)}`); assert.ok(item.left >= 0 && item.right <= width && item.toolsRight <= item.right + 1 && item.reserved >= item.toolsWidth, `${width}px controls stay within card ${JSON.stringify(item)}`); assert.ok(item.summaryWidth > item.reserved); }
+    const overflow = await page.locator('#page-builder-modal .modal-body').evaluate(node => node.scrollWidth - node.clientWidth); assert.ok(overflow <= 1, `${width}px modal overflow ${overflow}`);
+    const zones = await page.locator('.builder-data-table-editor .builder-add').evaluateAll(buttons => buttons.map(button => { const parent = button.parentElement, css = getComputedStyle(parent); return { text: button.innerText, aria: button.getAttribute('aria-label'), title: button.title, border: getComputedStyle(button).borderTopStyle, width: button.getBoundingClientRect().width, available: parent.clientWidth - parseFloat(css.paddingLeft) - parseFloat(css.paddingRight) }; }));
+    assert.equal(zones.length, 3); for (const zone of zones) { assert.equal(zone.text, '+'); assert.equal(zone.aria, zone.title); assert.ok(zone.aria.startsWith('Добавить')); assert.equal(zone.border, 'dashed'); assert.ok(Math.abs(zone.width - zone.available) < 2, `${width}px full-width add zone ${JSON.stringify(zone)}`); }
+  }
+  await page.setViewportSize({ width: 1440, height: 1000 }); await page.locator('#page-builder-save').click(); await close(); assert.equal(posts.length, 1);
+  const saved = queue.pageBuilder.read(job.id), block = saved.document.common.blocks[0]; assert.equal(block.type, 'data-table'); assert.equal(block.view, 'compact'); assert.equal(block.caption, 'Подпись'); assert.deepEqual(block.media, []); assert.deepEqual(block.meta, { striped: false, bordered: false, sticky_header: true, min_width: 640 });
+  assert.deepEqual(block.columns, [{ id: columnB, key: 'price', title: 'Цена' }, { id: columnA, key: 'name', title: '<b>Название</b>', align: 'center', width: 40, nowrap: true }]);
+  assert.deepEqual(block.rows, [{ id: groupId, group: 'Раздел' }, { id: rowId, cells: [{ id: cellB, value: '' }, { id: cellA, value: literal, key: 'unrelated-key', align: 'right', colspan: 2, rowspan: 3, is_header: true, nowrap: true }] }]);
+  await open(); assert.equal(await page.locator('.builder-data-table-editor details[open],.builder-data-advanced[open]').count(), 0); assert.equal(await control(cellA, 'value').inputValue(), literal); await page.locator('#builder-caption').fill('Отмена'); await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); assert.deepEqual(queue.pageBuilder.read(job.id), saved);
+  await open(); await page.locator('#builder-type').selectOption('content'); await page.locator('#page-builder-save').click(); await close(); const other = queue.pageBuilder.read(job.id).document.common.blocks[0]; assert.equal(other.type, 'content'); for (const key of ['columns', 'rows', 'caption']) assert.equal(Object.hasOwn(other, key), false); assert.equal(other.meta?.striped, undefined); assert.ok(other.media.every(asset => !asset.originalUrl && !asset.bigUrl));
+  assert.deepEqual(errors, []); assert.deepEqual(external, []);
+});
+
 test('queue handle reorders by keyboard and drag without selecting a different job', { timeout: 60000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'queue-reorder-ui-'));
   const queue = new Queue({ root, autoStart: false });
@@ -1027,7 +1111,7 @@ test('queue icons expose every action, preserve selection, handle races and show
   assert.equal(await page.locator('#results-column [data-job-action], #refresh-logs, #detail-actions').count(), 0);
   queue.jobs[0].url = null;
   queue.save();
-  await page.waitForFunction(id => document.querySelector(`[data-job-id="${id}"] td:first-child`)?.textContent.trim() === '—', queue.jobs[0].id);
+  await page.waitForFunction(id => document.querySelector(`[data-job-id="${id}"] td:nth-child(2)`)?.textContent.trim() === '—', queue.jobs[0].id);
   await select(0);
   assert.equal(await page.locator('#detail-url').innerText(), '—', 'missing URL renders a safe placeholder');
   for (const attribute of ['href', 'target', 'rel']) assert.equal(await page.locator('#detail-url').getAttribute(attribute), null, `missing URL omits ${attribute}`);
@@ -1847,7 +1931,7 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
     }), true, `${width}px: catalog card remains horizontal and readable`);
     const idleBorder = await tile.evaluate(node => getComputedStyle(node).borderColor);
     await tile.hover(); assert.notEqual(await tile.evaluate(node => getComputedStyle(node).borderColor), idleBorder, `${width}px: catalog card has visible hover`);
-    await page.locator('.builder-document-catalog .btn-close').focus(); await page.keyboard.press('Tab');
+    await page.locator('.builder-document-catalog .btn-close').focus(); await page.keyboard.press('Tab'); assert.equal(await page.locator('.builder-catalog-add-document').evaluate(node => node === document.activeElement), true); await page.keyboard.press('Tab');
     assert.equal(await tile.evaluate(node => document.activeElement === node && getComputedStyle(node).outlineStyle !== 'none'), true, `${width}px: catalog card has visible keyboard focus`);
     await page.screenshot({ path: path.join(testOutput(), `ui-links-document-catalog-${width}.png`) });
     await page.keyboard.press('Escape'); await page.waitForSelector('.builder-document-catalog', { state: 'detached' });
@@ -1857,6 +1941,7 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
   await page.locator('#builder-type').selectOption('content'); await page.locator('#builder-type').selectOption('links');
   assert.equal(await page.locator('#builder-view').inputValue(), 'links'); assert.equal(await page.locator('.builder-link-row').count(), 2);
   await page.locator('#builder-view').selectOption('documents'); assert.equal(await page.locator('.builder-link-row').count(), 1); assert.equal(await page.locator('#builder-links-columns').inputValue(), '1');
+  await page.locator('.builder-link-row > details > summary').click(); await page.locator('.builder-link-row .builder-item-markdown > summary').click();
   for (const width of [390, 320]) {
     await page.setViewportSize({ width, height: 850 });
     assert.equal(await page.locator('.builder-link-row').evaluate(node => node.scrollWidth <= node.clientWidth && node.getBoundingClientRect().right <= innerWidth + 1), true, `${width}px: document row fits`);
@@ -1925,11 +2010,13 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
     assert.deepEqual(await page.locator('.builder-link-row select[id$="-target"] option').evaluateAll(nodes => nodes.map(node => [node.value, node.textContent])), [['self', 'В этом окне'], ['blank', 'В новом окне']], 'target selector has exactly two distinct choices');
     assert.equal(await page.locator('.builder-link-row select[id$="-target"]').inputValue(), legacyTarget.slice(1), `legacy ${legacyTarget} displays the matching choice`);
     assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].items[0].meta.target, legacyTarget, 'opening the selector does not rewrite stored data');
+    await page.locator('.builder-link-row > details > summary').click();
     await page.locator('.builder-link-row').getByLabel('Заголовок').fill(`Проверка ${legacyTarget}`);
     await page.locator('#page-builder-save').click(); await close();
     assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].items[0].meta.target, legacyTarget, 'unrelated save preserves the legacy target');
   }
   await opener.click(); await page.waitForSelector('#page-builder-modal.show');
+  await page.locator('.builder-link-row > details > summary').click();
   await page.locator('.builder-link-row').getByRole('button', { name: 'Очистить документ 1' }).click();
   await page.locator('#page-builder-save').click(); await close();
   const cleared = queue.pageBuilder.read(job.id).document.common.blocks[1].items[0];
@@ -1938,11 +2025,13 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
   await opener.click(); await page.waitForSelector('#page-builder-modal.show');
   assert.equal(await page.locator('.builder-link-row .builder-media-placeholder').count(), 1);
   assert.equal(await page.locator('.builder-link-row .builder-clear-media').count(), 0);
+  await page.locator('.builder-link-row > details > summary').click();
   await page.getByRole('button', { name: 'Выбрать документ 1' }).click(); await page.locator('.builder-document-catalog-tile').nth(1).click(); await page.waitForSelector('.builder-document-catalog', { state: 'detached' });
   await page.locator('#page-builder-save').click(); await close();
   assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].items[0].sourceDocument.resourceId, 2, 'a cleared saved document can be selected again');
   for (const [catalogIndex, fileType, category] of [[2, 'SVG', 'graphic'], [3, 'MP3', 'audio'], [4, 'MP4', 'video'], [5, 'ZIP', 'archive']]) {
     await opener.click(); await page.waitForSelector('#page-builder-modal.show');
+    await page.locator('.builder-link-row > details > summary').click();
     const row = page.locator('.builder-link-row').first();
     await row.getByLabel('Заголовок').fill('Свой заголовок'); await row.getByLabel('Текст ссылки').fill('Своя ссылка');
     await row.getByRole('button', { name: 'Выбрать документ 1' }).click();
@@ -2073,7 +2162,7 @@ test('step 3 canonical editor offers dependent views, browser media selection an
   assert.equal(await page.locator('.builder-catalog-header .btn-close').getAttribute('aria-label'), 'Закрыть');
   assert.equal(await page.locator('.builder-catalog-header .btn-close').evaluate(node => getComputedStyle(node).backgroundImage === getComputedStyle(document.querySelector('#png-modal .btn-close')).backgroundImage), true, 'the catalog uses the same close icon as the image modal');
   assert.equal(await page.locator('.builder-catalog-message').isHidden(), true, 'the catalog does not display an image count');
-  assert.equal(await page.locator('.builder-catalog-grid').innerText(), '', 'the catalog shows no filenames');
+  assert.ok((await page.locator('.builder-catalog-tile').allTextContents()).every(text => text === ''), 'image tiles show no filenames while the catalog retains its add button');
   assert.equal(await page.locator('.builder-catalog-tile[title]').count(), 0, 'image buttons have no filename tooltip');
   assert.equal(await page.getByRole('button', { name: 'Выбрать изображение 1', exact: true }).count(), 1, 'the image keeps a numbered accessible name');
   const catalogButton = page.locator('.builder-catalog-tile').first();
@@ -2116,6 +2205,7 @@ test('step 3 canonical editor offers dependent views, browser media selection an
     await edgeTile.hover(); await page.waitForTimeout(200);
     assert.equal((await buttonStyle(edgeTile)).border, stepTwoHover.border, `${width}px hover matches step 2`);
     await page.locator('.builder-catalog-header .btn-close').focus();
+    await page.keyboard.press('Tab'); assert.equal(await page.locator('.builder-catalog-add-image').evaluate(node => node === document.activeElement), true, 'the add-image button precedes image tiles in keyboard order');
     for (let index = 0; index <= geometry.focusIndex; index++) await page.keyboard.press('Tab');
     assert.equal(await edgeTile.evaluate(node => node === document.activeElement && node.matches(':focus-visible')), true, `${width}px first-row edge tile has keyboard focus`);
     await page.waitForTimeout(200);
@@ -2158,6 +2248,7 @@ test('step 3 canonical editor offers dependent views, browser media selection an
   assert.doesNotMatch(await page.locator('#page-builder-fields').innerText(), /Mori|Принудительный|Описание карточки|JSON/i);
   assert.deepEqual(await page.locator('#builder-type option').evaluateAll(nodes => nodes.map(node => node.value)), initial.blockTypes.map(type => type.name));
   await page.locator('#builder-type').selectOption('content');
+  let serviceDraftMediaIds;
   for (const type of initial.blockTypes) {
     await page.locator('#builder-type').selectOption(type.name);
     assert.deepEqual(await page.locator('#builder-view option').evaluateAll(nodes => nodes.map(node => node.value)), type.views);
@@ -2165,13 +2256,14 @@ test('step 3 canonical editor offers dependent views, browser media selection an
     assert.equal(await page.locator('#builder-review-status').inputValue(), 'unreviewed');
     for (const name of new Set(initial.blockTypes.flatMap(item => item.fields.map(field => field.name)))) assert.equal(await page.locator(`#builder-${name}`).count(), Number(type.fields.some(field => field.name === name) && !(type.name === 'embed' && name === 'source_url')), `${type.name}: only applicable editable scalar ${name}`);
     const structured = type.name === 'data-table';
-    assert.equal(await page.locator('.builder-editor-placeholder').count(), Number(structured), `${type.name}: structured editor is explicitly unavailable`);
+    assert.equal(await page.locator('.builder-editor-placeholder').count(), 0, `${type.name}: editor is available`);
     assert.equal(await page.locator('#builder-add-image').count(), 0, `${type.name}: fixed media types do not show an add-image control`);
     if (type.name === 'big-media') assert.equal(await page.locator('#builder-meta-media_mode').inputValue(), 'intrinsic', 'ordinary banner uses the documented intrinsic default');
     if (type.name === 'grid') assert.equal(await page.locator('#builder-add-gallery-item').count(), 1, 'every grid view has the item editor');
     if (type.name === 'table') assert.equal(await page.locator('#builder-add-table-row').count(), 1, 'table has the row editor');
+    if (type.name === 'service') serviceDraftMediaIds = await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId));
     if (structured) {
-      assert.equal(await page.locator('.builder-editor-placeholder img').getAttribute('src'), '/assets/astronaut.png');
+      assert.equal(await page.locator('#builder-add-data-column').count(), 1);
       assert.deepEqual(await page.locator('.builder-text-fields legend').allInnerTexts(), ['Текст']);
       assert.equal(await page.getByLabel('Текст в Markdown', { exact: true }).count(), 1);
     }
@@ -2191,7 +2283,7 @@ test('step 3 canonical editor offers dependent views, browser media selection an
     await selectImage(row, 'основную'); await selectImage(row, 'большую');
     await row.getByLabel('Ссылка изображения', { exact: true }).fill(`/${name}`); await row.getByLabel('Альтернативный текст', { exact: true }).fill(name); await row.getByLabel('Подпись', { exact: true }).fill(`Caption ${name}`);
   }
-  const mediaIds = await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)); assert.equal(mediaIds[0], savedAsset.id); assert.match(mediaIds[1], /^media-[a-f0-9-]{36}$/);
+  const mediaIds = await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)); assert.deepEqual(mediaIds, serviceDraftMediaIds, 'service restores its own media slots after the type tour'); assert.notEqual(mediaIds[0], savedAsset.id, 'table-to-service starts a separate media pool'); assert.match(mediaIds[1], /^media-[a-f0-9-]{36}$/);
   assert.equal(await page.locator('.builder-image-row img').count(), 4, 'both browser selections preview immediately before save');
   await page.locator(`.builder-image-row[data-media-id="${mediaIds[1]}"] .builder-media-drag`).focus(); await page.keyboard.press('ArrowUp');
   assert.deepEqual(await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)), [...mediaIds].reverse());
@@ -2972,11 +3064,11 @@ test('table type drafts keep their large pool while non-table saves discard it',
   await open(); await page.locator('#builder-type').selectOption('links'); await page.locator('#page-builder-save').click(); await close();
   let stored = queue.pageBuilder.read(job.id), block = stored.document.common.blocks[0]; assert.equal(block.type, 'links'); assert.deepEqual(block.media, []); assert.deepEqual(posts, [200], 'links saves without the hidden over-limit table pool');
   const restored = structuredClone(stored.document); restored.common.blocks[0] = structuredClone(savedTableBlock); queue.pageBuilder.write(job.id, stored.revision, restored); await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
-  await open(); assert.equal(await page.locator('.builder-table-cell-images .builder-image-row').count(), 13); await page.locator('#builder-type').selectOption('data-table'); assert.match(await page.locator('.builder-editor-placeholder').innerText(), /Редактор содержимого в разработке/); assert.equal(await page.locator('.builder-image-row').count(), 0);
+  await open(); assert.equal(await page.locator('.builder-table-cell-images .builder-image-row').count(), 13); await page.locator('#builder-type').selectOption('data-table'); assert.equal(await page.locator('#builder-add-data-column').count(), 1); assert.equal(await page.locator('.builder-image-row').count(), 0);
   await page.locator('#page-builder-save').click(); await close(); stored = queue.pageBuilder.read(job.id); block = stored.document.common.blocks[0]; assert.equal(block.type, 'data-table'); assert.deepEqual(block.media, []); assert.deepEqual(posts, [200, 200], 'data-table also saves without hidden table media');
 });
 
-test('step 3 type and view changes keep drafts and explain unfinished structured editors', { timeout: 45000 }, async t => {
+test('step 3 type and view changes keep drafts and expose every structured editor', { timeout: 45000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-fields-ui-'));
   const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
   Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
@@ -2991,7 +3083,7 @@ test('step 3 type and view changes keep drafts and explain unfinished structured
   await page.evaluate(() => window.builderFieldsShown.then(() => true));
   const typeLabels = await page.locator('#builder-type option').allTextContents();
   assert.equal(typeLabels.length, 10);
-  assert.deepEqual(typeLabels, original.blockTypes.map(type => `${type.name === 'data-table' ? '✗ ' : ''}${type.label}`));
+  assert.deepEqual(typeLabels, original.blockTypes.map(type => type.label));
   assert.equal(typeLabels.some(label => label.includes('✓')), false);
   assert.equal(typeLabels.find(label => label.includes('Ссылки и документы')), 'Ссылки и документы');
   assert.equal(original.blockTypes.find(type => type.name === 'big-media').label, 'Изображение / баннер', 'API catalog label stays canonical');
@@ -3004,7 +3096,7 @@ test('step 3 type and view changes keep drafts and explain unfinished structured
       await page.locator('#builder-view').selectOption(view);
       assert.match(await page.locator('#builder-view option:checked').innerText(), /[А-Яа-я]/, `${type.name}/${view}: descriptive Russian view name`);
       assert.equal(await page.locator('#builder-view').evaluate(node => node === document.activeElement), true, 'changing view keeps the selector focused');
-      if (type.name === 'data-table') assert.match(await page.locator('.builder-editor-placeholder').innerText(), /Редактор содержимого в разработке[\s\S]+пока недоступно/);
+      if (type.name === 'data-table') { assert.equal(await page.locator('.builder-editor-placeholder').count(), 0); assert.equal(await page.locator('#builder-add-data-column').count(), 1); }
       if (type.name === 'table') { assert.equal(await page.locator('.builder-editor-placeholder').count(), 0); assert.equal(await page.locator('#builder-add-table-row').count(), 1); }
       if (type.name === 'grid') { assert.equal(await page.locator('.builder-editor-placeholder').count(), 0); assert.equal(await page.locator('#builder-add-gallery-item').count(), 1); }
     }
@@ -3947,7 +4039,7 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   assert.deepEqual(await page.locator('#jobs-body tr').evaluateAll(rows => rows.map(row => row.dataset.jobId)), queue.jobs.map(item => item.id).reverse(), 'newest jobs render first');
   assert.equal(await page.locator('#jobs-body a').count(), 0, 'queue URLs are plain text');
   const newJobRow = page.locator(`[data-job-id="${queue.jobs[1].id}"]`);
-  await newJobRow.locator('td').first().locator('span').click();
+  await newJobRow.locator('td').nth(1).locator('span').click();
   assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[1].url.replace(/^https?:\/\//i, '').replace(/\/+$/, ''), 'clicking URL text selects its row');
   const externalLink = page.locator('#detail-url');
   assert.equal(await externalLink.getAttribute('href'), queue.jobs[1].url);

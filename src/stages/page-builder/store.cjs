@@ -9,9 +9,8 @@ const { provenance: documentProvenance } = require('./document-picker.cjs');
 
 const VERSION = 1;
 const STATUSES = new Set(['unreviewed', 'passed', 'failed']);
-// Portable projection of company-block-contract.v1.json (1.0): root scalar
-// payload fields and the supported block meta settings. Other nested data
-// remains outside this editor.
+// Portable editor catalog for company-block-contract.v1.json (1.0).
+// Nested editor models are validated below; their IDs belong to local ARM.
 const f = (name, label, kind = 'text', values) => ({ name, label, kind, ...(values ? { values } : {}) });
 const links = [f('link', 'Ссылка', 'link'), f('link_text', 'Текст ссылки')];
 const BLOCK_TYPES = [
@@ -89,6 +88,60 @@ const TABLE_CELL_META = {
 };
 const TABLE_CELL_SETTINGS = ['colspan', 'rowspan', 'is_header', 'align', 'media_mode', 'media_width', 'media_align'];
 const legacyTableId = (kind, field) => `${kind}-${crypto.createHash('sha256').update(field).digest('hex').slice(0, 16)}`;
+// Local ARM editor resource limits, not limits of the Beget contract.
+const DATA_TABLE_LIMITS = Object.freeze({ columns: 100, rows: 100, cells: 1000, key: 200, title: 500, value: 12000, caption: 1000 });
+function dataTableObject(value, field, keys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`Некорректное поле ${field}`);
+  if (Object.keys(value).some(key => !keys.includes(key))) throw new Error(`Неизвестное поле ${field}`);
+}
+function dataTableId(value, kind, field) {
+  const id = value.id === undefined ? legacyTableId(kind, field) : value.id;
+  if (!validId(id)) throw new Error(`Некорректное поле ${field}.id`);
+  return id;
+}
+function dataTableSettings(value, field, kind) {
+  const result = {}, keys = kind === 'meta' ? ['striped', 'bordered', 'sticky_header', 'min_width'] : kind === 'column' ? ['align', 'width', 'nowrap'] : ['align', 'colspan', 'rowspan', 'is_header', 'nowrap'];
+  for (const key of keys) {
+    const item = value[key]; if (item === undefined) continue;
+    const range = { width: [5, 80], colspan: [1, 12], rowspan: [1, 100], min_width: [480, 1600] }[key];
+    if (range && (!Number.isInteger(item) || item < range[0] || item > range[1])
+      || key === 'align' && !['left', 'center', 'right'].includes(item)
+      || ['striped', 'bordered', 'sticky_header', 'is_header', 'nowrap'].includes(key) && typeof item !== 'boolean') throw new Error(`Некорректное поле ${field}.${key}`);
+    result[key] = item;
+  }
+  return result;
+}
+function dataTable(value, field) {
+  const meta = value.meta === undefined ? {} : value.meta;
+  dataTableObject(meta, `${field}.meta`, ['caption', 'columns', 'striped', 'bordered', 'sticky_header', 'min_width']);
+  const columns = value.columns !== undefined ? value.columns : meta.columns !== undefined ? meta.columns : [], rows = value.rows === undefined ? [] : value.rows;
+  if (!Array.isArray(columns) || columns.length > DATA_TABLE_LIMITS.columns) throw new Error(`Некорректное поле ${field}.columns`);
+  if (!Array.isArray(rows) || rows.length > DATA_TABLE_LIMITS.rows) throw new Error(`Некорректное поле ${field}.rows`);
+  let cellCount = 0;
+  return {
+    caption: limited(value.caption !== undefined ? value.caption : meta.caption !== undefined ? meta.caption : '', `${field}.caption`, DATA_TABLE_LIMITS.caption),
+    meta: dataTableSettings(meta, `${field}.meta`, 'meta'),
+    columns: columns.map((column, index) => {
+      const at = `${field}.columns[${index}]`;
+      dataTableObject(column, at, ['id', 'key', 'title', 'align', 'width', 'nowrap']);
+      return { id: dataTableId(column, 'column', at), key: limited(column.key === undefined ? '' : column.key, `${at}.key`, DATA_TABLE_LIMITS.key), title: limited(column.title === undefined ? '' : column.title, `${at}.title`, DATA_TABLE_LIMITS.title), ...dataTableSettings(column, at, 'column') };
+    }),
+    rows: rows.map((row, index) => {
+      const at = `${field}.rows[${index}]`;
+      dataTableObject(row, at, ['id', 'group', 'cells']);
+      const id = dataTableId(row, 'row', at);
+      if (Object.hasOwn(row, 'group') === Object.hasOwn(row, 'cells')) throw new Error(`Строка должна содержать либо group, либо cells (${at})`);
+      if (Object.hasOwn(row, 'group')) return { id, group: limited(row.group, `${at}.group`, DATA_TABLE_LIMITS.title, { required: true }) };
+      if (!Array.isArray(row.cells) || !row.cells.length || (cellCount += row.cells.length) > DATA_TABLE_LIMITS.cells) throw new Error(`Некорректное поле ${at}.cells`);
+      return { id, cells: row.cells.map((cell, cellIndex) => {
+        const cellAt = `${at}.cells[${cellIndex}]`;
+        dataTableObject(cell, cellAt, ['id', 'value', 'key', 'align', 'colspan', 'rowspan', 'is_header', 'nowrap']);
+        return { id: dataTableId(cell, 'cell', cellAt), value: limited(cell.value, `${cellAt}.value`, DATA_TABLE_LIMITS.value),
+          ...(cell.key !== undefined ? { key: limited(cell.key, `${cellAt}.key`, DATA_TABLE_LIMITS.key) } : {}), ...dataTableSettings(cell, cellAt, 'cell') };
+      }) };
+    })
+  };
+}
 function tableImageIds(value, field) {
   if (!Array.isArray(value) || value.length < 2 || value.length > 12 || new Set(value).size !== value.length || value.some(item => !validId(item))) throw new Error(`Некорректное поле ${field}`);
   return [...value];
@@ -240,19 +293,21 @@ function block(value, field) {
   if (!type) throw new Error(`Некорректный блок ${field}`);
   const view = value.view ?? legacy?.[1] ?? type.default_view;
   if (!type.views.includes(view)) throw new Error(`Некорректный вид отображения ${field}.view`);
-  const allowed = new Set(['id', 'type', 'view', 'title', 'text', 'description', 'content', 'settings', 'media', 'review', 'reviewedRevision', ...(['big-media', 'table', 'service', 'content', 'embed', 'links', 'sections', 'grid'].includes(type.name) ? ['meta'] : []), ...(type.name === 'embed' ? ['sourceFrame'] : []), ...(['links', 'sections', 'grid'].includes(type.name) ? ['items'] : []), ...(type.name === 'table' ? ['rows'] : []), ...type.fields.map(item => item.name)]);
+  const allowed = new Set(['id', 'type', 'view', 'title', 'text', 'description', 'content', 'settings', 'media', 'review', 'reviewedRevision', ...(['big-media', 'table', 'data-table', 'service', 'content', 'embed', 'links', 'sections', 'grid'].includes(type.name) ? ['meta'] : []), ...(type.name === 'embed' ? ['sourceFrame'] : []), ...(['links', 'sections', 'grid'].includes(type.name) ? ['items'] : []), ...(type.name === 'table' ? ['rows'] : type.name === 'data-table' ? ['rows', 'columns'] : []), ...type.fields.map(item => item.name)]);
   if (Object.keys(value).some(key => !allowed.has(key))) throw new Error(`Неизвестное поле блока ${field}`);
   if (value.reviewedRevision !== undefined && (!Number.isSafeInteger(value.reviewedRevision) || value.reviewedRevision < 1)) throw new Error(`Некорректная reviewedRevision ${field}`);
   // Grid items and their images are shared across views. Keep the same limit
   // when a populated gallery changes to a view without an item editor.
   if (!Array.isArray(value.media) || value.media.length > (type.name === 'table' ? 1200 : type.name === 'grid' ? 112 : 12)) throw new Error(`Некорректные медиа ${field}`);
+  if (type.name === 'data-table' && value.media.length) throw new Error(`Таблица данных не поддерживает медиа (${field}.media)`);
   // Accept the retired description field in old documents, but omit it from
   // the normalized model and subsequent saves. Reading never rewrites disk.
   const result = { id: value.id, type: type.name, view, title: limited(value.title ?? '', `${field}.title`, 200), text: limited(value.text ?? value.content ?? '', `${field}.text`, 12000),
     content: limited(value.content || '', `${field}.content`, 12000),
     settings: limited(value.settings || '', `${field}.settings`, 4000), review: review(value.review, `${field}.review`), media: value.media.map((item, index) => media(item, `${field}.media[${index}]`)) };
   if (value.sourceFrame !== undefined) result.sourceFrame = frameProvenance(value.sourceFrame);
-  if (value.meta !== undefined) result.meta = blockMeta(value.meta, `${field}.meta`, type.name);
+  if (type.name === 'data-table') Object.assign(result, dataTable(value, field));
+  else if (value.meta !== undefined) result.meta = blockMeta(value.meta, `${field}.meta`, type.name);
   if (type.name === 'links') {
     const items = value.items === undefined ? [] : value.items;
     if (!Array.isArray(items) || items.length > 100) throw new Error(`Некорректные элементы ${field}.items`);
@@ -318,8 +373,8 @@ function validateDocument(value) {
     for (const child of item.blocks) {
       if (ids.has(child.id)) throw new Error('Дублирующийся id блока'); ids.add(child.id);
       const visit = item => { if (ids.has(item.id)) throw new Error('Дублирующийся id медиа или элемента'); ids.add(item.id); for (const nested of item.children || []) visit(nested); };
-      for (const asset of [...child.media, ...(child.items || [])]) visit(asset);
-      for (const row of child.rows || []) { visit(row); for (const cell of row.cells) visit(cell); }
+      for (const asset of [...child.media, ...(child.items || []), ...(child.columns || [])]) visit(asset);
+      for (const row of child.rows || []) { visit(row); for (const cell of row.cells || []) visit(cell); }
     }
   }
   return document;
@@ -428,4 +483,4 @@ class PageBuilderStore {
     return assets.find(item => item.id === mediaId) || null;
   }
 }
-module.exports = { PageBuilderStore, validateDocument, statusSummary, derivedReview, BLOCK_TYPES };
+module.exports = { PageBuilderStore, validateDocument, statusSummary, derivedReview, BLOCK_TYPES, DATA_TABLE_LIMITS };

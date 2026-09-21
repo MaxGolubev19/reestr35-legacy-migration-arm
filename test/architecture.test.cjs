@@ -89,6 +89,21 @@ test('legacy CommonJS entrypoints retain their contract and QA policy identity',
   assert.deepEqual(qa.QA_POLICY, { version: 5, hash: '5f3785eb5ddaeebcdec47c5889cdda5b1f5ff01087c37ccc1404520d601d2eb9' });
 });
 
+test('Queue supports a capture-only stage factory while an installed media stage must retain its deletion guard', async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'architecture-capture-only-'));
+  const queue = new Queue({ root, autoStart: false, stageFactory: (queue, options) => new (require('../src/stages/capture-qa/index.cjs').CaptureQaStage)(queue, options) });
+  t.after(async () => { await queue.shutdown(); fs.rmSync(root, { recursive: true, force: true }); });
+  assert.equal(queue.stage.media, undefined);
+  queue.add('https://capture-only.reestr35.ru/'); const job = queue.jobs[0], stored = queue.pageBuilder.read(job.id);
+  assert.equal(queue.pageBuilder.write(job.id, stored.revision, stored.document).revision, stored.revision + 1);
+  job.attempts[0].status = 'paused'; queue.retry(job.id); assert.equal(job.attempts.length, 2);
+  // Skipping is allowed only for a stage with no media capability. A present
+  // but broken capability must never silently bypass the publication fence.
+  queue.stage.media = {};
+  assert.throws(() => queue.pageBuilder.assertWritable(), TypeError);
+  job.attempts[1].status = 'paused'; assert.throws(() => queue.retry(job.id), TypeError); assert.equal(job.attempts.length, 2);
+});
+
 test('existing state v2 loads without stage schema migration or altered flat API fields', async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'architecture-v2-'));
   const state = { version: 2, concurrency: 3, jobs: [{

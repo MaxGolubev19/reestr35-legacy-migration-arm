@@ -108,7 +108,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
       if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== `http://${host}`)) return json(res, 403, { error: 'Разрешён только локальный origin' });
       if (req.headers['sec-fetch-site'] === 'cross-site') return json(res, 403, { error: 'Cross-site запрос запрещён' });
       const url = new URL(req.url, `http://${host}`);
-      if (queue.stage.media.deletion.failed && !['/api/health', '/api/shutdown'].includes(url.pathname)) throw Object.assign(new Error('Удаление медиа требует восстановления при запуске'), { statusCode: 503 });
+      if (queue.stage.media?.deletion.failed && !['/api/health', '/api/shutdown'].includes(url.pathname)) throw Object.assign(new Error('Удаление медиа требует восстановления при запуске'), { statusCode: 503 });
       const builderAttempt = (jobId, writing = false) => {
         const job = queue.get(jobId), value = url.searchParams.get('attempt');
         if (value === null && writing && job.attempts.length > 1) throw conflict('Требуется номер попытки шага 3');
@@ -213,7 +213,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         }
       }
       if (req.method !== 'GET') return json(res, 405, { error: 'Метод не поддерживается' });
-      if (url.pathname === '/api/health') return json(res, 200, { app: 'Reestr35 ARM', version: '3.2.0', instance: process.env.ARM_INSTANCE_ID || '', pid: process.pid });
+      if (url.pathname === '/api/health') return json(res, 200, { app: 'Reestr35 ARM', version: '3.3.0', instance: process.env.ARM_INSTANCE_ID || '', pid: process.pid });
       if (url.pathname === '/api/events') {
         res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
         res.write(': connected\n\n');

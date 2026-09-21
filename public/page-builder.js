@@ -396,9 +396,9 @@
   function bind(control, object, key) {
     control.addEventListener(control.tagName === 'SELECT' || control.type === 'checkbox' ? 'change' : 'input', () => { object[key] = control.type === 'checkbox' ? control.checked : control.value; resetReview(); }); return control;
   }
-  function itemMarkdownField(item, id, extraClass = '') {
+  function itemMarkdownField(item, id, extraClass = '', valueKey = 'text') {
     const details = node('details', `builder-text-fields builder-item-markdown builder-gallery-collapsible mb-3${extraClass ? ` ${extraClass}` : ''}`);
-    const control = bind(textarea(id, item.text, 6), item, 'text'); control.maxLength = 12000; control.setAttribute('aria-label', 'Текст в Markdown');
+    const control = bind(textarea(id, item[valueKey], 6), item, valueKey); control.maxLength = 12000; control.setAttribute('aria-label', 'Текст в Markdown');
     details.append(node('summary', '', 'Текст'), window.BuilderMarkdown.editor(control)); return details;
   }
   function itemDetails(body, item, fallback, openItems) {
@@ -410,7 +410,7 @@
   const emptyMedia = () => ({ id: `media-${crypto.randomUUID()}`, originalUrl: '', bigUrl: '', href: '', alt: '', caption: '' });
   function blockFields(entity) {
     const type = node('select', 'form-select'), view = node('select', 'form-select'); type.id = 'builder-type'; view.id = 'builder-view';
-    state.blockTypes.forEach(item => type.append(new Option(`${item.name === 'data-table' ? '✗ ' : ''}${item.label}`, item.name, false, entity.type === item.name)));
+    state.blockTypes.forEach(item => type.append(new Option(item.label, item.name, false, entity.type === item.name)));
     const definition = () => state.blockTypes.find(item => item.name === entity.type);
     const updateViews = () => { clear(view); definition().views.forEach(value => view.append(new Option(VIEW[entity.type][value], value, false, value === entity.view))); };
     const selectors = node('div', 'builder-type-view'); selectors.append(field('Тип блока', type), field('Вид отображения', view));
@@ -425,7 +425,7 @@
     if (['links', 'sections'].includes(entity.type)) linkViews.set(`${entity.type}:${entity.view}`, { items: structuredClone(entity.items || []), meta: structuredClone(entity.meta || {}) });
     const renderContent = () => {
       clearMediaPreviewObservers(); window.ArmEditors.destroy('builder-content'); clear(content);
-      const structured = entity.type === 'data-table', rich = entity.type === 'rich-content', banner = entity.type === 'big-media', service = entity.type === 'service', contentBlock = entity.type === 'content', embed = entity.type === 'embed';
+      const rich = entity.type === 'rich-content', banner = entity.type === 'big-media', service = entity.type === 'service', contentBlock = entity.type === 'content', embed = entity.type === 'embed';
       if (banner && !entity.media.length) entity.media.push(emptyMedia());
       if (service || contentBlock) while (entity.media.length < 2) entity.media.push(emptyMedia());
       const advanced = banner || service || contentBlock ? node('details', 'builder-banner-advanced') : null;
@@ -449,6 +449,7 @@
       if (entity.type === 'sections') { sectionsFields(entity, content); return; }
       if (entity.type === 'grid') { gridFields(entity, content); return; }
       if (entity.type === 'table') { tableFields(entity, content); return; }
+      if (entity.type === 'data-table') { dataTableFields(entity, content); return; }
       if (service || contentBlock) {
         const label = ['media-left', 'media-right'].includes(entity.view) ? `Изображения ${entity.view === 'media-left' ? 'слева' : 'справа'}` : 'Изображения';
         mediaFields(entity, content, label, { fixedCount: 2 });
@@ -467,13 +468,6 @@
         else target.append(field(entity.type === 'embed' && entity.view === 'map' && spec.name === 'source_url' ? 'URL карты' : spec.name === 'reason' ? 'Обоснование' : spec.label, bind(control, entity, spec.name)));
       });
       if (service || contentBlock) content.append(linkGroup);
-      if (structured) {
-        const placeholder = node('section', 'builder-editor-placeholder'); placeholder.setAttribute('role', 'note');
-        const astronaut = node('img'); astronaut.src = '/assets/astronaut.png'; astronaut.alt = ''; astronaut.width = 144; astronaut.height = 144;
-        const contents = { 'data-table': 'колонок, строк и ячеек' };
-        placeholder.append(astronaut, node('h4', '', 'Редактор содержимого в разработке'), node('p', 'text-secondary', `«${VIEW[entity.type][entity.view]}»: редактирование ${contents[entity.type]} пока недоступно.`));
-        content.append(placeholder);
-      }
       if (advanced) { if (banner) bannerSettings(entity, advanced); else if (service) serviceSettings(entity, advanced); else contentSettings(entity, advanced); content.append(advanced); }
     };
     view.addEventListener('change', () => {
@@ -488,18 +482,19 @@
     type.addEventListener('change', () => {
       if (entity.type === type.value) return;
       if (entity.type === 'links') linkViews.set(`links:${entity.view}`, { items: structuredClone(entity.items || []), meta: structuredClone(entity.meta || {}) });
-      typeDrafts.set(entity.type, { ...(entity.sourceFrame ? { sourceFrame: structuredClone(entity.sourceFrame) } : {}), ...Object.fromEntries(definition().fields.filter(spec => Object.hasOwn(entity, spec.name)).map(spec => [spec.name, entity[spec.name]])), ...(['big-media', 'table', 'service', 'content', 'embed', 'links', 'sections', 'grid'].includes(entity.type) && entity.meta ? { meta: structuredClone(entity.meta) } : {}), ...(['links', 'sections', 'grid'].includes(entity.type) ? { items: structuredClone(entity.items || []), view: entity.view } : {}), ...(entity.type === 'table' ? { rows: structuredClone(entity.rows || []) } : {}), media: structuredClone(entity.media), previews: structuredClone(state.draft.previews) });
+      typeDrafts.set(entity.type, { ...(entity.sourceFrame ? { sourceFrame: structuredClone(entity.sourceFrame) } : {}), ...Object.fromEntries(definition().fields.filter(spec => Object.hasOwn(entity, spec.name)).map(spec => [spec.name, entity[spec.name]])), ...(['big-media', 'table', 'data-table', 'service', 'content', 'embed', 'links', 'sections', 'grid'].includes(entity.type) && entity.meta ? { meta: structuredClone(entity.meta) } : {}), ...(['links', 'sections', 'grid'].includes(entity.type) ? { items: structuredClone(entity.items || []), view: entity.view } : {}), ...(['table', 'data-table'].includes(entity.type) ? { rows: structuredClone(entity.rows || []) } : {}), ...(entity.type === 'data-table' ? { columns: structuredClone(entity.columns || []), view: entity.view } : {}), media: structuredClone(entity.media), previews: structuredClone(state.draft.previews) });
       const previousType = entity.type; entity.type = type.value; entity.view = definition().default_view;
       const allowed = new Set(definition().fields.map(item => item.name));
       state.blockTypes.flatMap(item => item.fields).forEach(spec => { if (!allowed.has(spec.name)) delete entity[spec.name]; });
-      delete entity.meta; delete entity.sourceFrame; delete entity.items; delete entity.rows;
+      delete entity.meta; delete entity.sourceFrame; delete entity.items; delete entity.rows; delete entity.columns;
       const restored = typeDrafts.get(entity.type);
-      entity.media = restored ? structuredClone(restored.media) : previousType === 'table' || ['sections', 'table'].includes(entity.type) ? [] : entity.type === 'big-media' ? entity.media.slice(0, 1) : entity.media;
+      entity.media = restored ? structuredClone(restored.media) : ['table', 'data-table'].includes(previousType) || ['sections', 'table', 'data-table'].includes(entity.type) ? [] : entity.type === 'big-media' ? entity.media.slice(0, 1) : entity.media;
       if (restored) { const { media, previews, ...fields } = restored; state.draft.previews = structuredClone(previews); Object.assign(entity, fields); }
       if (entity.type === 'links' && !restored) { entity.items = []; entity.meta = { columns: 2, compact: false }; }
       if (entity.type === 'sections' && !restored) { entity.items = []; entity.meta = {}; }
       if (entity.type === 'grid' && !restored) { entity.items = []; entity.meta = {}; }
       if (entity.type === 'table' && !restored) { entity.rows = []; entity.meta = {}; }
+      if (entity.type === 'data-table' && !restored) { entity.columns = []; entity.rows = []; entity.meta = {}; entity.caption = ''; }
       updateViews(); renderContent(); resetReview();
     }); renderContent();
   }
@@ -1098,6 +1093,130 @@
     const referenced = tableReferencedMedia(entity), removed = new Set(candidates);
     entity.media = entity.media.filter(asset => !removed.has(asset.id) || referenced.has(asset.id));
   }
+  function dataTableFields(entity, container) {
+    entity.columns ||= []; entity.rows ||= []; entity.meta ||= {}; entity.media = [];
+    const caption = bind(input('builder-caption', entity.caption), entity, 'caption'); caption.maxLength = 1000;
+    container.append(field('Подпись', caption));
+    const editor = node('div', 'builder-data-table-editor'); container.append(editor);
+    // These are local ARM resource limits (also enforced by the store).
+    const limits = { columns: 100, rows: 100, cells: 1000 };
+    const cellCount = () => entity.rows.reduce((sum, row) => sum + (row.cells?.length || 0), 0);
+    const emptyCell = () => ({ id: `cell-${crypto.randomUUID()}`, value: '' });
+    const rowDrafts = state.draft.dataTableRowDrafts ||= new Map();
+    let dragged = null;
+    const focus = selector => {
+      const control = editor.querySelector(selector); if (!control) return;
+      for (let parent = control.parentElement; parent && parent !== editor; parent = parent.parentElement) if (parent.tagName === 'DETAILS' && !(control.tagName === 'SUMMARY' && parent === control.parentElement)) parent.open = true;
+      control.focus();
+    };
+    const inputField = (body, item, key, label, max, { multiline = false, optional = false, required = false, update } = {}) => {
+      const control = multiline ? textarea(`builder-data-${item.id}-${key}`, item[key], 4) : input(`builder-data-${item.id}-${key}`, item[key]);
+      control.maxLength = max; control.dataset.dataTableLabel = label;
+      if (required) { control.dataset.nonblank = 'true'; control.setAttribute('aria-required', 'true'); }
+      control.addEventListener('input', () => { if (optional && !control.value) delete item[key]; else item[key] = control.value; update?.(); resetReview(); });
+      body.append(field(label, control)); return control;
+    };
+    const numberField = (body, item, key, label, min, max, id, fallback = '') => {
+      const control = input(id, item[key] ?? fallback); Object.assign(control, { type: 'number', min: String(min), max: String(max), step: '1', placeholder: key === 'min_width' ? 'Автоматически' : 'Не задано' }); control.dataset.dataTableLabel = label;
+      control.addEventListener('input', () => { if (control.value) item[key] = Number(control.value); else delete item[key]; resetReview(); }); body.append(field(label, control));
+    };
+    const checkbox = (body, item, key, label, id, fallback = false) => {
+      const control = node('input', 'form-check-input'); Object.assign(control, { id, type: 'checkbox', checked: item[key] ?? fallback }); bind(control, item, key); body.append(field(label, control));
+    };
+    const alignField = (body, item, inherit) => {
+      const control = node('select', 'form-select'); control.id = `builder-data-${item.id}-align`;
+      for (const [value, label] of [...(inherit ? [['', 'По колонке']] : []), ['left', 'Слева'], ['center', 'По центру'], ['right', 'Справа']]) control.append(new Option(label, value, false, (item.align ?? (inherit ? '' : 'left')) === value));
+      control.addEventListener('change', () => { if (control.value) item.align = control.value; else delete item.align; resetReview(); }); body.append(field('Выравнивание', control));
+    };
+    const render = (focusSelector) => {
+      const opened = new Set([...editor.querySelectorAll('details[open]')].map(details => details.id));
+      const active = editor.contains(document.activeElement) ? document.activeElement.id : null;
+      clear(editor);
+      const card = (items, item, index, kind, label, fill, removeItem, afterRemove) => {
+        const shell = node('div', `builder-link-row builder-table-cell builder-data-${kind}`); shell.dataset.dataId = item.id;
+        const details = node('details', 'builder-table-cell-details'), summary = node('summary'); details.id = `builder-data-${item.id}-details`;
+        const update = () => { summary.textContent = (kind === 'cell' ? window.BuilderMarkdown.plainText(item.value).slice(0, 120) : String(kind === 'column' ? item.title : kind === 'group' ? item.group : '').trim()) || label; };
+        const body = node('div', 'builder-table-cell-body'), controls = node('div', 'builder-image-tools');
+        const move = beforeId => {
+          if (state.saving || item.id === beforeId) return;
+          const index = items.indexOf(item); if (index < 0) return; items.splice(index, 1);
+          const destination = beforeId ? items.findIndex(candidate => candidate.id === beforeId) : items.length;
+          items.splice(destination < 0 ? items.length : destination, 0, item); resetReview(); render(`#builder-data-${CSS.escape(item.id)}-drag`);
+        };
+        const handle = action('⠿', () => { live.textContent = 'Используйте стрелки вверх и вниз или перетащите элемент.'; }, 'builder-media-drag');
+        handle.id = `builder-data-${item.id}-drag`; handle.draggable = true; handle.setAttribute('aria-label', `Перетащить: ${label.toLowerCase()} ${index + 1}`);
+        handle.addEventListener('keydown', event => { if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return; event.preventDefault(); event.stopPropagation(); if (event.key === 'ArrowUp' && index > 0) move(items[index - 1].id); else if (event.key === 'ArrowDown' && index < items.length - 1) move(items[index + 2]?.id); });
+        handle.addEventListener('dragstart', event => { if (state.saving) { event.preventDefault(); return; } event.stopPropagation(); dragged = { items, item, move }; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', item.id); });
+        handle.addEventListener('dragend', event => { event.stopPropagation(); dragged = null; editor.querySelectorAll('.builder-drop-before,.builder-drop-after').forEach(element => element.classList.remove('builder-drop-before', 'builder-drop-after')); });
+        const remove = action('', () => { if (state.saving) return; removeItem(); resetReview(); render(afterRemove); }, 'builder-delete text-danger'); remove.setAttribute('aria-label', `Удалить: ${label.toLowerCase()} ${index + 1}`); remove.append(trashIcon()); controls.append(remove, handle);
+        const before = event => event.clientY < shell.getBoundingClientRect().top + shell.getBoundingClientRect().height / 2;
+        shell.addEventListener('dragover', event => { if (!dragged || dragged.items !== items || state.saving) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; shell.classList.toggle('builder-drop-before', before(event)); shell.classList.toggle('builder-drop-after', !before(event)); });
+        shell.addEventListener('dragleave', event => { event.stopPropagation(); shell.classList.remove('builder-drop-before', 'builder-drop-after'); });
+        shell.addEventListener('drop', event => { if (!dragged || dragged.items !== items || state.saving) return; event.preventDefault(); event.stopPropagation(); const current = dragged; dragged = null; current.move(before(event) ? item.id : items[index + 1]?.id); });
+        fill(body, update); update(); summary.id = `builder-data-${item.id}-summary`; details.append(summary, body); shell.append(details, controls); return shell;
+      };
+      const add = (id, label, callback, disabled) => {
+        const button = action('', callback, 'builder-add builder-image-add'); button.id = id; button.disabled = disabled; button.setAttribute('aria-label', label); button.title = label;
+        const plus = node('span', 'builder-add-plus', '+'); plus.setAttribute('aria-hidden', 'true'); button.append(plus); return button;
+      };
+      const columns = node('section', 'builder-images-section builder-table-section'), columnList = node('div', 'builder-data-columns'); columns.append(node('h4', '', 'Колонки'), columnList);
+      entity.columns.forEach((column, index) => columnList.append(card(entity.columns, column, index, 'column', 'Колонка', (body, update) => {
+        inputField(body, column, 'title', 'Заголовок', 500, { update }); inputField(body, column, 'key', 'Ключ', 200); alignField(body, column, false);
+        numberField(body, column, 'width', 'Ширина, %', 5, 80, `builder-data-${column.id}-width`); checkbox(body, column, 'nowrap', 'Не переносить текст', `builder-data-${column.id}-nowrap`);
+      }, () => entity.columns.splice(index, 1), '#builder-add-data-column')));
+      columns.append(add('builder-add-data-column', 'Добавить колонку', () => { if (state.saving || entity.columns.length >= limits.columns) return; const column = { id: `column-${crypto.randomUUID()}`, key: '', title: '' }; entity.columns.push(column); resetReview(); render(`#builder-data-${CSS.escape(column.id)}-summary`); }, entity.columns.length >= limits.columns));
+      editor.append(columns);
+      const rows = node('section', 'builder-images-section builder-table-section'), rowList = node('div', 'builder-data-rows'); rows.append(node('h4', '', 'Строки'), rowList);
+      entity.rows.forEach((row, index) => rowList.append(card(entity.rows, row, index, Object.hasOwn(row, 'group') ? 'group' : 'row', Object.hasOwn(row, 'group') ? 'Группа' : 'Строка', (body, update) => {
+        const group = Object.hasOwn(row, 'group'), type = node('select', 'form-select'); type.id = `builder-data-${row.id}-type`;
+        type.append(new Option('Строка', 'row', false, !group), new Option('Группа', 'group', false, group));
+        type.addEventListener('change', () => {
+          if (state.saving || type.value === (group ? 'group' : 'row')) return;
+          const drafts = rowDrafts.get(row.id) || {};
+          if (group) drafts.group = row.group; else drafts.cells = structuredClone(row.cells);
+          const cells = type.value === 'row' ? structuredClone(drafts.cells || [emptyCell()]) : null;
+          if (cells && cellCount() + cells.length > limits.cells) {
+            type.value = 'group'; formError.textContent = `В таблице может быть не больше ${limits.cells} ячеек. Удалите лишние ячейки перед сменой типа.`; formError.classList.remove('d-none'); type.focus(); return;
+          }
+          rowDrafts.set(row.id, drafts); delete row.group; delete row.cells;
+          if (cells) row.cells = cells; else row.group = drafts.group ?? '';
+          resetReview(); render(`#${CSS.escape(type.id)}`);
+        });
+        body.append(field('Тип', type));
+        if (group) { inputField(body, row, 'group', 'Заголовок', 500, { required: true, update }); return; }
+        const cells = node('div', 'builder-table-cells'); body.append(cells);
+        row.cells.forEach((cell, cellIndex) => cells.append(card(row.cells, cell, cellIndex, 'cell', 'Ячейка', (cellBody, updateCell) => {
+          const text = itemMarkdownField(cell, `builder-data-${cell.id}-value`, 'builder-table-cell-text', 'value'); text.id = `builder-data-${cell.id}-text`;
+          const source = text.querySelector('textarea'); source.dataset.dataTableLabel = 'Текст'; source.addEventListener('input', updateCell); cellBody.append(text);
+          const settings = node('details', 'builder-table-cell-settings'); settings.id = `builder-data-${cell.id}-settings`; settings.append(node('summary', '', 'Настройки'));
+          inputField(settings, cell, 'key', 'Ключ', 200, { optional: true }); alignField(settings, cell, true);
+          numberField(settings, cell, 'colspan', 'Объединить колонок', 1, 12, `builder-data-${cell.id}-colspan`, 1); numberField(settings, cell, 'rowspan', 'Объединить строк', 1, 100, `builder-data-${cell.id}-rowspan`, 1);
+          checkbox(settings, cell, 'is_header', 'Ячейка-заголовок', `builder-data-${cell.id}-is_header`); checkbox(settings, cell, 'nowrap', 'Не переносить текст', `builder-data-${cell.id}-nowrap`); cellBody.append(settings);
+        }, () => { row.cells.splice(cellIndex, 1); if (!row.cells.length) { entity.rows.splice(entity.rows.indexOf(row), 1); rowDrafts.delete(row.id); } }, row.cells.length > 1 ? `#builder-data-${CSS.escape(row.id)}-add-cell` : '#builder-add-data-row')));
+        body.append(add(`builder-data-${row.id}-add-cell`, 'Добавить ячейку', () => { if (state.saving || cellCount() >= limits.cells) return; const cell = emptyCell(); row.cells.push(cell); resetReview(); render(`#builder-data-${CSS.escape(cell.id)}-summary`); }, cellCount() >= limits.cells));
+      }, () => { entity.rows.splice(index, 1); rowDrafts.delete(row.id); }, '#builder-add-data-row')));
+      rows.append(add('builder-add-data-row', 'Добавить строку', () => { if (state.saving || entity.rows.length >= limits.rows || cellCount() >= limits.cells) return; const row = { id: `row-${crypto.randomUUID()}`, cells: [emptyCell()] }; entity.rows.push(row); resetReview(); render(`#builder-data-${CSS.escape(row.id)}-summary`); }, entity.rows.length >= limits.rows || cellCount() >= limits.cells)); editor.append(rows);
+      for (const details of editor.querySelectorAll('details')) details.open = opened.has(details.id);
+      // Focusing a summary must not expand its own new card, only its ancestors.
+      if (focusSelector) focus(focusSelector); else if (active) focus(`#${CSS.escape(active)}`);
+    };
+    render();
+    const advanced = node('details', 'builder-banner-advanced builder-data-advanced'); advanced.append(node('summary', '', 'Дополнительные настройки'));
+    for (const [key, label, fallback] of [['striped', 'Чередовать фон строк', true], ['bordered', 'Показывать рамки', true], ['sticky_header', 'Закрепить заголовки колонок', false]]) checkbox(advanced, entity.meta, key, label, `builder-data-${key}`, fallback);
+    numberField(advanced, entity.meta, 'min_width', 'Минимальная ширина, px', 480, 1600, 'builder-data-min_width'); container.append(advanced);
+  }
+  function validateDataTableFields() {
+    for (const control of fields.querySelectorAll('[data-data-table-label]')) {
+      let message = '';
+      if (control.dataset.nonblank && !control.value.trim()) message = `Заполните поле «${control.dataset.dataTableLabel}».`;
+      else if (!control.validity.valid) message = control.type === 'number' ? `Поле «${control.dataset.dataTableLabel}»: укажите целое число от ${control.min} до ${control.max} или оставьте пустым.` : `Проверьте поле «${control.dataset.dataTableLabel}».`;
+      if (!message) continue;
+      formError.textContent = message; formError.classList.remove('d-none');
+      for (let parent = control.parentElement; parent && parent !== fields; parent = parent.parentElement) if (parent.tagName === 'DETAILS') parent.open = true;
+      control.focus(); control.scrollIntoView({ block: 'nearest' }); return false;
+    }
+    return true;
+  }
   function tableFields(entity, container) {
     entity.rows ||= []; entity.meta ||= {};
     const section = node('section', 'builder-images-section builder-table-section'), heading = node('h4', '', 'Таблица');
@@ -1354,7 +1473,8 @@
         resetReview(); renderMedia(); list.querySelector(`[data-media-id="${CSS.escape(id)}"] .builder-media-drag`)?.focus(); return;
       }
       const index = entity.media.findIndex(item => item.id === id); if (index < 0) return;
-      const asset = entity.media.splice(index, 1)[0], destination = beforeId ? entity.media.findIndex(item => item.id === beforeId) : entity.media.length;
+      if (fixedCount && (index >= fixedCount || (beforeId && !entity.media.slice(0, fixedCount).some(item => item.id === beforeId)))) return;
+      const asset = entity.media.splice(index, 1)[0], destination = beforeId ? entity.media.findIndex(item => item.id === beforeId) : fixedCount ? Math.min(fixedCount - 1, entity.media.length) : entity.media.length;
       entity.media.splice(destination, 0, asset); resetReview(); renderMedia(); list.querySelector(`[data-media-id="${id}"] .builder-media-drag`)?.focus();
     };
     const renderMedia = () => {
@@ -1528,6 +1648,7 @@
       await persistDraft(draft, next); return;
     }
     const status = document.getElementById('builder-review-status')?.value || 'unreviewed', reason = document.getElementById('builder-review-reason')?.value.trim() || '';
+    if (target.type === 'data-table' && !validateDataTableFields()) return;
     if (status === 'failed' && !reason) { formError.textContent = 'Укажите причину непройденной проверки.'; formError.classList.remove('d-none'); document.getElementById('builder-review-reason').focus(); return; }
     if (target.type === 'rich-content') {
       if (!target.text.trim()) { formError.textContent = 'Заполните поле «HTML».'; formError.classList.remove('d-none'); document.querySelector('#builder-content .cm-content')?.focus(); return; }
@@ -1539,7 +1660,7 @@
     if (edited.type === 'big-media') edited.media = edited.media.slice(0, 1);
     if (edited.type === 'service' || edited.type === 'content') edited.media = edited.media.slice(0, 2);
     if (edited.type === 'table') { const referenced = tableReferencedMedia(edited); edited.media = edited.media.filter(asset => referenced.has(asset.id)); }
-    if (edited.type === 'rich-content') edited.media = [];
+    if (edited.type === 'rich-content' || edited.type === 'data-table') edited.media = [];
     if (draft.reviewConfirmed && status !== 'unreviewed') edited.reviewedRevision = draft.revision;
     if (draft.mode === 'edit' && !draft.reviewConfirmed && JSON.stringify(edited) === JSON.stringify(draft.originalEntity)) {
       if (state.modalShown) window.tabler.Modal.getInstance(modalElement).hide(); else draft.closeWhenShown = true;

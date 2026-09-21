@@ -16,13 +16,15 @@ class Queue extends PageQueue {
     this.mediaPicker = new MediaPicker(this);
     this.framePicker = new FramePicker(this);
     this.documentPicker = new DocumentPicker(this);
-    this.pageBuilder.assertWritable = () => this.stage.media.deletion.assertReady();
+    // Capture-only stage factories remain supported. If media is installed,
+    // its deletion guard and recovery are mandatory (not optional methods).
+    this.pageBuilder.assertWritable = () => this.stage.media?.deletion.assertReady();
     this.pageBuilder.validateMedia = (...args) => { this.mediaPicker.validateDocument(...args); this.framePicker.validateDocument(...args); this.documentPicker.validateDocument(...args); };
     // Bind legacy pages before any subsequent retry can change the latest attempt.
     for (const job of this.jobs) { try { this.pageBuilder.migrateLegacy(job.id); } catch { /* surfaced by the page summary; retry also refuses incomplete migration */ } }
-    this.stage.media.deletion.recoverAll();
+    this.stage.media?.deletion.recoverAll();
   }
-  retry(id) { this.stage.media.deletion.assertReady(); this.pageBuilder.migrateLegacy(id); return super.retry(id); }
+  retry(id) { this.stage.media?.deletion.assertReady(); this.pageBuilder.migrateLegacy(id); return super.retry(id); }
   async shutdown() {
     const pickerStopped = this.mediaPicker.shutdown();
     try { await super.shutdown(); } finally { await pickerStopped; }

@@ -114,12 +114,17 @@ test('unreferenced deletion does not create a page and a newer attempt cannot de
 });
 
 test('a failed manifest write leaves a journal and restart rolls the builder-first transaction forward', async t => {
-  const ctx = await fixture(t, { server: false }), { queue, job, attempt, dir } = ctx, { images } = attach(ctx);
+  const ctx = await fixture(t), { queue, job, attempt, dir } = ctx, { images } = attach(ctx);
   const request = { ...context(ctx), resourceId: images[0].id }, manifestFile = path.join(dir, 'manifest.json'), originalRename = fs.renameSync;
   let fail = true; fs.renameSync = (...args) => { if (fail && args[1] === manifestFile) { fail = false; throw new Error('injected manifest rename failure'); } return originalRename(...args); };
   try { assert.throws(() => queue.stage.media.deletion.commit(job.id, request), /injected manifest/); }
   finally { fs.renameSync = originalRename; }
   assert.equal(queue.stage.media.deletion.failed, true); assert.equal(fs.existsSync(path.join(dir, 'delete-transaction.json')), true);
+  const frozen = queue.pageBuilder.read(job.id), attempts = job.attempts.length;
+  assert.throws(() => queue.pageBuilder.write(job.id, frozen.revision, frozen.document), /требуется восстановление/);
+  assert.throws(() => queue.retry(job.id), /требуется восстановление/); assert.equal(job.attempts.length, attempts);
+  assert.equal((await fetch(ctx.base + '/api/state')).status, 503);
+  const health = await fetch(ctx.base + '/api/health'); assert.equal(health.status, 200); assert.equal((await health.json()).version, require('../package.json').version);
   const restarted = new Queue({ root: queue.root, autoStart: false });
   assert.equal(fs.existsSync(path.join(dir, 'delete-transaction.json')), false);
   assert.equal(restarted.stage.media.read(restarted.get(job.id), restarted.get(job.id).attempts[0]).resources.find(item => item.id === images[0].id).status, 'deleted');
