@@ -1984,11 +1984,13 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
   await opener.click(); assert.equal(await page.locator('.builder-link-row').count(), 1);
   await page.locator('.builder-link-row').first().getByLabel('URL').fill('wrong address');
   const beforeBadLink = queue.pageBuilder.read(job.id).revision; await page.locator('#page-builder-save').click();
+  await page.waitForFunction(() => /ссылка 1, поле «URL».*http:\/\/.*https:\/\//.test(document.querySelector('#page-builder-form-error').textContent));
   assert.match(await page.locator('#page-builder-form-error').innerText(), /ссылка 1, поле «URL».*http:\/\/.*https:\/\//);
   assert.doesNotMatch(await page.locator('#page-builder-form-error').innerText(), /common\.blocks|items\[/);
   assert.equal(queue.pageBuilder.read(job.id).revision, beforeBadLink);
   await page.locator('.builder-link-row').first().getByLabel('URL').fill(`/${'a'.repeat(4096)}`);
   await page.locator('#page-builder-save').click();
+  await page.waitForFunction(() => /ссылка 1, поле «URL» слишком длинное.*4096 символов/.test(document.querySelector('#page-builder-form-error').textContent));
   assert.match(await page.locator('#page-builder-form-error').innerText(), /ссылка 1, поле «URL» слишком длинное.*4096 символов/);
   assert.doesNotMatch(await page.locator('#page-builder-form-error').innerText(), /common\.blocks|items\[/);
   assert.equal(queue.pageBuilder.read(job.id).revision, beforeBadLink);
@@ -2063,9 +2065,11 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
   await page.locator('[data-tab-id="news"]').click(); await page.locator('[data-builder-id="news-links"]').click(); await page.waitForSelector('#page-builder-modal.show');
   const tabRevision = queue.pageBuilder.read(job.id).revision;
   await page.locator('.builder-link-row').first().getByLabel('URL').fill('bad address'); await page.locator('#page-builder-save').click();
+  await page.waitForFunction(() => /ссылка 1, поле «URL».*http:\/\//.test(document.querySelector('#page-builder-form-error').textContent));
   assert.match(await page.locator('#page-builder-form-error').innerText(), /ссылка 1, поле «URL».*http:\/\//);
   assert.doesNotMatch(await page.locator('#page-builder-form-error').innerText(), /tabs\[|blocks\[|items\[/);
   await page.locator('.builder-link-row').first().getByLabel('URL').fill(`/${'a'.repeat(4096)}`); await page.locator('#page-builder-save').click();
+  await page.waitForFunction(() => /ссылка 1, поле «URL» слишком длинное.*4096 символов/.test(document.querySelector('#page-builder-form-error').textContent));
   assert.match(await page.locator('#page-builder-form-error').innerText(), /ссылка 1, поле «URL» слишком длинное.*4096 символов/);
   assert.doesNotMatch(await page.locator('#page-builder-form-error').innerText(), /tabs\[|blocks\[|items\[/);
   assert.equal(queue.pageBuilder.read(job.id).revision, tabRevision);
