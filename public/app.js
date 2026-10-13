@@ -13,7 +13,7 @@
     validating: "Проверяется",
     stopping: "Останавливается",
     complete: "Готово",
-    needs_review: "Нужна проверка",
+    needs_review: "Проверка не завершена",
     incomplete: "Неполный результат",
     failed: "Ошибка",
     cancelled: "Отменено",
@@ -49,6 +49,9 @@
     refreshGeneration: 0,
     shutdownRequested: false,
     shutdownError: false,
+    localConnection: "reconnecting",
+    localFailures: 0,
+    polling: false,
     submitting: false,
     pendingActions: new Map(),
     jobDragId: null,
@@ -56,10 +59,10 @@
   };
 
   const el = Object.fromEntries([
-    "connection-control", "connection-dot", "connection-label", "concurrency-value", "global-alert",
+    "connection-control", "connection-icon", "connection-message", "concurrency-value", "global-alert",
     "batch-form", "url-input", "clear-url", "url-feedback", "submit-button", "batch-result", "progress-label",
     "progress-bar", "jobs-body", "empty-detail", "concurrency-slider", "settings-error",
-    "job-detail", "detail-url", "result-steps", "attempt-duration", "detail-id",
+    "job-detail", "detail-url", "company-id", "result-steps", "attempt-duration", "detail-id",
     "detail-created", "attempt-select", "attempt-meta", "files-list", "recapture-button",
     "stage-step-1", "stage-step-2", "stage-step-3", "gallery-body",
     "metadata-panel", "summary-panel", "stage-two-panel", "stage-three-panel", "attempt-header",
@@ -72,11 +75,43 @@
     "json-modal", "json-modal-title", "json-output", "json-error"
   ].map((id) => [id, document.getElementById(id)]));
 
-  function setConnection(connected, message, phase = connected ? "connected" : "reconnecting") {
-    el["connection-label"].textContent = message;
-    const dotClass = phase === "connected" ? "bg-green" : phase === "stopping" ? "status-dot-animated bg-yellow" : phase === "disconnected" ? "bg-red" : "status-dot-animated bg-red";
-    el["connection-dot"].className = `status-dot ${dotClass}`;
-    el["connection-control"].disabled = phase !== "connected";
+  const CONNECTION_ICONS = {
+    "plug-connected": '<path d="M7 12l5 5l-1.5 1.5a3.536 3.536 0 1 1 -5 -5l1.5 -1.5"/><path d="M17 12l-5 -5l1.5 -1.5a3.536 3.536 0 1 1 5 5l-1.5 1.5"/><path d="M3 21l2.5 -2.5"/><path d="M18.5 5.5l2.5 -2.5"/><path d="M10 11l-2 2"/><path d="M13 14l-2 2"/>',
+    "plug-connected-x": '<path d="M20 16l-4 4"/><path d="M7 12l5 5l-1.5 1.5a3.536 3.536 0 1 1 -5 -5l1.5 -1.5"/><path d="M17 12l-5 -5l1.5 -1.5a3.536 3.536 0 1 1 5 5l-1.5 1.5"/><path d="M3 21l2.5 -2.5"/><path d="M18.5 5.5l2.5 -2.5"/><path d="M10 11l-2 2"/><path d="M13 14l-2 2"/><path d="M16 16l4 4"/>',
+    "wifi-off": '<path d="M12 18l.01 0"/><path d="M9.172 15.172a4 4 0 0 1 5.656 0"/><path d="M6.343 12.343a7.963 7.963 0 0 1 3.864 -2.14m4.163 .155a7.965 7.965 0 0 1 3.287 2"/><path d="M3.515 9.515a12 12 0 0 1 3.544 -2.455m3.101 -.92a12 12 0 0 1 10.325 3.374"/><path d="M3 3l18 18"/>',
+    spinner: '<path d="M12 3a9 9 0 1 1 -9 9"/>',
+    "server-off": '<path d="M12 12h-6a3 3 0 0 1 -3 -3v-2c0 -1.083 .574 -2.033 1.435 -2.56m3.565 -.44h10a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-2"/><path d="M16 12h2a3 3 0 0 1 3 3v2m-1.448 2.568a2.986 2.986 0 0 1 -1.552 .432h-12a3 3 0 0 1 -3 -3v-2a3 3 0 0 1 3 -3h6"/><path d="M7 8v.01"/><path d="M7 16v.01"/><path d="M3 3l18 18"/>'
+  };
+
+  function renderConnection() {
+    let phase = state.localConnection;
+    if (phase === "connected") {
+      phase = navigator.onLine === false ? "offline" : begetConnection?.connection === "online" ? "connected" : "beget-unavailable";
+    }
+    const icons = { connected: "plug-connected", offline: "wifi-off", "beget-unavailable": "plug-connected-x", reconnecting: "spinner", stopping: "spinner", stopped: "server-off", unavailable: "server-off" };
+    const labels = {
+      connected: "Отключить АРМ",
+      offline: "Нет интернета · Отключить АРМ",
+      "beget-unavailable": "Beget недоступен · Отключить АРМ",
+      reconnecting: "Подключение…",
+      stopping: "Отключение…",
+      stopped: "Запустите АРМ через лаунчер",
+      unavailable: "Повторить подключение"
+    };
+    const control = el["connection-control"];
+    control.dataset.state = phase;
+    control.dataset.icon = icons[phase];
+    control.setAttribute("aria-label", labels[phase]);
+    control.title = labels[phase];
+    control.setAttribute("aria-disabled", String(phase === "reconnecting" || phase === "stopping" || phase === "stopped"));
+    control.setAttribute("aria-busy", String(phase === "reconnecting" || phase === "stopping"));
+    el["connection-message"].textContent = labels[phase];
+    el["connection-icon"].innerHTML = CONNECTION_ICONS[icons[phase]];
+  }
+
+  function setConnection(phase) {
+    state.localConnection = phase;
+    renderConnection();
   }
 
   function showGlobalError(message) {
@@ -194,10 +229,13 @@
 
   function actionIcon(name) {
     if (name === "running") {
+      const graphic = document.createElement("span");
+      graphic.className = "icon queue-status-pulse-icon";
+      graphic.setAttribute("aria-hidden", "true");
       const indicator = document.createElement("span");
       indicator.className = "status-dot status-dot-animated bg-blue";
-      indicator.setAttribute("aria-hidden", "true");
-      return indicator;
+      graphic.append(indicator);
+      return graphic;
     }
     const ns = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(ns, "svg");
@@ -207,6 +245,9 @@
       clock: [["path", { d: "M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" }], ["path", { d: "M12 7v5l3 3" }]],
       check: [["path", { d: "M5 12l5 5l10 -10" }]],
       alert: [["path", { d: "M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" }], ["path", { d: "M12 8v4" }], ["path", { d: "M12 16h.01" }]],
+      imageClock: [["path", { d: "M12 5v7l5 3" }]],
+      imageCheck: [["path", { d: "M5 12l5 5l10 -10" }]],
+      imageAlert: [["path", { d: "M12 5v10" }], ["path", { d: "M12 19h.01" }]],
       square: [["path", { d: "M5 7a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2l0 -10" }]]
     };
     for (const [tag, attributes] of shapes[name] || shapes.alert) {
@@ -234,7 +275,7 @@
     button.setAttribute("aria-busy", String(pendingAction));
     button.setAttribute("aria-disabled", String(button.disabled));
     const graphic = actionIcon(icon);
-    if (icon === "running") graphic.className = `status-dot status-dot-animated bg-${color}`;
+    if (icon === "running") graphic.firstElementChild.className = `status-dot status-dot-animated bg-${color}`;
     button.append(graphic);
     button.addEventListener("click", event => {
       event.stopPropagation();
@@ -245,6 +286,7 @@
     wrapper.className = "queue-status-control";
     wrapper.append(button);
     wrapper.addEventListener("click", event => { if (button.disabled) event.stopPropagation(); });
+    wrapper.addEventListener("keydown", event => { if (button.disabled) event.stopPropagation(); });
     updateActionTooltip(button);
     return wrapper;
   }
@@ -255,8 +297,9 @@
     button.setAttribute("aria-label", `${title} · ${button.dataset.jobUrl}`);
     const wrapper = button.parentElement;
     window.tabler.Tooltip.getInstance(wrapper)?.dispose();
-    if (button.dataset.problem) { wrapper.tabIndex = 0; wrapper.setAttribute("role", "img"); wrapper.setAttribute("aria-label", title); }
-    new window.tabler.Tooltip(wrapper, { trigger: button.dataset.problem ? "hover focus" : "hover", title, html: false, animation: false });
+    const informational = Boolean(button.dataset.problem || !button.dataset.action);
+    if (informational) { wrapper.tabIndex = 0; wrapper.setAttribute("role", "img"); wrapper.setAttribute("aria-label", title); }
+    new window.tabler.Tooltip(wrapper, { trigger: informational ? "hover focus" : "hover", title, html: false, animation: false });
   }
 
   function queueActions(job) {
@@ -274,12 +317,12 @@
       paused: [job.canResume ? "resume" : null, "Продолжить", "pause", "secondary"],
       queued: ["pause", "Приостановить", "clock", "blue"],
       running: [job.canPause ? "pause" : null, "Приостановить", "running", "blue"],
-      pausing: [null, "Недоступно", "running", "yellow"],
+      pausing: [null, "Недоступно", "running", "secondary"],
       validating: [job.canPause ? "pause" : null, "Приостановить", "running", "blue"],
-      stopping: [null, "Недоступно", "square", "yellow"],
+      stopping: [null, "Недоступно", "running", "secondary"],
       complete: [job.canRecapture ? "retry" : null, "Перезапустить", "check", "green"],
       needs_review: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
-      incomplete: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "orange"],
+      incomplete: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
       failed: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
       interrupted: [job.canResume ? "resume" : job.canRecapture ? "retry" : null, job.canResume ? "Продолжить" : "Перезапустить", "alert", "red"],
       cancelled: [job.canRecapture ? "retry" : null, "Перезапустить", "square", "secondary"]
@@ -645,6 +688,28 @@
       detailUrl.removeAttribute("target");
       detailUrl.removeAttribute("rel");
     }
+    const attempt = selectedAttempt(job);
+    const companyId = Number(attempt?.pageBuilder?.companyId);
+    const companyIdAvailable = Number.isSafeInteger(companyId) && companyId > 0;
+    const companyIdControl = el["company-id"];
+    companyIdControl.textContent = companyIdAvailable ? `ID: ${companyId}` : "ID: —";
+    companyIdControl.classList.toggle("disabled", !companyIdAvailable);
+    companyIdControl.setAttribute("aria-disabled", String(!companyIdAvailable));
+    if (companyIdAvailable) {
+      companyIdControl.href = `http://reestr35.seperb3i.beget.tech/company/?company=${companyId}`;
+      companyIdControl.target = "_blank";
+      companyIdControl.rel = "noopener noreferrer";
+      companyIdControl.removeAttribute("tabindex");
+      companyIdControl.setAttribute("aria-label", `Открыть новую страницу компании ID ${companyId}`);
+      companyIdControl.title = `Открыть новую страницу компании ID ${companyId}`;
+    } else {
+      companyIdControl.removeAttribute("href");
+      companyIdControl.removeAttribute("target");
+      companyIdControl.removeAttribute("rel");
+      companyIdControl.tabIndex = -1;
+      companyIdControl.setAttribute("aria-label", "ID компании ещё не получен");
+      companyIdControl.title = "ID компании ещё не получен";
+    }
     el["detail-id"].textContent = String(job.id || "—");
     el["detail-created"].textContent = formatDate(job.createdAt);
 
@@ -671,16 +736,22 @@
     recapture.title = "Перезапустить";
     recapture.setAttribute("aria-label", "Перезапустить");
     renderDuration();
-    const attempt = selectedAttempt(job);
     renderAttempt(job, attempt);
     renderStages(job, attempt);
   }
 
+  let begetConnection = null;
+  window.addEventListener('online', renderConnection);
+  window.addEventListener('offline', renderConnection);
   function renderState(data, generation = state.refreshGeneration) {
+    begetConnection = data.beget || null; renderConnection();
     if (state.jobDragId || state.jobReorderPending) return;
     state.csrfToken = typeof data.csrfToken === "string" ? data.csrfToken : "";
     const jobs = Array.isArray(data.jobs) ? data.jobs : [];
-    const fingerprint = JSON.stringify(jobs);
+    // The backend checkpoints active duration every second. Duration is drawn
+    // separately below; keeping it out of this fingerprint preserves animated
+    // status nodes while all actual status/action changes still rerender.
+    const fingerprint = JSON.stringify(jobs, (key, value) => key === "activeDurationMs" || key === "activeSince" ? undefined : value);
     const changed = fingerprint !== state.jobsFingerprint;
     let confirmedAction = false;
     for (const [id, pending] of state.pendingActions) {
@@ -699,6 +770,9 @@
     if (changed || confirmedAction) {
       renderJobs();
       renderDetail();
+    } else if (state.activeStage === 3) {
+      const job = jobs.find(item => item.id === state.selectedJobId), attempt = job && currentAttempt(job);
+      if (job && thirdStageAvailable(attempt)) void window.PageBuilder.render(job, { api, attempt, refresh: () => refreshState() });
     }
     renderDuration();
   }
@@ -900,7 +974,7 @@
     span.className = `image-status ${classes[status]}`;
     span.dataset.imageStatus = status;
     span.tabIndex = 0; span.setAttribute('role', 'img'); span.setAttribute('aria-label', labels[status]); span.title = labels[status];
-    span.append(actionIcon(status === 'passed' ? 'check' : status === 'unreviewed' ? 'clock' : 'alert'));
+    span.append(actionIcon(status === 'passed' ? 'imageCheck' : status === 'unreviewed' ? 'imageClock' : 'imageAlert'));
     span.addEventListener('click', event => event.stopPropagation());
     // Polling can replace a focused status immediately after blur; avoid a
     // pending hide transition calling into a disposed Tabler tooltip.
@@ -1068,7 +1142,8 @@
         const data = await api("/api/state");
         renderState(data || {}, generation);
         if (!state.shutdownRequested) {
-          setConnection(true, "Подключено");
+          state.localFailures = 0;
+          setConnection("connected");
           if (!state.shutdownError) showGlobalError("");
         }
         await refreshSelectedLogs();
@@ -1089,7 +1164,7 @@
     state.stopped = true;
     if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);
     state.eventSource?.close();
-    setConnection(false, "Отключено", "disconnected");
+    setConnection("stopped");
   }
 
   async function waitForDisconnect() {
@@ -1114,7 +1189,7 @@
     state.shutdownRequested = true;
     if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);
     state.eventSource?.close();
-    setConnection(false, "Отключение…", "stopping");
+    setConnection("stopping");
     showGlobalError("");
     try {
       await api("/api/shutdown", { method: "POST", body: "{}" });
@@ -1122,7 +1197,7 @@
       if (!error.status) { void waitForDisconnect(); return; }
       if (error.status === 409) { void waitForDisconnect(); return; }
       state.shutdownRequested = false;
-      setConnection(true, "Подключено");
+      setConnection("connected");
       showGlobalError(`Не удалось выключить backend: ${error.message}`);
       state.shutdownError = true;
       connectEvents();
@@ -1133,16 +1208,28 @@
   }
 
   async function poll() {
-    if (state.stopped) return;
+    if (state.stopped || state.polling) return;
+    state.polling = true;
+    if (state.pollTimer !== null) window.clearTimeout(state.pollTimer);
     try {
       await refreshState();
     } catch (error) {
       if (!state.shutdownRequested) {
-        setConnection(false, "Переподключение…");
+        state.localFailures++;
+        setConnection(state.localFailures >= 3 ? "unavailable" : "reconnecting");
         showGlobalError(`Сервер недоступен: ${error instanceof Error ? error.message : String(error)}`);
       }
     } finally {
+      state.polling = false;
       if (!state.stopped && !state.shutdownRequested) state.pollTimer = window.setTimeout(poll, POLL_INTERVAL_MS);
+    }
+  }
+
+  function activateConnection() {
+    if (state.localConnection === "connected") { void requestShutdown(); return; }
+    if (state.localConnection === "unavailable") {
+      if (state.polling) { void refreshState().catch(() => {}); return; }
+      void poll();
     }
   }
 
@@ -1176,7 +1263,7 @@
   syncStepGeometry();
 
   el["batch-form"].addEventListener("submit", submitUrl);
-  el["connection-control"].addEventListener("click", requestShutdown);
+  el["connection-control"].addEventListener("click", activateConnection);
   el["url-input"].addEventListener("input", () => {
     rowFeedback({ input: el["url-input"], feedback: el["url-feedback"] }, "", "");
     el["batch-result"].classList.add("d-none");

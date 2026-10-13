@@ -277,7 +277,7 @@ test('worker prompt pins available Node, NODE_PATH and Chrome executable', t => 
 
 test('spawn errors fail the job and continue queue', t => {
   const { queue, children } = setup(t); queue.add('https://a.reestr35.ru\nhttps://b.reestr35.ru\nhttps://c.reestr35.ru'); queue.pump();
-  children[0].emit('error', new Error('ENOENT codex')); children[0].finish(-2);
+  children[0].emit('error', new Error('ENOENT node')); children[0].finish(-2);
   assert.equal(queue.jobs[0].attempts[0].status, 'failed'); assert.equal(children.length, 3);
   children[1].finish(1); children[2].finish(1);
 });
@@ -590,8 +590,6 @@ test('real child process receives stdin and writes JSONL/stderr files', async t 
   assert.match(fs.readFileSync(path.join(locations.dir, 'events.jsonl'), 'utf8'), /fixture/);
   assert.match(fs.readFileSync(path.join(locations.dir, 'stderr.log'), 'utf8'), /diagnostic/);
   assert.equal(queue.jobs[0].attempts[0].status, 'failed');
-  assert.deepEqual(buildArgs('W').slice(-3), ['app-server', '--listen', 'stdio://']);
+  assert.deepEqual(buildArgs('W'), ['app-server']); // stdio transport is implied
   assert.ok(!buildArgs('W').includes('exec'));
-  assert.ok(buildArgs('W').includes('sandbox_mode="read-only"'));
-  assert.ok(!buildArgs('W').includes('danger-full-access'));
 });

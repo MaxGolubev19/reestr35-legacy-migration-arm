@@ -9,6 +9,7 @@ const { EventEmitter } = require('node:events');
 const { Writable } = require('node:stream');
 const { spawn } = require('node:child_process');
 const { AppServer } = require('../src/app-server.cjs');
+const { BRIDGE } = require('../src/stages/capture-qa/qa/config.cjs');
 const { Queue, createServer } = require('../src/server.cjs');
 const { layout, captureInventory, captureCoverage, inspectArtifacts } = require('../src/lib.cjs');
 const { atomicJson, paths, loadQa, hash, QA_POLICY, counts, checkManifest } = require('../src/qa.cjs');
@@ -305,7 +306,9 @@ test('early PNG discovery, transient JSON and unlisted file privacy survive', t 
 });
 test('one capture and one QA turn receive all 11 PNG; each call commits and updates UI before completion', t => {
   const ctx = start(t), child = qa(ctx); assert.equal(ctx.sessions.length, 1); assert.equal(child.config.files.length, 11);
-  assert.ok(!child.config.prompt.includes('NOT_IN_QA_PROMPT')); assert.ok(!child.config.prompt.includes('capture-report.json')); assert.equal(fs.readdirSync(child.config.cwd).length, 11);
+  assert.ok(!child.config.prompt.includes('NOT_IN_QA_PROMPT')); assert.ok(!child.config.prompt.includes('capture-report.json'));
+  assert.deepEqual(fs.readdirSync(child.config.cwd).filter(name => name !== 'AGENTS.md'), child.config.files.map(file => file.name));
+  assert.ok(fs.readFileSync(path.join(child.config.cwd, 'AGENTS.md'), 'utf8').includes('QA staging'));
   let snapshot = ctx.queue.snapshot('').jobs[0].attempts[0];
   assert.deepEqual(snapshot.qa.segments.map(file => file.name), child.config.files.map(file => file.name));
   assert.deepEqual(snapshot.qa.segments.map(file => file.status), Array(11).fill('pending'));
@@ -559,7 +562,7 @@ test('two companies use separate app-server processes; failure and stop retry on
     while (!predicate()) { if (Date.now() > deadline) assert.fail('Process fixture timed out'); await new Promise(resolve => setTimeout(resolve, 10)); }
   };
   const ctx = setup(t, { concurrency: 2, appServerFactory() {
-    const app = new AppServer({ spawnFn(command, args, config) {
+    const app = new AppServer({ launch: { node: process.execPath, script: 'zcode-fixture', bridge: BRIDGE, provider: 'custom:fixture', model: 'GLM-5.3', reasoning: 'low', personalProviderFile: 'provider-fixture.json' }, spawnFn(command, args, config) {
       const child = spawn(process.execPath, [path.join(__dirname, 'fixtures/qa-app-server.cjs')], { ...config, stdio: ['pipe', 'pipe', 'pipe', 'ipc'] });
       child.on('message', message => { if (message.type === 'turn') child.turnInput = message.input; });
       processes.push(child); return child;
@@ -578,8 +581,10 @@ test('two companies use separate app-server processes; failure and stop retry on
   assert.equal(ctx.queue.active.size, 2); assert.equal(ctx.queue.qaServers.size, 2);
   for (const [index, child] of processes.entries()) {
     assert.equal(child.exitCode, null); assert.equal(child.signalCode, null);
-    const images = child.turnInput.filter(item => item.type === 'localImage');
-    assert.equal(images.length, 3); assert.ok(images.every(item => item.detail === 'original'));
+    const images = child.turnInput.attachments;
+    assert.equal(images.length, 3);
+    assert.ok(images.every(item => item.kind === 'image' && item.mimeType === 'image/png'));
+    assert.ok(images.every(item => path.isAbsolute(item.localPath) && fs.existsSync(item.localPath)));
     const job = ctx.queue.jobs[index], lease = readLease(layout(ctx.root, job, job.attempts[0]).dir, job.attempts[0].launch);
     assert.equal(lease.appServerPid, child.pid);
   }
@@ -594,7 +599,7 @@ test('two companies use separate app-server processes; failure and stop retry on
   assert.equal(new Set(processes.map(child => child.pid)).size, 3);
   assert.equal(ctx.queue.active.size, 2);
   assert.deepEqual(passes[2].config.files.map(file => file.name), ['01_tab.png', '02_tab.png']);
-  assert.equal(processes[2].turnInput.filter(item => item.type === 'localImage').length, 2);
+  assert.equal(processes[2].turnInput.attachments.length, 2);
   ctx.queue.pause(ctx.queue.jobs[1].id);
   await until(() => ctx.queue.jobs[1].attempts[0].status === 'paused');
   assert.equal(passes[1].app.child, null);

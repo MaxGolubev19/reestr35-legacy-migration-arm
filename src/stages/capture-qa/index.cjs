@@ -26,7 +26,7 @@ class CaptureQaStage {
     this.snapshotPngCache = new SnapshotPngCache();
     // These runtime aliases remain available to existing Queue integrations.
     Object.assign(queue, { qaAutoRetryLimit, qaRetryDelayMs, qaStates: new Map(), qaCompletions: new Map(), recoveredQa: new Map(), qaServers: new Set(),
-      appServerFactory: appServerFactory || (() => new AppServer({ codex: queue.codex, env: queue.runtime.env, root: queue.root })) });
+      appServerFactory: appServerFactory || (() => { if (!queue.zcode) throw new Error(queue.zcodeError || 'ZCode QA launch is not configured'); return new AppServer({ launch: queue.zcode, env: queue.runtime.env, root: queue.root }); }) });
   }
   attemptFields() { return { workflow: 2, phase: 'capture' }; }
   prepareAttempt(job, attempt) {

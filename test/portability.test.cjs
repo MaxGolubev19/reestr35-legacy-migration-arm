@@ -9,6 +9,10 @@ const { acquireLock } = require('../src/server.cjs');
 const { testTempRoot } = require('./support.cjs');
 const { configuration } = require('./run.cjs');
 
+// start.ps1 targets both PowerShell editions; prefer 7, fall back to 5.1.
+const powershell = process.env.ARM_TEST_PWSH_EXE
+  || (spawnSync('pwsh.exe', ['-NoProfile', '-Command', 'exit 0'], { windowsHide: true }).status === 0 ? 'pwsh.exe' : 'powershell.exe');
+
 test('data root is anchored to the application and supports an optional override', () => {
   assert.equal(APP_ROOT, path.resolve(__dirname, '..'));
   assert.equal(dataRoot({}), path.resolve(__dirname, '../local'));
@@ -34,8 +38,8 @@ test('start.ps1 creates logs under relative and absolute data roots from a forei
     const root = roots[index];
     assert.equal(fs.existsSync(path.join(root, 'logs')), false);
     assert.equal(fs.existsSync(path.join(root, 'qa-servers')), false);
-    const env = { ...process.env, ARM_DATA_DIR: override, ARM_CODEX_EXE: 'fixture' };
-    const result = spawnSync('pwsh.exe', ['-NoProfile', '-File', path.join(app, 'start.ps1')],
+    const env = { ...process.env, ARM_DATA_DIR: override, ARM_ZCODE_CJS: 'fixture', ARM_ZCODE_API_KEY: 'fixture' };
+    const result = spawnSync(powershell, ['-NoProfile', '-File', path.join(app, 'start.ps1')],
       { cwd: foreign, env, encoding: 'utf8', windowsHide: true });
     assert.equal(result.status, 0, result.stderr);
     const logs = path.join(root, 'logs');
@@ -44,7 +48,10 @@ test('start.ps1 creates logs under relative and absolute data roots from a forei
     assert.equal(fs.readdirSync(root).some(name => /^server-.*\.log$/.test(name)), false);
     const logFiles = fs.readdirSync(logs).filter(name => /^server-.*\.log$/.test(name));
     assert.equal(logFiles.length, 1);
-    const record = JSON.parse(fs.readFileSync(path.join(logs, logFiles[0]), 'utf8').trim());
+    // PowerShell 5.1 Tee-Object writes UTF-16LE; PowerShell 7 writes UTF-8.
+    const logBytes = fs.readFileSync(path.join(logs, logFiles[0]));
+    const logText = logBytes[0] === 0xff && logBytes[1] === 0xfe ? logBytes.subarray(2).toString('utf16le') : logBytes.toString('utf8');
+    const record = JSON.parse(logText.trim());
     assert.equal(record.root, root);
     assert.equal(record.cwd, foreign);
   }
@@ -85,7 +92,7 @@ test('standalone application starts clean and captures with its bundled helper f
   assert.deepEqual(fs.readdirSync(foreign), []);
 });
 
-test('explicit packaged runtime wins over developer modules and Codex cache', t => {
+test('explicit packaged runtime wins over developer modules and cached runtime', t => {
   const { resolveRuntime } = require('../src/lib.cjs');
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'runtime-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

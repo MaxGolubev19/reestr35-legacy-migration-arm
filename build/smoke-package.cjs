@@ -15,11 +15,12 @@ async function exited(child, timeout = 15000) {
  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'ARM smoke Кириллица '));
  const data = path.join(sandbox, 'Reestr35 ARM'), profile = path.join(sandbox, 'empty-profile');
  fs.mkdirSync(profile); const port = await freePort();
- const fakeCodex = path.join(sandbox, 'OpenAI/Codex/bin/fake-install/codex.exe');
+ const fakeZcode = path.join(profile, 'ZCode/resources/glm/zcode.cjs'); // ProgramFiles points at the profile sandbox
  const fakeChrome = path.join(sandbox, 'Google/Chrome/Application/chrome.exe');
- for (const file of [fakeCodex, fakeChrome]) { fs.mkdirSync(path.dirname(file), {recursive:true}); fs.copyFileSync(path.join(root,'runtime/node.exe'),file); }
+ fs.mkdirSync(path.dirname(fakeZcode), {recursive:true}); fs.writeFileSync(fakeZcode, '// fixture CLI bundle' + String.fromCharCode(10));
+ fs.mkdirSync(path.dirname(fakeChrome), {recursive:true}); fs.copyFileSync(path.join(root,'runtime/node.exe'),fakeChrome);
  const env = { ...process.env };
- for (const key of Object.keys(env)) if (['NODE_PATH', 'NODE_OPTIONS', 'ARM_DATA_DIR', 'ARM_RUNTIME_DIR', 'ARM_CODEX_EXE', 'ARM_CHROME_EXE', 'LOCALAPPDATA', 'USERPROFILE', 'HOME', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PATH', 'ARM_PORT', 'ARM_NO_BROWSER'].includes(key.toUpperCase())) delete env[key];
+ for (const key of Object.keys(env)) if (['NODE_PATH', 'NODE_OPTIONS', 'ARM_DATA_DIR', 'ARM_RUNTIME_DIR', 'ARM_ZCODE_CJS', 'ARM_ZCODE_API_KEY', 'ARM_CHROME_EXE', 'LOCALAPPDATA', 'USERPROFILE', 'HOME', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PATH', 'ARM_PORT', 'ARM_NO_BROWSER'].includes(key.toUpperCase())) delete env[key];
  Object.assign(env, { LOCALAPPDATA: sandbox, USERPROFILE: profile, HOME: profile, ProgramFiles: profile, 'ProgramFiles(x86)': profile, ARM_CHROME_EXE: fakeChrome, ARM_PORT: String(port), ARM_NO_BROWSER: '1', PATH: path.join(process.env.SystemRoot, 'System32') });
  const children = [];
  const launch = () => { const child = spawn(path.join(root, 'Reestr35 ARM.exe'), [], { cwd: sandbox, env, windowsHide: true, stdio: 'ignore' }); children.push(child); return child; };
@@ -47,16 +48,16 @@ async function exited(child, timeout = 15000) {
   try { assert.equal(await exited(launch()), 1); } finally { occupied.close(); }
   const logs = fs.readdirSync(path.join(data,'logs')).map(f => fs.readFileSync(path.join(data,'logs',f),'utf8')).join('\n');
   assert.match(logs, /EADDRINUSE/);
-  assert(logs.includes('Codex CLI: ' + fakeCodex), 'Codex desktop installation discovered without PATH');
+  assert(logs.includes('ZCode CLI: ' + fakeZcode), 'ZCode installation discovered without PATH');
   assert(logs.includes('Chrome: ' + fakeChrome), 'Chrome preflight validates the selected executable');
-  fs.unlinkSync(fakeCodex);
-  assert.equal(await exited(launch()), 1, 'missing Codex fails before backend startup');
-  fs.copyFileSync(path.join(root,'runtime/node.exe'),fakeCodex); fs.unlinkSync(fakeChrome);
+  fs.unlinkSync(fakeZcode);
+  assert.equal(await exited(launch()), 1, 'missing ZCode fails before backend startup');
+  fs.writeFileSync(fakeZcode, '// fixture CLI bundle' + String.fromCharCode(10)); fs.unlinkSync(fakeChrome);
   assert.equal(await exited(launch()), 1, 'missing Chrome fails before backend startup');
   const preflightLogs = fs.readdirSync(path.join(data,'logs')).map(f => fs.readFileSync(path.join(data,'logs',f),'utf8')).join('\n');
-  assert.match(preflightLogs, /Codex CLI was not found/); assert.match(preflightLogs, /ARM_CHROME_EXE does not point to an existing Chrome executable/);
+  assert.match(preflightLogs, /ZCode CLI was not found/); assert.match(preflightLogs, /ARM_CHROME_EXE does not point to an existing Chrome executable/);
   assert(!fs.existsSync(path.join(data,'server.lock'))); assert(!fs.existsSync(path.join(data,'launcher.json')));
-  console.log('Packaged smoke passed: isolated runtime, native sharp, Codex discovery, dependency preflight failures, readiness, repeat launch, UI shutdown, occupied-port failure.');
+  console.log('Packaged smoke passed: isolated runtime, native sharp, ZCode discovery, dependency preflight failures, readiness, repeat launch, UI shutdown, occupied-port failure.');
  } finally {
   for (const child of children) if (child.exitCode === null) spawnSync(path.join(process.env.SystemRoot,'System32/taskkill.exe'), ['/pid',String(child.pid),'/T','/F'], { windowsHide:true });
   fs.rmSync(sandbox, { recursive:true, force:true });

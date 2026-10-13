@@ -18,11 +18,11 @@ const conflict = message => Object.assign(new Error(message), { statusCode: 409 
 
 // Page lifecycle and global FIFO scheduler. A registered stage owns its work units.
 class PageQueue {
-  constructor({ root = dataRoot(), workspace = APP_ROOT, concurrency = 2, spawnFn = launchWorker, stopFn = stopTree, codex = 'codex', autoStart = true,
+  constructor({ root = dataRoot(), workspace = APP_ROOT, concurrency = 2, spawnFn = launchWorker, stopFn = stopTree, zcode, autoStart = true,
     idleTimeoutMs = Number(process.env.ARM_IDLE_TIMEOUT_MS || 600000), launchGraceMs = 5000,
     clock = Date.now, setTimer = setInterval, clearTimer = clearInterval, isPidAlive = pidAlive, stageFactory, ...stageOptions } = {}) {
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) throw new Error('concurrency должен быть целым числом 1–8');
-    Object.assign(this, { root, workspace, concurrency, spawnFn, stopFn, codex, autoStart });
+    Object.assign(this, { root, workspace, concurrency, spawnFn, stopFn, zcode, autoStart });
     if (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs < 1) throw new Error('ARM_IDLE_TIMEOUT_MS должен быть положительным целым');
     if (!Number.isInteger(launchGraceMs) || launchGraceMs < 1) throw new Error('launchGraceMs должен быть положительным целым');
     Object.assign(this, { idleTimeoutMs, launchGraceMs, clock, setTimer, clearTimer, isPidAlive });

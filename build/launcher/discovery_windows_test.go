@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func fixtureExe(t *testing.T, file string) string {
@@ -17,31 +16,24 @@ func fixtureExe(t *testing.T, file string) string {
 	}
 	return file
 }
-func TestCodexDiscovery(t *testing.T) {
+func TestZcodeDiscovery(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("LOCALAPPDATA", root)
-	t.Setenv("PATH", root)
-	t.Setenv("ARM_CODEX_EXE", "")
-	if _, err := discoverCodex(); err == nil {
+	t.Setenv("ProgramFiles", root)
+	t.Setenv("ProgramFiles(x86)", root)
+	t.Setenv("ARM_ZCODE_CJS", "")
+	if _, err := discoverZcode(); err == nil {
 		t.Fatal("missing CLI accepted")
 	}
-	older := fixtureExe(t, filepath.Join(root, "OpenAI/Codex/bin/old/codex.exe"))
-	oldTime := time.Now().Add(-time.Hour)
-	os.Chtimes(older, oldTime, oldTime)
-	newest := fixtureExe(t, filepath.Join(root, "OpenAI/Codex/bin/new/codex.exe"))
-	if got, err := discoverCodex(); err != nil || got != newest {
-		t.Fatalf("newest discovery: %s %v", got, err)
+	file := fixtureExe(t, filepath.Join(root, "ZCode/resources/glm/zcode.cjs"))
+	if got, err := discoverZcode(); err != nil || got != file {
+		t.Fatalf("Program Files discovery: %s %v", got, err)
 	}
-	onPath := fixtureExe(t, filepath.Join(root, "codex.exe"))
-	if got, err := discoverCodex(); err != nil || got != onPath {
-		t.Fatalf("PATH priority: %s %v", got, err)
-	}
-	t.Setenv("ARM_CODEX_EXE", older)
-	if got, err := discoverCodex(); err != nil || got != older {
+	t.Setenv("ARM_ZCODE_CJS", file)
+	if got, err := discoverZcode(); err != nil || got != file {
 		t.Fatalf("explicit priority: %s %v", got, err)
 	}
-	t.Setenv("ARM_CODEX_EXE", filepath.Join(root, "absent.exe"))
-	if _, err := discoverCodex(); err == nil {
+	t.Setenv("ARM_ZCODE_CJS", filepath.Join(root, "absent.cjs"))
+	if _, err := discoverZcode(); err == nil {
 		t.Fatal("invalid override accepted")
 	}
 }

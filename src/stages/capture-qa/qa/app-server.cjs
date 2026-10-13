@@ -1,6 +1,8 @@
 'use strict';
 const fs = require('node:fs');
+const net = require('node:net');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { APP_ROOT, dataRoot, dataSubdir } = require('../../../data-dir.cjs');
 const readline = require('node:readline');
 const { EventEmitter } = require('node:events');
@@ -13,11 +15,19 @@ const RECORD_REVIEW = Object.freeze({ type: 'function', name: 'record_review',
     properties: { name: { type: 'string' }, sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
       status: { type: 'string', enum: ['passed', 'issues'] }, issues: { type: 'array', items: { type: 'string' } } } } });
 
-// One process, ephemeral thread and turn for one company's QA pass. Never reuse
-// this object: completion is published only after its OS process has closed.
+const RUNTIME_PREFERENCES = Object.freeze({ nativeSearchEnhancementsEnabled: false, subagentRuntimeConfigEnabled: false,
+  memoryEnabled: false, askUserQuestionAutoResolutionEnabled: true, modelContextBudgetStrategy: 'preflight-v1' });
+
+// One process, session and turn for one company's QA pass. Never reuse this
+// object: completion is published only after its OS process has closed. The
+// ZCode app-server speaks bare JSON-RPC lines ({id,method,params}) over stdio;
+// record_review arrives through an inline MCP server whose loopback relay
+// calls back into this process, so every review is validated and checkpointed
+// by the backend before the tool call is acknowledged to the model.
 class AppServer {
-  constructor({ codex = 'codex', env = process.env, root = dataRoot(env), spawnFn = spawn, requestTimeoutMs = 30000, shutdownGraceMs = 2000 } = {}) {
-    Object.assign(this, { codex, env, root, spawnFn, requestTimeoutMs, shutdownGraceMs });
+  constructor({ launch, env = process.env, root = dataRoot(env), spawnFn = spawn, netModule = net, requestTimeoutMs = 30000, shutdownGraceMs = 2000 } = {}) {
+    if (!launch) throw new Error('AppServer requires a ZCode launch configuration');
+    Object.assign(this, { launch, env, root, spawnFn, netModule, requestTimeoutMs, shutdownGraceMs });
     this.pending = new Map(); this.sessions = new Set(); this.threads = new Map(); this.serial = 0;
   }
   async start() {
@@ -31,11 +41,12 @@ class AppServer {
     this.cwd = fs.mkdtempSync(path.join(dataSubdir('qa-servers', this.root), 'server-'));
     const tempDir = dataSubdir('tmp', this.root);
     let child;
-    try { child = this.spawnFn(this.codex, buildArgs(this.cwd), { cwd: this.cwd, shell: false, windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'], env: qaEnvironment({ ...this.env, TMP: tempDir, TEMP: tempDir, TMPDIR: tempDir }) }); }
+    try { child = this.spawnFn(this.launch.node, [this.launch.script, ...buildArgs()], { cwd: this.cwd, shell: false, windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'], env: qaEnvironment({ ...this.env, TMP: tempDir, TEMP: tempDir, TMPDIR: tempDir }, this.launch.personalProviderFile, this.launch.builtinProviderConfig) }); }
     catch (error) { fs.rmSync(this.cwd, { recursive: true, force: true }); this.starting = null; throw error; }
     this.child = child; const cwd = this.cwd;
     const reader = readline.createInterface({ input: child.stdout });
+    reader.on('error', () => {});
     reader.on('line', line => { try { this.receive(JSON.parse(line)); } catch (error) { this.failTransport(error); } });
     child.stderr.on('data', data => { for (const session of this.sessions) session.onLog?.(String(data)); });
     child.stdin.on('error', error => this.failTransport(error));
@@ -44,23 +55,51 @@ class AppServer {
       reader.close();
       for (const { reject, timer } of this.pending.values()) { clearTimeout(timer); reject(new Error('app-server connection closed')); }
       this.pending.clear();
+      this.stopRelay();
       this.child = null; this.starting = null; this.closed = true;
       try { fs.rmSync(cwd, { recursive: true, force: true, maxRetries: 3, retryDelay: 30 }); }
       catch (error) { for (const session of this.sessions) session.cleanupError = error; }
       for (const session of [...this.sessions]) this.finish(session, session.resultCode ?? 1, 'app-server-closed');
     });
     try {
-      // Publish ownership before initialization or any request that can run QA.
+      // Publish ownership before any request that can run QA.
       for (const session of this.sessions) session.onIdentity({ appServerPid: child.pid });
-      await this.request('initialize', { clientInfo: { name: 'reestr35_capture_qa', version: '3.3.0' }, capabilities: { experimentalApi: true } });
-      this.send({ method: 'initialized' });
-      const configuration = await this.request('config/read', { includeLayers: false });
-      if (!configuration.config || typeof configuration.config !== 'object') throw new Error('Cannot verify app-server configuration');
-      // An empty TOML table merges with user config; it does not disable its MCPs.
-      // Enumerate names through the protocol and explicitly disable every server.
-      this.disabledMcp = Object.fromEntries(Object.keys(configuration.config.mcp_servers || {}).map(name => [name, { enabled: false }]));
       return child;
     } catch (error) { if (this.child === child) this.failTransport(error); throw error; }
+  }
+  startRelay(session) {
+    const token = crypto.randomUUID();
+    this.relay = this.netModule.createServer();
+    this.relaySockets = new Set();
+    this.relay.on('error', () => {});
+    this.relay.on('connection', socket => {
+      this.relaySockets.add(socket);
+      socket.on('error', () => {});
+      socket.on('close', () => this.relaySockets.delete(socket));
+      const wire = readline.createInterface({ input: socket });
+      wire.on('error', () => {});
+      wire.on('line', line => {
+        let message; try { message = JSON.parse(line); } catch { return; }
+        if (message.token !== token) { socket.write(JSON.stringify({ id: message.id, error: 'bad relay token' }) + '\n'); return; }
+        if (message.kind !== 'record_review') { socket.write(JSON.stringify({ id: message.id, error: 'unknown relay kind' }) + '\n'); return; }
+        let answer;
+        try {
+          if (!session || session.exitCode !== null || session.ending || !session.turnId || this.threads.get(session.sessionId) !== session) throw new Error('Stale relay: unknown session or turn');
+          answer = session.onReview(message.arguments, { generation: session.generation, threadId: session.sessionId, turnId: session.turnId });
+        } catch (error) { answer = { error: error.message }; }
+        socket.write(JSON.stringify({ id: message.id, ...answer }) + '\n');
+      });
+    });
+    return new Promise((resolve, reject) => {
+      this.relay.once('error', reject);
+      this.relay.listen(0, '127.0.0.1', () => resolve({ port: this.relay.address().port, token }));
+    });
+  }
+  stopRelay() {
+    const relay = this.relay; this.relay = null;
+    for (const socket of this.relaySockets || []) try { socket.destroy(); } catch {}
+    this.relaySockets = new Set();
+    try { relay?.close(); } catch {}
   }
   send(value) {
     if (!this.child || this.child.exitCode !== null) throw new Error('app-server unavailable');
@@ -80,7 +119,7 @@ class AppServer {
   }
   failTransport(error) {
     this.closed = true;
-    for (const session of this.sessions) { session.failure = error; session.ending = true; session.resultCode = 1; }
+    for (const session of this.sessions) { session.failure = session.failure ?? error; session.ending = true; session.resultCode = 1; }
     // Ambiguous RPC outcome cannot release any slot before actual process close.
     if (this.child) { this.child.stdin.destroy(); this.child.kill('SIGKILL'); }
   }
@@ -91,29 +130,30 @@ class AppServer {
       message.error ? request.reject(new Error(message.error.message || JSON.stringify(message.error))) : request.resolve(message.result);
       return;
     }
-    const p = message.params || {}, session = this.threads.get(p.threadId);
-    if (message.method === 'item/tool/call' && Object.hasOwn(message, 'id')) {
-      let result;
-      try {
-        if (!session || session.exitCode !== null || session.ending || p.tool !== 'record_review' || p.namespace || p.turnId !== session.turnId) throw new Error('Unknown tool or stale thread/turn');
-        result = session.onReview(p.arguments, { generation: session.generation, threadId: p.threadId, turnId: p.turnId, callId: p.callId });
-        this.send({ id: message.id, result: { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify(result) }] } });
-      } catch (error) {
-        this.send({ id: message.id, result: { success: false, contentItems: [{ type: 'inputText', text: error.message }] } });
-      }
+    if (Object.hasOwn(message, 'id')) {
+      // Server-to-client request; the QA session is fully autonomous (yolo +
+      // tool allowlist), so anything interactive is refused deterministically.
+      if (message.method === 'session/requestRuntimePreferences') this.send({ id: message.id, result: RUNTIME_PREFERENCES });
+      else if (message.method === 'subagents/readRuntimeConfig') this.send({ id: message.id, result: { kind: 'built-in-fallback' } });
+      else if (message.method === 'interaction/requestPermission') this.send({ id: message.id, result: { decision: 'deny', reason: 'ARM QA runs autonomously' } });
+      else this.send({ id: message.id, error: { code: -32601, message: `Only record_review is supported: ${message.method}` } });
       return;
     }
-    if (Object.hasOwn(message, 'id')) {
-      this.send({ id: message.id, error: { code: -32601, message: 'Only record_review is supported' } }); return;
-    }
+    if (message.method !== 'session/event') return;
+    for (const event of message.params?.events || (message.params?.type ? [message.params] : [])) this.receiveEvent(event);
+  }
+  receiveEvent(event) {
+    if (!event.type) return;
+    const turnId = event.turnId || event.payload?.turnId;
+    const session = this.threads.get(event.sessionId || (event.payload && event.payload.sessionId));
+    if (event.type === 'tool.updated' && session?.onLog && event.toolName && event.kind) session.onLog(`${event.toolName} ${event.kind}\n`);
     if (!session) return;
-    if (message.method === 'turn/started') this.bindTurn(session, p.turn?.id);
-    if (message.method === 'turn/completed') {
-      if (p.turn?.id !== session.turnId) return;
-      if (session.ending) return;
-      session.ending = true; session.resultCode = p.turn.status === 'completed' ? 0 : 1;
-      void this.shutdown();
-    }
+    if (event.type === 'turn.started') { this.bindTurn(session, turnId); return; }
+    if (event.type !== 'turn.completed' && event.type !== 'turn.failed') return;
+    if (session.ending || (session.turnId && turnId && turnId !== session.turnId)) return;
+    if (event.type === 'turn.failed') { const message = event.payload?.error?.message || event.payload?.error?.underlyingErrorMessage; if (message) session.failure = new Error(message); }
+    session.ending = true; session.resultCode = event.type === 'turn.completed' ? 0 : 1;
+    void this.shutdown();
   }
   bindTurn(session, id) {
     if (typeof id !== 'string' || !id || (session.turnId && session.turnId !== id)) throw new Error('Unexpected turn identity');
@@ -130,7 +170,7 @@ class AppServer {
       session.cancelRequested = true; session.ending = true; session.resultCode = 1;
       if (session.exitCode !== null) return;
       // This process belongs only to this pass. Closing it also stops a hung
-      // initialization/turn without depending on an interrupt acknowledgement.
+      // session/turn without depending on a stop acknowledgement.
       await this.shutdown();
       await session.ready;
     };
@@ -138,16 +178,31 @@ class AppServer {
     session.ready = Promise.resolve().then(async () => {
       await this.start();
       if (session.exitCode !== null || session.ending) return;
-      const started = await this.request('thread/start', { model: 'gpt-5.6-sol', cwd, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: true,
-        baseInstructions: fs.readFileSync(path.join(APP_ROOT, 'src', 'qa-instructions.txt'), 'utf8'),
-        config: { 'project_doc_max_bytes': 0, 'skills.include_instructions': false, 'skills.bundled.enabled': false, 'web_search': 'disabled', 'mcp_servers': this.disabledMcp },
-        dynamicTools: [RECORD_REVIEW] });
-      session.threadId = started.thread.id; this.threads.set(session.threadId, session);
+      const relay = await this.startRelay(session);
+      const model = { providerId: this.launch.provider, modelId: this.launch.model, options: { reasoningLevel: this.launch.reasoning } };
+      const created = await this.request('session/create', {
+        workspace: { workspacePath: cwd, workspaceKey: cwd },
+        mode: 'yolo', persistence: 'deferred', titleGenerationEnabled: false, model,
+        mcpServers: [{ name: 'reestr35-qa', command: this.launch.node, args: [this.launch.bridge, String(relay.port), relay.token], env: [], isolation: 'session' }],
+        // MCP tools register under their qualified id; keep the bare name too
+        // so a CLI change in either direction cannot widen the tool surface.
+        toolAllowlist: ['mcp__reestr35-qa__record_review', 'record_review'],
+      });
+      session.sessionId = created?.session?.sessionId ?? created?.sessionId;
+      if (!session.sessionId) throw new Error('session/create returned no session id');
+      session.threadId = session.sessionId; this.threads.set(session.threadId, session);
       if (session.exitCode !== null || session.ending) return;
       onIdentity({ appServerPid: this.child.pid, threadId: session.threadId });
-      const turn = await this.request('turn/start', { threadId: session.threadId,
-        input: [{ type: 'text', text: prompt }, ...files.map(file => ({ type: 'localImage', path: path.join(cwd, file.name), detail: 'original' }))] });
-      if (session.exitCode === null && !session.ending) this.bindTurn(session, turn.turn.id);
+      await this.request('session/subscribe', { sessionId: session.sessionId, deliveryKind: 'desktop-continuous' });
+      if (session.exitCode !== null || session.ending) return;
+      const instructions = fs.readFileSync(path.join(APP_ROOT, 'src', 'qa-instructions.txt'), 'utf8').replace(/\r\n/g, '\n');
+      const turn = await this.request('session/send', { sessionId: session.sessionId, modelSelection: model,
+        content: `${instructions}\n\n${prompt}`,
+        attachments: files.map(file => ({ kind: 'image', filename: file.name, localPath: path.join(cwd, file.name), mimeType: 'image/png' })) });
+      if (!turn?.accepted) throw new Error(`session/send not accepted: ${JSON.stringify(turn).slice(0, 200)}`);
+      // A turn id normally arrives through the turn.started event before the
+      // first review; bind defensively from the accepted turn as well.
+      if (session.exitCode === null && !session.ending && typeof turn.turnId === 'string') this.bindTurn(session, turn.turnId);
     }).catch(error => {
       if (session.exitCode !== null) return;
       session.failure = error;
@@ -168,6 +223,7 @@ class AppServer {
     this.closed = true;
     for (const session of this.sessions) session.ending = true;
     if (!this.child) {
+      this.stopRelay();
       for (const session of [...this.sessions]) this.finish(session, 1, 'no-app-server');
       return;
     }
@@ -179,7 +235,7 @@ class AppServer {
       try {
         try { child.stdin.end(); } catch (error) { this.failTransport(error); }
         await closed;
-      } finally { clearTimeout(timer); }
+      } finally { clearTimeout(timer); this.stopRelay(); }
     })();
     return this.stopping;
   }

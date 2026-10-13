@@ -27,11 +27,19 @@
 
 .detail-heading { flex: 0 1 auto; min-width: 0; }
 .queue-status-control { display: inline-flex; align-items: center; }
+.queue-status-button { --tblr-btn-hover-bg: var(--tblr-bg-surface-secondary); --tblr-btn-hover-border-color: transparent; }
 .queue-status-button:disabled { opacity: 1; pointer-events: none; }
+.queue-status-pulse-icon { display: inline-grid; place-items: center; overflow: visible; }
+.queue-status-control:hover > .queue-status-button:disabled,
+.queue-status-control:focus-visible > .queue-status-button:disabled { background: var(--tblr-btn-hover-bg); border-color: var(--tblr-btn-hover-border-color); }
+.queue-status-control:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 1px; border-radius: var(--tblr-btn-border-radius); }
+.queue-status-button .status-dot-animated::before { animation-delay: 0s; }
 #results-header { display: block; border-bottom: 0; }
 .results-common { display: grid; grid-template-columns: minmax(0, 1fr) minmax(22rem, 26rem); align-items: center; gap: .5rem; min-width: 0; }
 .header-control-group { display: flex; align-items: center; gap: .5rem; min-width: 0; }
 .result-url { flex: 0 1 auto; min-width: 0; max-width: 24rem; height: auto; min-height: calc(1.5em + .875rem + 2px); justify-content: flex-start; overflow-wrap: anywhere; text-align: left; white-space: normal; }
+.company-id { flex: 0 0 auto; white-space: nowrap; }
+.company-id[aria-disabled="true"] { pointer-events: none; }
 .attempt-header { display: grid; grid-template-columns: minmax(0, 1fr); gap: .625rem; }
 .attempt-controls { flex: 0 0 auto; flex-wrap: nowrap !important; }
 .attempt-duration { flex-shrink: 0; }
@@ -135,15 +143,23 @@
 .modal-header .btn-close { flex-shrink: 0; margin-left: .25rem; }
 .thumbnail-status { position: absolute; top: .5rem; right: .5rem; z-index: 1; }
 .image-status { display: inline-flex; width: 1.5rem; height: 1.5rem; border-radius: 50%; align-items: center; justify-content: center; color: #fff; box-shadow: 0 0 0 2px #fff; }
-.image-status .icon { width: 1rem; height: 1rem; }
+.image-status .icon { width: 1.25rem; height: 1.25rem; stroke-width: 2.5; }
 .image-status:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 3px; }
-.connection-control { padding: .25rem; border: 0; color: inherit; background: transparent; border-radius: var(--tblr-border-radius); }
-.connection-control:not(:disabled) { cursor: pointer; }
-.connection-control:not(:disabled):hover { background: var(--tblr-bg-surface-secondary); }
+.connection-control { display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; padding: .25rem; border: 0; color: var(--tblr-secondary); background: transparent; border-radius: var(--tblr-border-radius); }
+.connection-control:not([aria-disabled="true"]) { cursor: pointer; }
+.connection-control:not([aria-disabled="true"]):hover { background: var(--tblr-bg-surface-secondary); }
 .connection-control:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 2px; }
-.connection-control:disabled { opacity: 1; }
+.connection-control[aria-disabled="true"] { cursor: default; }
+.connection-control[data-state="connected"] { color: var(--tblr-green); }
+.connection-control[data-state="unavailable"] { color: var(--tblr-red); }
+.connection-control[data-icon="spinner"] #connection-icon { animation: arm-connection-spin 1.2s linear infinite; transform-origin: center; }
+@keyframes arm-connection-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .connection-control[data-icon="spinner"] #connection-icon { animation: none; }
+}
 .navbar > .container-fluid { flex-wrap: wrap; gap: .5rem 1rem; }
 .navbar-brand { min-width: 0; white-space: normal; }
+.header-connections { display: flex; align-items: center; margin-left: auto; }
 
 .builder-section + .builder-section { margin-top: 1rem; padding-top: 1rem; border-top: var(--tblr-border-width) solid var(--tblr-border-color); }
 .builder-block { --builder-card-bg: var(--tblr-bg-surface); --builder-card-panel: var(--tblr-bg-surface-secondary); --builder-card-border: var(--tblr-border-color); --builder-card-muted: var(--tblr-secondary); display: grid; grid-template-columns: minmax(0, 1fr) auto; width: 100%; min-height: 4.75rem; padding: 0; overflow: visible; border: var(--tblr-border-width) solid var(--builder-card-border); border-radius: .65rem; color: inherit; background: var(--builder-card-bg); }
@@ -172,7 +188,8 @@
 .builder-block-open:focus-visible, .builder-card-tools .btn:focus-visible, .builder-tab:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 2px; }
 .builder-block.review-passed { border-inline-start: .3rem solid var(--tblr-green); }
 .builder-block.review-failed { border-inline-start: .3rem solid var(--tblr-yellow); }
-.builder-block.review-unreviewed { border-inline-start: .3rem solid var(--tblr-secondary); }
+.builder-block.review-unreviewed { border-inline-start: .3rem solid var(--tblr-blue); }
+.builder-block.review-pending { border-inline-start: .3rem solid var(--tblr-secondary); }
 .builder-block-body { display: grid; grid-template-columns: 2.75rem minmax(0, 1fr) auto; gap: .75rem; align-items: center; min-height: 100%; padding: .55rem .35rem .55rem .65rem; }
 .builder-type-icon { display: inline-grid; place-items: center; width: 2.75rem; height: 2.75rem; border-radius: .6rem; color: var(--builder-card-muted); background: var(--builder-card-panel); }
 .builder-type-icon svg { width: 1.25rem; height: 1.25rem; }
@@ -193,6 +210,7 @@
 #page-builder-modal .modal-footer { display: flex; flex-wrap: nowrap; gap: .5rem; align-items: flex-end; }
 #page-builder-modal .modal-footer > * { margin: 0; }
 #page-builder-form-error { overflow-wrap: anywhere; }
+#page-builder-sync-notice { overflow-wrap: anywhere; }
 .builder-review-footer { flex: 1 1 auto; min-width: 0; margin-right: auto !important; }
 .builder-review-footer > .mb-3 { margin: 0 !important; }
 .builder-review-footer .form-label { font-size: .75rem; margin-bottom: .25rem; }
@@ -259,6 +277,7 @@
 .builder-tab-handle:focus-visible, .builder-tab-menu-button:focus-visible, .builder-tab-add:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 2px; }
 .builder-status-dot { width: .65rem; height: .65rem; border-radius: 50%; background: var(--tblr-secondary); }
 .builder-status-dot.review-passed { background: var(--tblr-green); }
+.builder-status-dot.review-unreviewed { background: var(--tblr-blue); }
 .builder-status-dot.review-failed { background: var(--tblr-yellow); }
 .builder-status-dot.review-system-error { background: var(--tblr-red); }
 .builder-tab-panel { min-width: 0; }

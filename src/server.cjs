@@ -8,6 +8,7 @@ const { PageBuilderStore } = require('./stages/page-builder/store.cjs');
 const { MediaPicker } = require('./stages/page-builder/media-picker.cjs');
 const { FramePicker } = require('./stages/page-builder/frame-picker.cjs');
 const { DocumentPicker } = require('./stages/page-builder/document-picker.cjs');
+const { BegetSync } = require('./stages/beget/sync.cjs');
 
 // Public Queue API remains compatible while the page scheduler owns no stage implementation.
 class Queue extends PageQueue {
@@ -23,12 +24,15 @@ class Queue extends PageQueue {
     // Bind legacy pages before any subsequent retry can change the latest attempt.
     for (const job of this.jobs) { try { this.pageBuilder.migrateLegacy(job.id); } catch { /* surfaced by the page summary; retry also refuses incomplete migration */ } }
     this.stage.media?.deletion.recoverAll();
+    if (options.beget !== false) { this.beget = new BegetSync(this, options.beget || {}); this.pageBuilder.sync = this.beget; }
   }
   retry(id) { this.stage.media?.deletion.assertReady(); this.pageBuilder.migrateLegacy(id); return super.retry(id); }
   async shutdown() {
     const pickerStopped = this.mediaPicker.shutdown();
-    try { await super.shutdown(); } finally { await pickerStopped; }
+    const syncStopped = this.beget?.shutdown();
+    try { await super.shutdown(); } finally { await pickerStopped; await syncStopped; }
   }
+  snapshot(csrfToken) { const result = super.snapshot(csrfToken); if (this.beget) result.beget = this.beget.snapshot(); return result; }
   get reviewListeners() { return this.listenersFor('qa-review'); }
   set reviewListeners(listeners) { this.listeners.set('qa-review', listeners); }
   subscribeReviews(listener) { return this.subscribe('qa-review', listener); }
@@ -54,7 +58,15 @@ if (require.main === module) {
     unlock = acquireLock(root);
     const port = Number(process.env.ARM_PORT || 4318);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('ARM_PORT должен быть 1–65535');
-    const queue = new Queue({ root, concurrency: Number(process.env.ARM_CONCURRENCY || 2), codex: process.env.ARM_CODEX_EXE || 'codex', autoStart: false });
+    const { resolveRuntime } = require('./infrastructure/runtime.cjs');
+    const { resolveZcodeLaunch } = require('./stages/capture-qa/qa/config.cjs');
+    // QA transport is resolved best-effort: capture, page builder and sync keep
+    // working without ZCode credentials; QA attempts fail with this message.
+    let zcode = null, zcodeError = null;
+    try { zcode = resolveZcodeLaunch(process.env, { node: resolveRuntime().node, root }); }
+    catch (error) { zcodeError = error.message; console.error(`QA-агент ZCode недоступен: ${zcodeError}`); }
+    const queue = new Queue({ root, concurrency: Number(process.env.ARM_CONCURRENCY || 2), zcode, autoStart: false });
+    queue.zcodeError = zcodeError;
     let stop;
     const server = createServer(queue, { onShutdown: () => stop() });
     stop = createShutdownController({ queue, server, unlock });

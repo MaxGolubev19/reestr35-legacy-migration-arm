@@ -5,11 +5,12 @@ const { dataRoot, dataSubdir } = require('../src/data-dir.cjs');
 const { resolveRuntime } = require('../src/lib.cjs');
 
 const suites = {
-  full: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder', 'ui', 'capture', 'capture-resume', 'portability', 'cli-isolation'],
-  backend: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder'],
+  full: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder', 'beget-sync', 'beget-serialize', 'beget-ssh', 'ui', 'capture', 'capture-resume', 'portability', 'cli-isolation'],
+  backend: ['architecture', 'arm', 'duration', 'qa', 'app-server', 'html-media', 'page-builder', 'beget-sync', 'beget-serialize', 'beget-ssh'],
   'html-media': ['html-media'],
   ui: ['html-media', 'ui'], capture: ['capture', 'capture-resume'], portability: ['portability'], cli: ['cli-isolation'],
   'beget-contract': ['beget-contract.integration'],
+  'beget-object-protocol': ['beget-object-protocol.integration'],
 };
 function configuration(suite = 'full', environment = process.env) {
   if (!Object.hasOwn(suites, suite)) throw new Error(`Unknown test suite: ${suite}`);

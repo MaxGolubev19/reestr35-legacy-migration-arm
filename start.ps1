@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateRange(1, 65535)][int]$Port = 4318,
     [ValidateRange(1, 8)][int]$Concurrency = 2,
     [string]$DataDir = $env:ARM_DATA_DIR
@@ -11,6 +11,7 @@ $oldPort = $env:ARM_PORT
 $oldConcurrency = $env:ARM_CONCURRENCY
 $oldNodePath = $env:NODE_PATH
 $oldDataDir = $env:ARM_DATA_DIR
+$oldZcodeCjs = $env:ARM_ZCODE_CJS
 $oldConsoleEncoding = [Console]::OutputEncoding
 try {
     # Node writes UTF-8 even when Windows uses a legacy console code page.
@@ -38,7 +39,15 @@ try {
     }
     & $runtimeNode -e "require.resolve('playwright'); require.resolve('sharp');"
     if ($LASTEXITCODE -ne 0) { throw 'Нужен существующий Node с playwright и sharp. Укажите NODE_PATH; зависимости автоматически не устанавливаются.' }
-    if (-not $env:ARM_CODEX_EXE) { Get-Command codex -ErrorAction Stop | Out-Null }
+    if (-not $env:ARM_ZCODE_CJS) {
+        $zcodeCli = Join-Path $env:ProgramFiles 'ZCode\resources\glm\zcode.cjs'
+        if (-not (Test-Path -LiteralPath $zcodeCli) -and $env:ProgramFiles -and ${env:ProgramFiles(x86)}) {
+            $zcodeCli = Join-Path ${env:ProgramFiles(x86)} 'ZCode\resources\glm\zcode.cjs'
+        }
+        if (-not (Test-Path -LiteralPath $zcodeCli)) { throw 'ZCode CLI не найден. Установите ZCode Desktop или задайте ARM_ZCODE_CJS путём к zcode.cjs.' }
+        $env:ARM_ZCODE_CJS = $zcodeCli
+    }
+    if (-not $env:ARM_ZCODE_API_KEY) { Write-Warning 'ARM_ZCODE_API_KEY не задан: QA-стадия будет недоступна, пока не задан API-ключ Z.ai.' }
     $serverLog = Join-Path $logsDir ('server-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.log')
     & $runtimeNode (Join-Path $PSScriptRoot 'src\server.cjs') 2>&1 | Tee-Object -FilePath $serverLog
 } finally {
@@ -47,4 +56,5 @@ try {
     $env:ARM_CONCURRENCY = $oldConcurrency
     $env:NODE_PATH = $oldNodePath
     $env:ARM_DATA_DIR = $oldDataDir
+    $env:ARM_ZCODE_CJS = $oldZcodeCjs
 }

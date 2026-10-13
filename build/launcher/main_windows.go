@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -57,36 +56,30 @@ func executableFile(file string) bool {
 	info, err := os.Stat(file)
 	return err == nil && info.Mode().IsRegular() && strings.EqualFold(filepath.Ext(file), ".exe")
 }
-func discoverCodex() (string, error) {
-	if explicit := os.Getenv("ARM_CODEX_EXE"); explicit != "" {
-		resolved, err := exec.LookPath(explicit)
-		if err == nil && executableFile(resolved) {
-			return filepath.Abs(resolved)
+func regularFile(file string) bool {
+	info, err := os.Stat(file)
+	return err == nil && info.Mode().IsRegular()
+}
+// The backend runs the ZCode CLI bundle (zcode.cjs) with its own Node runtime;
+// only the script path has to be discovered here. The QA API key is resolved
+// lazily by the backend so non-QA workflows keep working without it.
+func discoverZcode() (string, error) {
+	if explicit := os.Getenv("ARM_ZCODE_CJS"); explicit != "" {
+		if regularFile(explicit) {
+			return filepath.Abs(explicit)
 		}
-		return "", fmt.Errorf("ARM_CODEX_EXE does not point to an existing codex.exe: %s", explicit)
+		return "", fmt.Errorf("ARM_ZCODE_CJS does not point to an existing zcode.cjs: %s", explicit)
 	}
-	if found, err := exec.LookPath("codex.exe"); err == nil && executableFile(found) {
-		return filepath.Abs(found)
-	}
-	files, _ := filepath.Glob(filepath.Join(os.Getenv("LOCALAPPDATA"), "OpenAI", "Codex", "bin", "*", "codex.exe"))
-	candidates := files[:0]
-	for _, file := range files {
-		if executableFile(file) {
-			candidates = append(candidates, file)
+	for _, base := range []string{os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)")} {
+		if base == "" {
+			continue
+		}
+		file := filepath.Join(base, "ZCode", "resources", "glm", "zcode.cjs")
+		if regularFile(file) {
+			return file, nil
 		}
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		a, _ := os.Stat(candidates[i])
-		b, _ := os.Stat(candidates[j])
-		if a.ModTime().Equal(b.ModTime()) {
-			return candidates[i] < candidates[j]
-		}
-		return a.ModTime().After(b.ModTime())
-	})
-	if len(candidates) > 0 {
-		return candidates[0], nil
-	}
-	return "", fmt.Errorf("Codex CLI was not found. Install Codex, sign in, or set ARM_CODEX_EXE to the full path of codex.exe")
+	return "", fmt.Errorf("ZCode CLI was not found. Install ZCode Desktop or set ARM_ZCODE_CJS to the full path of zcode.cjs")
 }
 func discoverChrome() (string, error) {
 	if explicit := os.Getenv("ARM_CHROME_EXE"); explicit != "" {
@@ -129,7 +122,7 @@ func run(root string, log *os.File) error {
 		}
 		return fmt.Errorf("ARM is already starting or stopping. See logs in %s", root)
 	}
-	codex, err := discoverCodex()
+	zcodeCli, err := discoverZcode()
 	if err != nil {
 		return err
 	}
@@ -137,7 +130,7 @@ func run(root string, log *os.File) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(log, "Codex CLI: %s\nChrome: %s\n", codex, chrome)
+	fmt.Fprintf(log, "ZCode CLI: %s\nChrome: %s\n", zcodeCli, chrome)
 	port := 4318
 	if value := os.Getenv("ARM_PORT"); value != "" {
 		port, err = strconv.Atoi(value)
@@ -162,13 +155,15 @@ func run(root string, log *os.File) error {
 	cmd.Stderr = log
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	// Remove inherited Node injection, and make package resolution explicit.
+	// ARM_ZCODE_API_KEY passes through untouched; ARM_ZCODE_CJS is re-pinned to
+	// the discovered CLI so a stale inherited value cannot win.
 	for _, item := range os.Environ() {
 		name := strings.ToUpper(strings.SplitN(item, "=", 2)[0])
-		if name != "NODE_PATH" && name != "NODE_OPTIONS" && name != "ARM_RUNTIME_DIR" && name != "ARM_DATA_DIR" && name != "ARM_INSTANCE_ID" && name != "ARM_CODEX_EXE" && name != "ARM_CHROME_EXE" {
+		if name != "NODE_PATH" && name != "NODE_OPTIONS" && name != "ARM_RUNTIME_DIR" && name != "ARM_DATA_DIR" && name != "ARM_INSTANCE_ID" && name != "ARM_ZCODE_CJS" && name != "ARM_CHROME_EXE" {
 			cmd.Env = append(cmd.Env, item)
 		}
 	}
-	cmd.Env = append(cmd.Env, "NODE_PATH="+filepath.Join(runtime, "node_modules"), "ARM_RUNTIME_DIR="+runtime, "ARM_DATA_DIR="+root, "ARM_INSTANCE_ID="+e.Instance, "ARM_CODEX_EXE="+codex, "ARM_CHROME_EXE="+chrome)
+	cmd.Env = append(cmd.Env, "NODE_PATH="+filepath.Join(runtime, "node_modules"), "ARM_RUNTIME_DIR="+runtime, "ARM_DATA_DIR="+root, "ARM_INSTANCE_ID="+e.Instance, "ARM_ZCODE_CJS="+zcodeCli, "ARM_CHROME_EXE="+chrome)
 	if err = cmd.Start(); err != nil {
 		return err
 	}
