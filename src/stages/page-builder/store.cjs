@@ -427,7 +427,8 @@ class PageBuilderStore {
   }
   validateStored(stored) {
     if (!Number.isSafeInteger(stored.revision) || stored.revision < 1) throw new Error('Некорректная revision шага 3');
-    return { revision: stored.revision, updatedAt: limited(stored.updatedAt, 'updatedAt', 64, { required: true }), document: validateDocument(stored.document), blockTypes: BLOCK_TYPES };
+    return { revision: stored.revision, updatedAt: limited(stored.updatedAt, 'updatedAt', 64, { required: true }), document: validateDocument(stored.document), blockTypes: BLOCK_TYPES,
+      ...(stored.syncRequested === true ? { syncRequested: true } : {}) };
   }
   read(jobId, { create = true, attempt } = {}) {
     attempt = this.attempt(jobId, attempt); this.migrateLegacy(jobId);
@@ -435,13 +436,20 @@ class PageBuilderStore {
     if (create) fs.mkdirSync(path.dirname(file), { recursive: true });
     if (!fs.existsSync(file)) { if (!create) return null; if (!this.resolveJob) throw new Error('Для новой страницы требуется задание'); atomicJson(file, { revision: 1, updatedAt: new Date().toISOString(), document: emptyDocument(this.resolveJob(jobId)) }); }
     const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return { ...this.validateStored(stored), attempt };
+    const result = { ...this.validateStored(stored), attempt };
+    if (this.sync) result.sync = this.sync.projection(jobId, attempt, result.document);
+    return result;
   }
   write(jobId, expectedRevision, document, attempt) {
     this.assertWritable?.(jobId);
     const prepared = this.prepareWrite(jobId, expectedRevision, document, attempt);
-    atomicJson(this.file(jobId, prepared.attempt), { revision: prepared.revision, updatedAt: prepared.updatedAt, document: prepared.document });
-    return prepared;
+    atomicJson(this.file(jobId, prepared.attempt), { revision: prepared.revision, updatedAt: prepared.updatedAt, document: prepared.document,
+      ...(prepared.syncRequested ? { syncRequested: true } : {}) });
+    // The document is the recovery source if a process dies between these two
+    // atomic writes. Every normal save also durably coalesces the object outbox.
+    if (prepared.syncRequested) this.sync?.enqueue(jobId, prepared.attempt, prepared.document, prepared.revision);
+    this.sync?.wake();
+    return this.read(jobId, { attempt: prepared.attempt });
   }
   prepareWrite(jobId, expectedRevision, document, attempt) {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw Object.assign(new Error('Требуется revision'), { statusCode: 409 });
@@ -470,12 +478,24 @@ class PageBuilderStore {
       }
       section.review = derivedReview(section.blocks);
     }
-    const next = { revision: current.revision + 1, updatedAt: new Date().toISOString(), document: validated };
+    this.sync?.enforceReview(jobId, attempt, current.document, validated);
+    for (const section of [validated.common, ...validated.tabs]) section.review = derivedReview(section.blocks);
+    const job = this.resolveJob?.(jobId), eligible = this.sync && job?.attempts.at(-1)?.number === attempt
+      && ['complete', 'ready_with_issues'].includes(job.attempts.at(-1).htmlMedia?.status);
+    const next = { revision: current.revision + 1, updatedAt: new Date().toISOString(), document: validated,
+      ...(current.syncRequested || eligible ? { syncRequested: true } : {}) };
     return { ...next, attempt, blockTypes: BLOCK_TYPES };
   }
   summary(jobId, attempt) {
-    try { const stored = this.read(jobId, { create: false, attempt }); return stored ? { ...statusSummary(stored.document), revision: stored.revision } : { status: 'unreviewed', total: 0, passed: 0, failed: 0, unreviewed: 0, revision: 0 }; }
-    catch (error) { return { status: 'system_error', error: error.message, total: 0, passed: 0, failed: 0, unreviewed: 0, revision: 0 }; }
+    let company = {};
+    try {
+      if (this.sync) company = { companyId: this.sync.companyId(jobId, attempt) };
+      const stored = this.read(jobId, { create: false, attempt });
+      return stored ? { ...statusSummary(stored.document), revision: stored.revision, ...company,
+        ...(stored.sync ? { syncVersion: stored.sync.version, pending: stored.sync.pendingCount } : {}) }
+        : { status: 'unreviewed', total: 0, passed: 0, failed: 0, unreviewed: 0, revision: 0, ...company };
+    }
+    catch (error) { return { status: 'system_error', error: error.message, total: 0, passed: 0, failed: 0, unreviewed: 0, revision: 0, ...company }; }
   }
   media(jobId, mediaId, attempt) {
     const stored = this.read(jobId, { attempt }), assets = [];

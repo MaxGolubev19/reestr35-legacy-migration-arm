@@ -10,7 +10,9 @@
 <div class="page">
   <header class="navbar d-print-none"><div class="container-fluid">
     <h1 class="navbar-brand">АРМ миграции страниц · Реестр 35</h1>
-    <button id="connection-control" type="button" class="connection-control d-flex align-items-center gap-2" title="Отключить" disabled><span id="connection-dot" class="status-dot bg-secondary" aria-hidden="true"></span><span id="connection-label" aria-live="polite">Подключение…</span></button>
+    <div class="header-connections">
+      <button id="connection-control" type="button" class="connection-control" data-state="reconnecting" data-icon="spinner" aria-disabled="true" aria-busy="true" aria-label="Подключение…" title="Подключение…"><svg id="connection-icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 3a9 9 0 1 1 -9 9"/></svg><span id="connection-message" class="visually-hidden" aria-live="polite">Подключение…</span></button>
+    </div>
   </div></header>
   <div class="page-wrapper">
     <div class="page-body"><div class="container-fluid">
@@ -43,6 +45,7 @@
               <div id="results-common" class="results-common w-100">
                 <div id="header-control-group" class="header-control-group">
                   <a id="detail-url" class="btn btn-outline-primary result-url"></a>
+                  <a id="company-id" class="btn btn-outline-primary company-id disabled" aria-disabled="true" tabindex="-1">ID: —</a>
                   <div id="attempt-controls" class="attempt-controls d-flex flex-wrap align-items-center gap-2">
                     <output id="attempt-duration" class="form-control w-auto attempt-duration" aria-label="Активное время попытки">00:00:00</output>
                     <button id="recapture-button" type="button" class="btn btn-outline-primary btn-icon flex-shrink-0" aria-label="Перезапустить" title="Перезапустить"><svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg></button>

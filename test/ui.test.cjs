@@ -14,6 +14,149 @@ const { layout, normalizeUrl } = require('../src/lib.cjs');
 const { publishLease } = require('../src/launcher.cjs');
 const { filename } = require('../src/infrastructure/media.cjs');
 
+// Explicit server acknowledgements keep review tests independent of real Beget.
+function confirmBuilderFixture(queue, job) {
+  const { desired, destinationIdentity } = require('../src/stages/beget/sync.cjs');
+  const attempt = job.attempts.at(-1).number, stored = queue.pageBuilder.read(job.id);
+  const target = desired(stored.document), record = queue.beget.record(job.id, attempt);
+  queue.beget.destination = destinationIdentity({ host: 'ui-fixture.test', user: 'fixture', remoteScript: '/fixture/rest/arm_sync.php' });
+  record.destination = queue.beget.destination;
+  record.acknowledged = { ...target, attempt, bindings: { tabs: {}, blocks: {} } };
+  queue.beget.connection = 'online'; queue.beget.lastError = ''; record.lastError = ''; queue.beget.persist(record); queue.save();
+}
+
+test('result header keeps a disabled company ID placeholder until Beget resolves the new page', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'company-id-header-ui-'));
+  const queue = new Queue({ root, autoStart: false, beget: { autoStart: false } });
+  queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click();
+  const control = page.locator('#company-id');
+  assert.deepEqual(await control.evaluate(node => ({ text: node.textContent, href: node.getAttribute('href'), disabled: node.getAttribute('aria-disabled'), tabIndex: node.tabIndex })),
+    { text: 'ID: —', href: null, disabled: 'true', tabIndex: -1 });
+  assert.deepEqual(await page.locator('#header-control-group > *').evaluateAll(nodes => nodes.map(node => node.id)), ['detail-url', 'company-id', 'attempt-controls']);
+  const { destinationIdentity } = require('../src/stages/beget/sync.cjs'), record = queue.beget.record(job.id, 1);
+  queue.beget.destination = destinationIdentity({ host: 'ui-fixture.test', user: 'fixture', remoteScript: '/fixture/rest/arm_sync.php' });
+  Object.assign(record, { destination: queue.beget.destination, company: { id: 203370 } }); queue.beget.persist(record); queue.save();
+  await page.waitForFunction(() => document.querySelector('#company-id')?.getAttribute('href')?.endsWith('company=203370'));
+  assert.deepEqual(await control.evaluate(node => ({ text: node.textContent, href: node.getAttribute('href'), target: node.target, rel: node.rel, disabled: node.getAttribute('aria-disabled'), tabIndex: node.tabIndex })),
+    { text: 'ID: 203370', href: 'http://reestr35.seperb3i.beget.tech/company/?company=203370', target: '_blank', rel: 'noopener noreferrer', disabled: 'false', tabIndex: 0 });
+});
+
+test('step 3 autosave serializes CAS writes and flushes the newest edit before close', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-autosave-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.beget.connection = 'offline'; queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage(), posts = [], errors = []; page.on('pageerror', error => errors.push(error.message));
+  let releaseFirst, announceFirst; const firstStarted = new Promise(resolve => { announceFirst = resolve; }), firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  await page.route(`**/api/page-builder/${job.id}?attempt=*`, async route => {
+    if (route.request().method() !== 'POST') return route.continue();
+    posts.push(route.request().postDataJSON());
+    if (posts.length === 1) { announceFirst(); await firstGate; }
+    await route.continue();
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  await page.locator('[data-builder-id="common-actions"]').click(); await page.waitForSelector('#page-builder-modal.show');
+  const title = page.locator('#builder-title'); await title.fill('Первая версия'); await firstStarted;
+  await title.fill('Последняя версия'); await page.getByRole('button', { name: 'Отмена', exact: true }).click();
+  assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'close waits for every queued local write');
+  releaseFirst(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
+  assert.deepEqual(posts.map(item => item.revision), [1, 2], 'writes use the acknowledged revision in order');
+  assert.deepEqual(posts.map(item => item.document.common.blocks[1].title), ['Первая версия', 'Последняя версия']);
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].title, 'Последняя версия');
+  assert.deepEqual(errors, []);
+});
+
+test('step 3 same-object CAS conflict fences later saves, close and navigation until reload', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-conflict-fence-ui-'));
+  const queue = new Queue({ root, autoStart: false });
+  queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  queue.add('https://example.reestr35.ru/'); const otherJob = queue.jobs[1]; seedMoriPage(queue, otherJob);
+  for (const item of [job, otherJob]) Object.assign(item.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } });
+  queue.beget.connection = 'offline'; queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage(), posts = [], errors = []; page.on('pageerror', error => errors.push(error.message));
+  await page.route(`**/api/page-builder/${job.id}?attempt=*`, route => {
+    if (route.request().method() === 'POST') posts.push(route.request().postDataJSON());
+    return route.continue();
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator(`[data-job-id="${job.id}"]`).click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  await page.locator('[data-builder-id="common-actions"]').click(); await page.waitForSelector('#page-builder-modal.show');
+  await page.locator('#builder-title').fill('LOCAL TITLE FIRST');
+  const externalStored = queue.pageBuilder.read(job.id), externalDocument = structuredClone(externalStored.document);
+  externalDocument.common.blocks[1].text = 'EXTERNAL TEXT MUST SURVIVE'; queue.pageBuilder.write(job.id, externalStored.revision, externalDocument);
+  await page.waitForFunction(() => document.querySelector('#page-builder-form-error')?.textContent.includes('перезагрузите страницу'));
+  assert.equal(posts.length, 1); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].text, 'EXTERNAL TEXT MUST SURVIVE');
+  await page.locator('#builder-title').fill('LOCAL TITLE SECOND'); await page.waitForTimeout(700);
+  assert.equal(posts.length, 1, 'a later keystroke cannot clear the same-object conflict fence');
+  await page.locator('#page-builder-save').click();
+  assert.equal(await page.locator('#page-builder-modal').isVisible(), true); assert.equal(await page.locator('#builder-title').inputValue(), 'LOCAL TITLE SECOND'); assert.equal(posts.length, 1, 'explicit Save cannot overwrite the external object');
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click();
+  assert.equal(await page.locator('#page-builder-modal').isVisible(), true); assert.equal(await page.locator('#builder-title').inputValue(), 'LOCAL TITLE SECOND', 'close keeps the unresolved local draft visible');
+  await page.locator(`[data-job-id="${otherJob.id}"]`).click({ force: true }); await page.waitForTimeout(300);
+  assert.equal(await page.locator('#page-builder-modal').isVisible(), true); assert.equal(await page.locator('#builder-title').inputValue(), 'LOCAL TITLE SECOND', 'navigation cannot silently replace the conflicted draft');
+  const finalStored = queue.pageBuilder.read(job.id); assert.equal(finalStored.document.common.blocks[1].text, 'EXTERNAL TEXT MUST SURVIVE'); assert.notEqual(finalStored.document.common.blocks[1].title, 'LOCAL TITLE SECOND'); assert.equal(posts.length, 1);
+  assert.deepEqual(errors, []);
+});
+
+test('Beget pending blocks stay editable offline and unlock review only after the current version is confirmed', { timeout: 60000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-beget-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.beget.connection = 'offline'; queue.beget.lastError = 'Сеть недоступна'; queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const opener = page.locator('[data-builder-id="common-actions"]'), card = page.locator('[data-block-id="common-actions"] .builder-block'), review = page.locator('#builder-review-status');
+  const close = async () => { await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); };
+  assert.equal(await page.locator('#connection-control').getAttribute('data-state'), 'beget-unavailable'); assert.equal(await page.locator('#connection-control').getAttribute('data-icon'), 'plug-connected-x');
+  assert.match(await page.locator('#connection-control').getAttribute('title'), /Beget недоступен/); assert.equal(await page.locator('#page-builder-sync-notice').innerText(), 'Синхронизация с Beget: Сеть недоступна');
+  assert.match(await opener.getAttribute('aria-label'), /Ожидает отправки/); assert.match(await card.getAttribute('class'), /review-pending/);
+  const pendingColor = await card.evaluate(node => getComputedStyle(node).borderLeftColor);
+  await opener.click(); await page.waitForSelector('#page-builder-modal.show'); assert.equal(await review.isDisabled(), true); assert.equal(await review.locator('option:checked').innerText(), 'Ожидает отправки');
+  await page.locator('#builder-title').fill('Сохранено без интернета'); await page.locator('#page-builder-save').click(); await close();
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].title, 'Сохранено без интернета');
+  const localRevision = queue.pageBuilder.read(job.id).revision;
+  await page.locator('[data-builder-id="common-hero"]').click(); await page.locator('#page-builder-save').click(); await close();
+  assert.equal(queue.pageBuilder.read(job.id).revision, localRevision, 'an untouched retained block uses its current persisted review');
+  await opener.click(); await page.waitForSelector('#page-builder-modal.show');
+  await page.waitForFunction(() => document.activeElement?.closest('#page-builder-modal'));
+  const retainedInput = await page.locator('#builder-title').elementHandle(); await page.locator('#builder-title').focus();
+  let failedSyncRead = false;
+  const syncPattern = `**/api/page-builder/${job.id}?attempt=*`;
+  await page.route(syncPattern, route => { if (route.request().method() === 'GET' && !failedSyncRead) { failedSyncRead = true; return route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Временная ошибка чтения"}' }); } return route.continue(); });
+  confirmBuilderFixture(queue, job);
+  await page.waitForFunction(() => document.querySelector('#builder-review-status')?.disabled === false);
+  assert.equal(failedSyncRead, true, 'a failed sync read is retried even when the state snapshot has not changed'); await page.unroute(syncPattern);
+  assert.equal(await retainedInput.evaluate(node => node.isConnected && document.activeElement === node), true, 'ack does not replace the open editor or steal focus');
+  assert.equal(await review.locator('option:checked').innerText(), 'Не проверено'); assert.equal(await page.locator('#connection-control').getAttribute('data-state'), 'connected'); assert.equal(await page.locator('#page-builder-sync-notice').isHidden(), true);
+  assert.notEqual(await card.evaluate(node => getComputedStyle(node).borderLeftColor), pendingColor, 'confirmed unreviewed block becomes blue');
+  await review.selectOption('passed'); await page.locator('#page-builder-save').click(); await close();
+  await page.waitForSelector('[data-block-id="common-actions"] .review-passed');
+  await opener.click(); await review.selectOption('failed'); await page.locator('#builder-review-reason').fill('Сверить отступы'); await page.locator('#page-builder-save').click(); await close();
+  await page.waitForSelector('[data-block-id="common-actions"] .review-failed');
+  await opener.click(); await page.locator('#builder-title').fill('Следующая версия'); assert.equal(await review.isDisabled(), true);
+  confirmBuilderFixture(queue, job); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state');
+  assert.equal(await review.isDisabled(), true, 'confirmation of saved content never unlocks a modified draft');
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${width}: header fits`);
+    assert.equal(await page.locator('#page-builder-modal .modal-footer').evaluate(node => { const select = node.querySelector('select').getBoundingClientRect(), cancel = node.querySelector('[data-bs-dismiss]').getBoundingClientRect(), save = node.querySelector('[type="submit"]').getBoundingClientRect(); return select.right <= cancel.left && save.right <= innerWidth; }), true, `${width}: pending review and save fit`);
+  }
+  await page.locator('#page-builder-save').click(); await close(); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].review.status, 'unreviewed'); assert.match(await card.getAttribute('class'), /review-pending/);
+  assert.deepEqual(errors, []);
+});
+
 function installLocalPreview(queue, job, asset) {
   const attempt = job.attempts.at(-1), manifest = queue.stage.media.create(job, attempt, Buffer.from(`<img src="${asset.originalUrl}">`), 'test');
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+R5sGAAAAAElFTkSuQmCC', 'base64'), sha256 = crypto.createHash('sha256').update(png).digest('hex');
@@ -127,7 +270,8 @@ test('data-table editor edits, reorders and validates nested data without media 
   const saved = queue.pageBuilder.read(job.id), block = saved.document.common.blocks[0]; assert.equal(block.type, 'data-table'); assert.equal(block.view, 'compact'); assert.equal(block.caption, 'Подпись'); assert.deepEqual(block.media, []); assert.deepEqual(block.meta, { striped: false, bordered: false, sticky_header: true, min_width: 640 });
   assert.deepEqual(block.columns, [{ id: columnB, key: 'price', title: 'Цена' }, { id: columnA, key: 'name', title: '<b>Название</b>', align: 'center', width: 40, nowrap: true }]);
   assert.deepEqual(block.rows, [{ id: groupId, group: 'Раздел' }, { id: rowId, cells: [{ id: cellB, value: '' }, { id: cellA, value: literal, key: 'unrelated-key', align: 'right', colspan: 2, rowspan: 3, is_header: true, nowrap: true }] }]);
-  await open(); assert.equal(await page.locator('.builder-data-table-editor details[open],.builder-data-advanced[open]').count(), 0); assert.equal(await control(cellA, 'value').inputValue(), literal); await page.locator('#builder-caption').fill('Отмена'); await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); assert.deepEqual(queue.pageBuilder.read(job.id), saved);
+  await open(); assert.equal(await page.locator('.builder-data-table-editor details[open],.builder-data-advanced[open]').count(), 0); assert.equal(await control(cellA, 'value').inputValue(), literal); await page.locator('#builder-caption').fill('Отмена'); await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close();
+  const closed = queue.pageBuilder.read(job.id), closedBlock = closed.document.common.blocks[0]; assert.equal(closed.revision, saved.revision + 1); assert.equal(closedBlock.caption, 'Отмена'); assert.deepEqual(closedBlock.columns, block.columns); assert.deepEqual(closedBlock.rows, block.rows); assert.deepEqual(closedBlock.meta, block.meta);
   await open(); await page.locator('#builder-type').selectOption('content'); await page.locator('#page-builder-save').click(); await close(); const other = queue.pageBuilder.read(job.id).document.common.blocks[0]; assert.equal(other.type, 'content'); for (const key of ['columns', 'rows', 'caption']) assert.equal(Object.hasOwn(other, key), false); assert.equal(other.meta?.striped, undefined); assert.ok(other.media.every(asset => !asset.originalUrl && !asset.bigUrl));
   assert.deepEqual(errors, []); assert.deepEqual(external, []);
 });
@@ -379,6 +523,72 @@ test('catalog plus buttons add image, document and iframe to step 2 with browser
   await page.locator('#media-modal .btn-close').click();
 });
 
+test('one header icon shows both connections and retries a lost ARM connection on click', { timeout: 30000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-connection-ui-'));
+  const queue = new Queue({ root, autoStart: false });
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage();
+  let begetStatus = 'online', failState = false, shutdownPosts = 0, stateRequests = 0;
+  await page.addInitScript(() => Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => window.__armNetworkOnline !== false }));
+  await page.route('**/api/state', async route => {
+    stateRequests++;
+    if (failState) return route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"temporarily unavailable"}' });
+    const response = await route.fetch(), data = await response.json();
+    return route.fulfill({ response, json: { ...data, beget: { connection: begetStatus } } });
+  });
+  page.on('request', request => { if (new URL(request.url()).pathname === '/api/shutdown') shutdownPosts++; });
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+  const icon = page.locator('#connection-control');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'connected');
+  assert.equal(await icon.getAttribute('data-icon'), 'plug-connected');
+  assert.equal(await icon.getAttribute('title'), 'Отключить АРМ');
+  assert.equal(await page.locator('.header-connections button').count(), 1);
+  const green = await icon.evaluate(node => getComputedStyle(node).color);
+  await page.evaluate(() => { window.__armNetworkOnline = false; window.dispatchEvent(new Event('offline')); });
+  assert.equal(await icon.getAttribute('data-state'), 'offline'); assert.equal(await icon.getAttribute('data-icon'), 'wifi-off');
+  assert.equal(await icon.getAttribute('title'), 'Нет интернета · Отключить АРМ');
+  const gray = await icon.evaluate(node => getComputedStyle(node).color);
+  assert.notEqual(gray, green);
+  await page.evaluate(() => { window.__armNetworkOnline = true; window.dispatchEvent(new Event('online')); });
+  assert.equal(await icon.getAttribute('data-state'), 'connected');
+  begetStatus = 'unconfigured';
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'beget-unavailable');
+  assert.equal(await icon.getAttribute('data-icon'), 'plug-connected-x'); assert.equal(await icon.isEnabled(), true);
+  assert.equal(await icon.getAttribute('title'), 'Beget недоступен · Отключить АРМ');
+  assert.equal(await icon.evaluate(node => getComputedStyle(node).color), gray);
+  failState = true;
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'reconnecting');
+  assert.equal(await icon.getAttribute('title'), 'Подключение…');
+  assert.equal(await icon.getAttribute('data-icon'), 'spinner');
+  assert.equal(await icon.evaluate(node => getComputedStyle(node).color), gray);
+  assert.equal(await icon.isDisabled(), true);
+  assert.equal(await icon.getAttribute('aria-busy'), 'true');
+  const graphic = page.locator('#connection-icon');
+  assert.equal(await graphic.evaluate(node => getComputedStyle(node).animationName), 'arm-connection-spin');
+  const before = await graphic.evaluate(node => getComputedStyle(node).transform);
+  await page.waitForTimeout(100);
+  assert.notEqual(await graphic.evaluate(node => getComputedStyle(node).transform), before, 'reconnection spinner visibly rotates');
+  const requestsBeforeClick = stateRequests;
+  await icon.dispatchEvent('click'); await page.waitForTimeout(100);
+  assert.equal(stateRequests, requestsBeforeClick, 'reconnecting click does not queue another check');
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  assert.equal(await graphic.evaluate(node => getComputedStyle(node).animationName), 'none');
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'unavailable');
+  assert.equal(await icon.getAttribute('data-icon'), 'server-off');
+  assert.equal(await icon.getAttribute('title'), 'Повторить подключение');
+  const red = await icon.evaluate(node => getComputedStyle(node).color);
+  assert.notEqual(red, gray); assert.notEqual(red, green);
+  assert.equal(await graphic.evaluate(node => getComputedStyle(node).animationName), 'none');
+  failState = false;
+  const nextRequest = page.waitForRequest(request => new URL(request.url()).pathname === '/api/state', { timeout: 1200 });
+  await icon.click(); await nextRequest;
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'beget-unavailable');
+  assert.equal(shutdownPosts, 0, 'retry never sends a shutdown request');
+});
+
 test('connected indicator sends one protected shutdown POST and reaches disconnected only after server loss', { timeout: 30000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-arm-shutdown-ui-'));
   let spawns = 0, shutdownCalls = 0, server;
@@ -405,21 +615,30 @@ test('connected indicator sends one protected shutdown POST and reaches disconne
   const origin = `http://127.0.0.1:${server.address().port}`;
   await page.goto(origin);
   const indicator = page.locator('#connection-control');
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'beget-unavailable');
   assert.equal(await indicator.evaluate(node => node.tagName), 'BUTTON');
   assert.equal(await indicator.getAttribute('type'), 'button');
-  assert.equal(await indicator.getAttribute('title'), 'Отключить');
+  assert.equal(await indicator.getAttribute('title'), 'Beget недоступен · Отключить АРМ');
   assert.equal(await indicator.isEnabled(), true);
+  const gray = await indicator.evaluate(node => getComputedStyle(node).color);
   await indicator.click();
-  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…', 'the click changes state synchronously');
+  assert.equal(await indicator.getAttribute('data-state'), 'stopping', 'the click changes state synchronously');
+  assert.equal(await indicator.getAttribute('title'), 'Отключение…');
+  assert.equal(await indicator.getAttribute('data-icon'), 'spinner');
+  assert.equal(await indicator.getAttribute('aria-busy'), 'true');
+  assert.equal(await indicator.evaluate(node => getComputedStyle(node).color), gray);
+  assert.equal(await page.locator('#connection-icon').evaluate(node => getComputedStyle(node).animationName), 'arm-connection-spin');
   assert.equal(server.listening, true, 'the UI does not claim disconnection while the server is still reachable');
   assert.equal(await indicator.isDisabled(), true, 'shutdown immediately fences repeated clicks');
   await indicator.evaluate(node => { node.click(); node.click(); });
   assert.equal(await page.locator('[role="menu"]').count(), 0);
   assert.deepEqual(dialogs, [], 'shutdown has no confirmation dialog');
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Отключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'stopped');
   assert.equal(server.listening, false, 'disconnected is shown only after the HTTP server has closed');
-  assert.equal(await page.locator('#connection-dot').evaluate(node => node.classList.contains('bg-red') && !node.classList.contains('status-dot-animated')), true);
+  assert.equal(await indicator.getAttribute('data-icon'), 'server-off');
+  assert.equal(await indicator.getAttribute('title'), 'Запустите АРМ через лаунчер');
+  assert.equal(await indicator.evaluate(node => getComputedStyle(node).color), gray);
+  assert.equal(await page.locator('#connection-icon').evaluate(node => getComputedStyle(node).animationName), 'none');
   assert.equal(posts.length, 1); assert.equal(posts[0].path, '/api/shutdown'); assert.equal(posts[0].body, '{}');
   const requestHeaders = await posts[0].headers;
   assert.match(requestHeaders['x-csrf-token'], /^[a-f0-9]{64}$/);
@@ -446,12 +665,12 @@ test('shutdown probe timeout keeps the live server in shutting-down state', { ti
     try { await route.continue(); } catch {}
   });
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'beget-unavailable');
   slowState = true;
   await page.locator('#connection-control').click();
   await page.waitForTimeout(1400);
   assert.equal(server.listening, true); assert.equal(shutdownCalls, 1);
-  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…');
+  assert.equal(await page.locator('#connection-control').getAttribute('data-state'), 'stopping');
   assert.equal(await page.locator('#connection-control').isDisabled(), true);
 });
 
@@ -478,7 +697,7 @@ test('an in-flight polling failure cannot claim disconnect while shutdown probes
   await page.route('**/api/shutdown', route => route.abort('connectionrefused'));
   const origin = `http://127.0.0.1:${server.address().port}`;
   await page.goto(origin);
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'beget-unavailable');
   await held;
   await page.locator('#connection-control').click();
   while (stateRequests < 3) await page.waitForTimeout(25);
@@ -487,10 +706,10 @@ test('an in-flight polling failure cannot claim disconnect while shutdown probes
   await page.waitForTimeout(250);
   assert.equal(server.listening, true);
   assert.equal(shutdownCalls, 0, 'the simulated network failure never reaches the shutdown endpoint');
-  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…');
+  assert.equal(await page.locator('#connection-control').getAttribute('data-state'), 'stopping');
   assert.equal(await page.locator('#connection-control').isDisabled(), true);
   await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Отключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'stopped');
   assert.equal(server.listening, false);
 });
 
@@ -513,12 +732,12 @@ test('shutdown HTTP refusal restores SSE and polling while preserving the error'
   });
   await page.route('**/api/shutdown', route => route.fulfill({ status: 403, contentType: 'application/json', body: '{"error":"fixture denied"}' }));
   await page.goto(`http://127.0.0.1:${server.address().port}`);
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'beget-unavailable');
   const beforeStates = stateRequests;
   await page.locator('#connection-control').click();
   await page.waitForFunction(() => document.querySelector('#global-alert').textContent.includes('fixture denied'));
   await page.waitForTimeout(250);
-  assert.equal(await page.locator('#connection-label').innerText(), 'Подключено');
+  assert.equal(await page.locator('#connection-control').getAttribute('data-state'), 'beget-unavailable');
   assert.equal(await page.locator('#connection-control').isEnabled(), true);
   assert.match(await page.locator('#global-alert').innerText(), /Не удалось выключить backend: fixture denied/);
   assert.ok(eventRequests >= 2, 'EventSource reconnects after the rejected POST');
@@ -542,16 +761,16 @@ test('shutdown 409 keeps the click fenced and waits for the in-progress server s
   });
   const page = await browser.newPage(), origin = `http://127.0.0.1:${server.address().port}`;
   await page.goto(origin);
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Подключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'beget-unavailable');
   const snapshot = await (await fetch(origin + '/api/state')).json();
   const primed = await fetch(origin + '/api/shutdown', { method: 'POST', headers: {
     'Content-Type': 'application/json', 'x-csrf-token': snapshot.csrfToken, Origin: origin, 'sec-fetch-site': 'same-origin'
   }, body: '{}' });
   assert.equal(primed.status, 200);
   await page.locator('#connection-control').click();
-  assert.equal(await page.locator('#connection-label').innerText(), 'Отключение…');
+  assert.equal(await page.locator('#connection-control').getAttribute('data-state'), 'stopping');
   assert.equal(await page.locator('#connection-control').isDisabled(), true);
-  await page.waitForFunction(() => document.querySelector('#connection-label').textContent === 'Отключено');
+  await page.waitForFunction(() => document.querySelector('#connection-control').dataset.state === 'stopped');
   assert.equal(shutdownCalls, 1); assert.equal(server.listening, false);
   assert.equal(await page.locator('#global-alert').isVisible(), false);
 });
@@ -766,7 +985,7 @@ test('queue icons expose every action, preserve selection, handle races and show
     child.finish = () => { child.exitCode = 1; child.emit('close', 1, null); };
     children.push(child); return child;
   } });
-  const statuses = ['paused', 'queued', 'running', 'pausing', 'complete', 'needs_review', 'incomplete', 'failed', 'interrupted', 'cancelled', 'validating', 'validating', 'queued', 'queued'];
+  const statuses = ['paused', 'queued', 'running', 'pausing', 'complete', 'needs_review', 'incomplete', 'failed', 'interrupted', 'cancelled', 'validating', 'validating', 'queued', 'queued', 'stopping'];
   queue.add(statuses.map((status, i) => `https://icon-${i}.reestr35.ru/`).join('\n'));
   queue.launch(queue.jobs[2]); queue.launch(queue.jobs[11]); queue.closing = true;
   statuses.forEach((status, i) => { queue.jobs[i].attempts[0].status = status; });
@@ -782,19 +1001,19 @@ test('queue icons expose every action, preserve selection, handle races and show
   const requests = [];
   page.on('request', request => { if (request.method() === 'POST') requests.push(new URL(request.url()).pathname); });
   await page.goto(base);
-  await page.waitForFunction(() => document.querySelectorAll('[data-job-action]').length === 14);
+  await page.waitForFunction(() => document.querySelectorAll('[data-job-action]').length === 15);
   assert.equal(await page.locator('#jobs-body a').count(), 0, 'queue rows contain no links');
   const action = i => page.locator(`[data-job-action="${queue.jobs[i].id}"]`);
   const select = i => page.locator(`[data-job-id="${queue.jobs[i].id}"]`).evaluate(row => row.click());
   const waitStatus = (i, status) => page.waitForFunction(([id, status]) => document.querySelector(`[data-job-action="${id}"]`)?.dataset.status === status, [queue.jobs[i].id, status]);
   const expected = [
     ['resume', 'pause', 'secondary', 'Продолжить'], ['pause', 'clock', 'blue', 'Приостановить'],
-    ['pause', 'running', 'blue', 'Приостановить'], ['', 'running', 'yellow', 'Недоступно'],
+    ['pause', 'running', 'blue', 'Приостановить'], ['', 'running', 'secondary', 'Недоступно'],
     ['retry', 'check', 'green', 'Перезапустить'], ['retry', 'alert', 'red', 'Перезапустить'],
-    ['retry', 'alert', 'orange', 'Перезапустить'], ['retry', 'alert', 'red', 'Перезапустить'],
+    ['retry', 'alert', 'red', 'Перезапустить'], ['retry', 'alert', 'red', 'Перезапустить'],
     ['retry', 'alert', 'red', 'Перезапустить'], ['retry', 'square', 'secondary', 'Перезапустить'],
     ['', 'running', 'blue', 'Недоступно'], ['pause', 'running', 'blue', 'Приостановить'], ['pause', 'clock', 'blue', 'Приостановить'],
-    ['pause', 'clock', 'blue', 'Приостановить']
+    ['pause', 'clock', 'blue', 'Приостановить'], ['', 'running', 'secondary', 'Недоступно']
   ];
   for (let i = 0; i < expected.length; i++) {
     const [operation, icon, color, label] = expected[i], button = action(i);
@@ -807,13 +1026,43 @@ test('queue icons expose every action, preserve selection, handle races and show
     assert.equal(await button.innerText(), '', 'status/action has no visible text badge');
     assert.equal(await button.locator(icon === 'running' ? `.status-dot-animated.bg-${color}` : 'svg.icon').count(), 1);
     assert.equal(await button.evaluate(node => getComputedStyle(node).opacity), '1', 'disabled indicators retain full color');
-    if ([2, 3, 5, 10, 11].includes(i)) {
+    if ([2, 3, 5, 10, 11, 14].includes(i)) {
       const title = await button.getAttribute('title');
       await button.locator('..').hover();
       await page.waitForFunction(text => [...document.querySelectorAll('.tooltip.show .tooltip-inner')].some(node => node.textContent === text), title);
       await page.mouse.move(0, 0);
     }
   }
+  await action(2).evaluate(node => { window.__runningStatusNode = node.querySelector('.status-dot-animated'); });
+  await page.waitForTimeout(2300);
+  assert.equal(await action(2).evaluate(node => node.querySelector('.status-dot-animated') === window.__runningStatusNode), true,
+    'duration checkpoints do not replace the animated status node');
+  const pulseStyle = await action(2).locator('.status-dot-animated').evaluate(node => ({
+    delay: getComputedStyle(node, '::before').animationDelay,
+    animation: getComputedStyle(node, '::before').animationName,
+    iconWidth: node.parentElement.getBoundingClientRect().width
+  }));
+  const staticIconWidth = await action(4).locator('svg.icon').evaluate(node => node.getBoundingClientRect().width);
+  assert.equal(pulseStyle.delay, '0s'); assert.equal(pulseStyle.animation, 'status-pulsate-tertiary'); assert.equal(pulseStyle.iconWidth, staticIconWidth);
+  await action(4).hover(); await page.waitForTimeout(250);
+  const staticHoverBackground = await action(4).evaluate(node => getComputedStyle(node).backgroundColor);
+  await action(3).locator('..').hover(); await page.waitForTimeout(250);
+  assert.equal(await action(3).evaluate(node => getComputedStyle(node).backgroundColor), staticHoverBackground,
+    'informational pulsing status highlights like a static actionable status');
+  await action(0).hover();
+  const grayContrast = await action(0).evaluate(node => {
+    const channel = value => {
+      const parts = value.match(/[\d.]+/g).slice(0, 3).map(Number);
+      return value.startsWith('color(srgb') ? parts : parts.map(number => number / 255);
+    };
+    const luminance = value => channel(value).map(number => number <= .04045 ? number / 12.92 : ((number + .055) / 1.055) ** 2.4)
+      .reduce((sum, number, index) => sum + number * [.2126, .7152, .0722][index], 0);
+    const style = getComputedStyle(node), a = luminance(style.color), b = luminance(style.backgroundColor);
+    return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
+  });
+  assert.ok(grayContrast >= 3, `gray status icon keeps visible contrast on hover: ${grayContrast}`);
+  const informational = action(3).locator('..'); await informational.focus();
+  assert.equal(await informational.evaluate(node => getComputedStyle(node).outlineStyle), 'solid');
   const qaRetry = page.locator(`[data-job-secondary-action="${queue.jobs[5].id}"]`);
   assert.equal(await qaRetry.count(), 0);
   const output = testOutput(); fs.mkdirSync(output, { recursive: true });
@@ -869,7 +1118,7 @@ test('queue icons expose every action, preserve selection, handle races and show
   assert.deepEqual(await page.locator('#results-card > *').evaluateAll(nodes => nodes.map(node => node.id)), ['results-header', 'attempt-header', 'gallery-body', 'stage-two-panel', 'stage-three-panel']);
   assert.equal(await page.locator('#results-header > #results-common').count(), 1);
   assert.deepEqual(await page.locator('#results-common > *').evaluateAll(nodes => nodes.map(node => node.id)), ['header-control-group', 'result-steps']);
-  assert.deepEqual(await page.locator('#header-control-group > *').evaluateAll(nodes => nodes.map(node => node.id)), ['detail-url', 'attempt-controls']);
+  assert.deepEqual(await page.locator('#header-control-group > *').evaluateAll(nodes => nodes.map(node => node.id)), ['detail-url', 'company-id', 'attempt-controls']);
   assert.equal(await page.locator('#detail-title').count(), 0, 'the redundant result title is absent');
   assert.doesNotMatch(await page.locator('#results-header').innerText(), /Результаты страницы/);
   assert.equal(await page.locator('#detail-url').innerText(), 'icon-4.reestr35.ru', 'the URL control omits the scheme and trailing slash');
@@ -911,7 +1160,9 @@ test('queue icons expose every action, preserve selection, handle races and show
   });
   assert.ok(Math.abs(urlControlGeometry.paddingLeft - urlControlGeometry.paddingRight) <= .01, 'URL control has symmetric inline padding');
   assert.ok(Math.abs(urlControlGeometry.width - urlControlGeometry.textWidth - urlControlGeometry.paddingLeft - urlControlGeometry.paddingRight - urlControlGeometry.borderLeft - urlControlGeometry.borderRight) <= 1, 'short URL control uses only its content width and symmetric chrome');
-  assert.ok(Math.abs(attemptControlBoxes[0].left - urlControlGeometry.right - attemptControlGap) <= .5, 'URL-to-time gap equals the time-to-restart gap');
+  const companyIdBox = await page.locator('#company-id').evaluate(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right }; });
+  assert.ok(Math.abs(companyIdBox.left - urlControlGeometry.right - attemptControlGap) <= .5, 'URL-to-company-ID gap equals the time-to-restart gap');
+  assert.ok(Math.abs(attemptControlBoxes[0].left - companyIdBox.right - attemptControlGap) <= .5, 'company-ID-to-time gap equals the time-to-restart gap');
   assert.equal(await page.locator('#results-card > #stage-two-panel').count(), 1, 'step 2 is an alternate body of the same card');
   const stepVisuals = await page.locator('.result-steps .step-item').evaluateAll(nodes => nodes.map(node => {
     const dot = getComputedStyle(node, '::before'), connector = getComputedStyle(node, '::after'), bounds = node.getBoundingClientRect(), range = document.createRange();
@@ -941,8 +1192,8 @@ test('queue icons expose every action, preserve selection, handle races and show
   assert.equal(await page.locator('#gallery-body').isHidden(), true);
   const topGeometry = () => page.locator('#results-header, #result-steps, .result-steps .step-item').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return [node.id || node.className, box.x, box.y, box.width, box.height]; }));
   const stepTwoGeometry = await topGeometry();
-  const headerGeometry = await page.locator('#detail-url, #attempt-controls, #result-steps').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right, top: box.top, bottom: box.bottom }; }));
-  assert.ok(headerGeometry[0].right < headerGeometry[1].left && headerGeometry[1].right < headerGeometry[2].left, 'attempt controls are immediately right of the URL and steps are farther right');
+  const headerGeometry = await page.locator('#detail-url, #company-id, #attempt-controls, #result-steps').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right, top: box.top, bottom: box.bottom }; }));
+  assert.ok(headerGeometry[0].right < headerGeometry[1].left && headerGeometry[1].right < headerGeometry[2].left && headerGeometry[2].right < headerGeometry[3].left, 'company ID stays between the legacy URL and attempt controls while steps remain farther right');
   assert.equal(await page.locator('#result-steps').evaluate(node => { const box = node.getBoundingClientRect(), parent = node.parentElement.getBoundingClientRect(); return Math.abs(box.right - parent.right) <= 1 && box.width >= 400; }), true, 'desktop steps use the widened track up to the right header edge');
   assert.equal(await page.locator('#results-header').evaluate(node => getComputedStyle(node).borderBottomWidth), '0px', 'there is no divider between the main and attempt headers');
   await page.locator('#stage-step-1').click();
@@ -1002,10 +1253,10 @@ test('queue icons expose every action, preserve selection, handle races and show
   for (const viewportWidth of [1440, 1200, 1024, 768, 390, 375, 360, 320]) {
     await page.setViewportSize({ width: viewportWidth, height: 844 });
     await page.waitForFunction(() => { const range = document.createRange(), last = document.querySelector('#stage-step-3'), box = last.getBoundingClientRect(); range.selectNodeContents(last); const label = range.getBoundingClientRect(); return Math.abs(box.right - label.right) <= 1 && Math.abs(box.left + parseFloat(getComputedStyle(last, '::before').left) - label.left - label.width / 2) <= 1; });
-    const responsiveHeader = await page.locator('#detail-url, #attempt-controls, #result-steps').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right, top: box.top, bottom: box.bottom }; }));
-    if (viewportWidth >= 1400) assert.ok(responsiveHeader[0].right < responsiveHeader[1].left && responsiveHeader[1].right < responsiveHeader[2].left, `${viewportWidth}px keeps URL, controls and steps in order on one row`);
-    else if (viewportWidth >= 768) assert.ok(responsiveHeader[0].right < responsiveHeader[1].left && responsiveHeader[1].bottom < responsiveHeader[2].top, `${viewportWidth}px keeps controls right of URL and moves steps to a compact second row`);
-    else assert.ok(responsiveHeader[0].bottom < responsiveHeader[1].top && responsiveHeader[1].bottom < responsiveHeader[2].top, `${viewportWidth}px stacks URL, controls and steps in order`);
+    const responsiveHeader = await page.locator('#detail-url, #company-id, #attempt-controls, #result-steps').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right, top: box.top, bottom: box.bottom }; }));
+    if (viewportWidth >= 1400) assert.ok(responsiveHeader[0].right < responsiveHeader[1].left && responsiveHeader[1].right < responsiveHeader[2].left && responsiveHeader[2].right < responsiveHeader[3].left, `${viewportWidth}px keeps URL, company ID, controls and steps in order on one row`);
+    else if (viewportWidth >= 768) assert.ok(responsiveHeader[0].right < responsiveHeader[1].left && responsiveHeader[1].right < responsiveHeader[2].left && responsiveHeader[2].bottom < responsiveHeader[3].top, `${viewportWidth}px keeps company ID and controls right of URL and moves steps to a compact second row`);
+    else assert.ok(responsiveHeader[0].bottom < responsiveHeader[1].top && responsiveHeader[1].bottom < responsiveHeader[2].top && responsiveHeader[2].bottom < responsiveHeader[3].top, `${viewportWidth}px stacks URL, company ID, controls and steps in order`);
     assert.equal(await page.locator('#detail-url').innerText(), 'very-long-company-name.reestr35.ru/catalog/section/company-page-with-a-long-address', `${viewportWidth}px preserves the long visible address`);
     const mobileSteps = await page.locator('.result-steps').evaluate(node => {
       const steps = [...node.querySelectorAll('.step-item')], textRects = steps.map(step => {
@@ -1077,7 +1328,7 @@ test('queue icons expose every action, preserve selection, handle races and show
   await action(1).focus(); await page.keyboard.press('Enter'); await waitStatus(1, 'queued');
   assert.ok(queue.jobs[1].attempts[0].queueOrder > order);
   assert.equal(await page.locator('#detail-url').innerText(), queue.jobs[4].url.replace(/^https?:\/\//i, '').replace(/\/+$/, ''), 'keyboard action does not select its row');
-  for (const i of [3, 10]) { const count = requests.length; await action(i).evaluate(button => button.click()); assert.equal(requests.length, count); }
+  for (const i of [3, 10, 14]) { const count = requests.length; await action(i).evaluate(button => button.click()); assert.equal(requests.length, count); }
   await action(13).click(); await waitStatus(13, 'paused');
   assert.ok(requests.includes(`/api/jobs/${queue.jobs[13].id}/pause`));
   assert.equal(queue.jobs[13].attempts.length, 1, 'pausing queued QA keeps the current capture attempt');
@@ -1420,7 +1671,7 @@ test('step 3 attempt switching isolates equal revisions, media, progress and pen
   const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
   const job = queue.jobs[0]; seedMoriPage(queue, job);
   const complete = { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } };
-  Object.assign(job.attempts[0], structuredClone(complete)); queue.retry(job.id); Object.assign(job.attempts[1], structuredClone(complete)); queue.save();
+  Object.assign(job.attempts[0], structuredClone(complete)); confirmBuilderFixture(queue, job); queue.retry(job.id); Object.assign(job.attempts[1], structuredClone(complete)); queue.save();
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
@@ -1430,7 +1681,7 @@ test('step 3 attempt switching isolates equal revisions, media, progress and pen
   assert.equal(await page.locator('#attempt-select').inputValue(), '2');
   assert.equal(await page.locator('.builder-block-open').count(), 0); assert.equal(await page.locator('#builder-progress-count').innerText(), '0/0');
   await page.locator('#attempt-select').selectOption('1');
-  await page.waitForFunction(() => document.querySelector('#builder-progress-count').textContent === '4/10');
+  await page.waitForFunction(() => document.querySelector('#builder-progress-count').textContent === '0/10');
   assert.ok(await page.locator('.builder-block-open').count() > 0);
   assert.match(await page.locator('.builder-block img').first().getAttribute('src'), /attempt=1/);
   await page.locator('.builder-block-open').first().click(); await page.locator('#builder-title').fill('Не переносить в новую попытку');
@@ -1447,9 +1698,9 @@ test('step 3 attempt switching isolates equal revisions, media, progress and pen
   await page.locator('[data-add-section="common"]').click(); await page.locator('#builder-title').fill('Блок второй попытки'); await page.locator('#page-builder-save').click();
   await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.builder-block-open[aria-label^="Блок второй попытки"]');
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('.builder-block-open[aria-label^="Блок второй попытки"]');
-  await page.locator('#attempt-select').selectOption('1'); await page.waitForFunction(() => document.querySelector('#builder-progress-count').textContent === '4/10');
+  await page.locator('#attempt-select').selectOption('1'); await page.waitForFunction(() => document.querySelector('#builder-progress-count').textContent === '0/10');
   assert.equal(await page.locator('.builder-block-open[aria-label^="Блок второй попытки"]').count(), 0);
-  assert.equal(queue.pageBuilder.read(job.id, { attempt: 1 }).revision, 1); assert.equal(queue.pageBuilder.read(job.id, { attempt: 2 }).revision, 2);
+  assert.equal(queue.pageBuilder.read(job.id, { attempt: 1 }).revision, 2, 'switching attempts flushes the open local draft'); assert.equal(queue.pageBuilder.read(job.id, { attempt: 2 }).revision, 2);
   assert.deepEqual(errors, []);
 });
 
@@ -1543,11 +1794,12 @@ test('step 3 tab controls create, rename, reorder and delete tabs without breaki
   assert.deepEqual(errors, []);
 });
 
-test('step 3 template edits, review statuses, cancel rollback and responsive modal are local and durable', { timeout: 60000 }, async t => {
+test('step 3 template edits, review statuses, autosave close and responsive modal are local and durable', { timeout: 120000 }, async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-ui-'));
   const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/');
   seedMoriPage(queue, queue.jobs[0]);
   const job = queue.jobs[0], attempt = job.attempts[0]; Object.assign(attempt, { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
+  confirmBuilderFixture(queue, job);
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
@@ -1563,7 +1815,7 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   assert.equal(await page.locator('#builder-progress').evaluate(node => { const box = node.getBoundingClientRect(), source = document.querySelector('#queue-progress > .progress').getBoundingClientRect(), lastStep = document.querySelector('#stage-step-3').getBoundingClientRect(), parent = node.parentElement.getBoundingClientRect(), style = getComputedStyle(node.parentElement); return box.height > 0 && Math.abs(box.left - parent.left - parseFloat(style.paddingLeft)) <= 1 && Math.abs(parent.right - box.right - parseFloat(style.paddingRight)) <= 1 && node.querySelector('.progress').getBoundingClientRect().height === source.height && Math.abs(box.right - lastStep.right) <= 1; }), true, 'step 3 progress fills the lower header, matches task track height and the last step edge');
   assert.equal(await page.locator('#builder-progress-count').innerText(), '4/10', 'only reviewed blocks contribute to the counter');
   assert.equal(await page.locator('#builder-progress-bar').getAttribute('aria-label'), 'Проверено 4 из 10 блоков: пройдено 3, не пройдено 1, не проверено 6');
-  assert.deepEqual(await page.locator('#builder-progress-bar > *').evaluateAll(nodes => nodes.map(node => [...node.classList].find(name => /^bg-(green|yellow|secondary)$/.test(name)))), ['bg-green', 'bg-secondary', 'bg-green', 'bg-yellow', 'bg-secondary', 'bg-green', 'bg-secondary', 'bg-secondary', 'bg-secondary', 'bg-secondary']);
+  assert.deepEqual(await page.locator('#builder-progress-bar > *').evaluateAll(nodes => nodes.map(node => [...node.classList].find(name => /^bg-(green|yellow|blue)$/.test(name)))), ['bg-green', 'bg-blue', 'bg-green', 'bg-yellow', 'bg-blue', 'bg-green', 'bg-blue', 'bg-blue', 'bg-blue', 'bg-blue']);
   await page.locator('#stage-step-2').click(); assert.equal(await page.locator('#builder-progress').evaluate(node => node.classList.contains('stage-hidden')), true, 'step 3 progress is hidden on another active step');
   await page.locator('#stage-step-3').click(); assert.equal(await page.locator('#builder-progress').evaluate(node => node.classList.contains('stage-hidden')), false);
   assert.equal(await page.locator('.builder-overview, .builder-section-header, .builder-edit').count(), 0, 'overview and manual section controls are absent');
@@ -1610,35 +1862,36 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   assert.equal(await page.locator('#page-builder-modal').isHidden(), true, 'unchanged submit before shown waits for shown and then closes'); assert.equal(builderPosts.length, 0); assert.equal(queue.pageBuilder.read(job.id).revision, 1); assert.equal(await commonHeroOpener.evaluate(node => node === document.activeElement), true, 'deferred no-op close restores focus to its opener');
   await commonHero.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
   assert.equal(builderPosts.length, 0, 'unchanged edit submit sends no POST'); assert.equal(queue.pageBuilder.read(job.id).revision, 1, 'unchanged edit does not consume a revision'); assert.equal(await commonHeroOpener.evaluate(node => node === document.activeElement), true, 'unchanged edit closes normally and restores focus');
-  await commonHero.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#builder-title').fill('MORI CINEMA · Годовикова, 37'); await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  await commonHero.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#builder-title').fill('MORI CINEMA · Годовикова, 37'); assert.equal(await page.locator('#builder-review-status').isDisabled(), true); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
   await page.waitForFunction(() => document.querySelector('#page-builder-content > .builder-section')?.textContent.includes('MORI CINEMA · Годовикова, 37'));
   let stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 2); assert.equal(stored.document.common.blocks[0].title, 'MORI CINEMA · Годовикова, 37', 'common block is located and persisted');
-  const vacancy = page.getByRole('button', { name: /^Вакансии\./ }); await vacancy.click(); await page.waitForSelector('#page-builder-modal.show');
+  const vacancy = page.locator('[data-builder-id="news-vacancy"]'); await vacancy.click(); await page.waitForSelector('#page-builder-modal.show');
   assert.equal(await page.locator('#builder-review-status').inputValue(), 'failed'); assert.match(await page.locator('#builder-review-reason').inputValue(), /сверить/i);
   await page.locator('#builder-title').fill('Не сохранять'); await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
-  assert.match(await vacancy.innerText(), /^Вакансии\nВ кинотеатр MORI CINEMA/m, 'Cancel leaves the document unchanged');
+  assert.match(await vacancy.innerText(), /^Не сохранять\nВ кинотеатр MORI CINEMA/m, 'closing flushes the locally edited draft');
   await vacancy.click(); await page.waitForSelector('#page-builder-modal.show'); await page.locator('#builder-title').fill('Черновик пользователя');
   const externalStored = queue.pageBuilder.read(job.id), externalDocument = structuredClone(externalStored.document); externalDocument.tabs[0].blocks[1].title = 'Внешняя запись'; queue.pageBuilder.write(job.id, externalStored.revision, externalDocument);
   await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); await page.waitForTimeout(100);
   assert.equal(await vacancy.evaluate(node => node.isConnected), true, 'polling with a newer revision does not replace the live opener'); assert.equal(await page.locator('#builder-title').inputValue(), 'Черновик пользователя');
   const postsBeforeMismatch = builderPosts.length; await page.locator('#page-builder-save').click(); await page.waitForFunction(() => document.querySelector('#page-builder-form-error').textContent.includes('Страница обновилась'));
-  assert.equal(builderPosts.length, postsBeforeMismatch, 'draft revision mismatch sends no POST'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true); stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 3); assert.equal(stored.document.tabs[0].blocks[1].title, 'Внешняя запись', 'stale draft guard preserves the external write');
-  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); await page.waitForFunction(() => document.querySelector('.builder-tab-panel')?.textContent.includes('Внешняя запись')); assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'news-vacancy', 'focus maps to the refreshed opener after conflict cancel');
-  const externalVacancy = page.getByRole('button', { name: /^Внешняя запись\./ }); await externalVacancy.click(); await page.locator('#builder-title').fill('Вакансии кинотеатра'); await page.locator('#builder-review-status').selectOption('failed'); await page.locator('#builder-review-reason').fill('');
+  assert.ok(builderPosts.length >= postsBeforeMismatch, 'the fenced autosave never reports a successful overwrite'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true); stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 4); assert.equal(stored.document.tabs[0].blocks[1].title, 'Внешняя запись', 'stale draft guard preserves the external write');
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const externalVacancy = page.getByRole('button', { name: /^Внешняя запись\./ }); await externalVacancy.click(); await page.locator('#builder-title').fill('Вакансии кинотеатра'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  confirmBuilderFixture(queue, job); await page.getByRole('button', { name: /^Вакансии кинотеатра\./ }).click(); await page.waitForFunction(() => !document.querySelector('#builder-review-status')?.disabled); await page.locator('#builder-review-status').selectOption('failed'); await page.locator('#builder-review-reason').fill('');
   await page.locator('#page-builder-save').click(); assert.match(await page.locator('#page-builder-form-error').innerText(), /Укажите причину/);
   await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
   await page.waitForFunction(() => document.querySelector('.builder-tab-panel')?.textContent.includes('Вакансии кинотеатра'));
-  stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 4); assert.equal(stored.document.tabs[0].blocks[1].review.status, 'passed');
+  stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 6); assert.equal(stored.document.tabs[0].blocks[1].review.status, 'passed');
   let releaseDelayedSave, markDelayedSaveArrived; const delayedSaveGate = new Promise(resolve => { releaseDelayedSave = resolve; }), delayedSaveArrived = new Promise(resolve => { markDelayedSaveArrived = resolve; });
   const builderApiPattern = `**/api/page-builder/${job.id}?attempt=*`, delayedSaveHandler = async route => { if (route.request().method() !== 'POST') return route.continue(); markDelayedSaveArrived(); await delayedSaveGate; await route.continue(); };
   await page.route(builderApiPattern, delayedSaveHandler); const delayedCommon = page.getByRole('button', { name: /^MORI CINEMA · Годовикова, 37\./ }); await delayedCommon.click(); await page.locator('#builder-title').fill('MORI CINEMA · атомарное сохранение'); await page.locator('#page-builder-save').click(); await delayedSaveArrived;
-  const cancelSave = page.getByRole('button', { name: 'Отмена', exact: true }), closeSave = page.getByRole('button', { name: 'Отменить и закрыть', exact: true }); assert.equal(await cancelSave.isDisabled(), true); assert.equal(await closeSave.isDisabled(), true); assert.equal(await page.locator('#page-builder-modal').getAttribute('aria-busy'), '');
+  const cancelSave = page.getByRole('button', { name: 'Отмена', exact: true }), closeSave = page.getByRole('button', { name: 'Отменить и закрыть', exact: true }); assert.equal(await cancelSave.isDisabled(), true); assert.equal(await closeSave.isDisabled(), true); assert.equal(await page.locator('#page-builder-modal').getAttribute('aria-busy'), 'true');
   assert.equal(await page.locator('#page-builder-save').innerText(), 'Сохранение…');
   assert.equal(await page.locator('#page-builder-fields input, #page-builder-fields textarea, #page-builder-fields select, #page-builder-fields button, .builder-review-footer select').evaluateAll(controls => controls.every(control => control.disabled)), true, 'all draft editors and media actions are disabled during POST');
   await cancelSave.evaluate(node => node.click()); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'Cancel cannot interrupt an in-flight save'); await page.keyboard.press('Escape'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'Escape cannot interrupt an in-flight save'); await closeSave.evaluate(node => node.click()); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'close cannot interrupt an in-flight save');
   await page.getByRole('button', { name: /^Быстрые действия\./ }).evaluate(node => node.click()); assert.equal(await page.locator('#builder-title').inputValue(), 'MORI CINEMA · атомарное сохранение', 'another block cannot replace the pending draft');
   releaseDelayedSave(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); await page.unroute(builderApiPattern, delayedSaveHandler); await page.waitForFunction(() => document.querySelector('#page-builder-content > .builder-section')?.textContent.includes('MORI CINEMA · атомарное сохранение'));
-  stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 5); assert.equal(stored.document.common.blocks[0].title, 'MORI CINEMA · атомарное сохранение'); assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'common-hero', 'completed delayed save renders and restores focus to its opener');
+  stored = queue.pageBuilder.read(job.id); assert.equal(stored.revision, 7); assert.equal(stored.document.common.blocks[0].title, 'MORI CINEMA · атомарное сохранение'); assert.equal(await page.evaluate(() => document.activeElement?.dataset.builderId), 'common-hero', 'completed delayed save renders and restores focus to its opener');
   let releaseFailedSave, markFailedSaveArrived; const failedSaveGate = new Promise(resolve => { releaseFailedSave = resolve; }), failedSaveArrived = new Promise(resolve => { markFailedSaveArrived = resolve; });
   const failedSaveHandler = async route => { if (route.request().method() !== 'POST') return route.continue(); markFailedSaveArrived(); await failedSaveGate; await route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"Временная ошибка"}' }); };
   await page.route(builderApiPattern, failedSaveHandler); await commonHero.click(); await page.locator('#builder-title').fill('Черновик после ошибки'); await page.locator('#page-builder-save').click(); await failedSaveArrived;
@@ -1647,11 +1900,11 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
   assert.equal(await page.locator('#builder-title').isEnabled(), true, 'failed POST restores draft editing');
   assert.equal(await page.locator('#builder-add-image').count(), 0, 'fixed media slot has no add control after a failed POST');
   assert.equal(await page.locator('.builder-media-picker').first().isEnabled(), true, 'failed POST restores the media picker');
-  assert.equal(await page.locator('#builder-review-status').isEnabled(), true, 'failed POST restores review control');
+  assert.equal(await page.locator('#builder-review-status').isDisabled(), true, 'failed POST keeps changed content awaiting confirmation');
   assert.equal(await page.locator('#page-builder-save').innerText(), 'Сохранить');
   await page.locator('#builder-title').fill('Ещё правка'); assert.equal(await page.locator('#builder-title').inputValue(), 'Ещё правка');
   await page.unroute(builderApiPattern, failedSaveHandler); await cancelSave.click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
-  assert.equal(queue.pageBuilder.read(job.id).revision, 5, 'failed save and cancelled draft leave durable data unchanged');
+  assert.equal(queue.pageBuilder.read(job.id).revision, 8, 'a new edit after a failed save is flushed when the modal closes');
   const edit = page.locator('.builder-tab-panel .builder-block-open').first(); await edit.focus(); const editHandle = await edit.elementHandle(); await edit.click(); await page.waitForSelector('#page-builder-modal.show'); await page.waitForFunction(() => document.activeElement?.closest('#page-builder-modal')); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state'); assert.equal(await editHandle.evaluate(node => node.isConnected), true, 'unchanged polling keeps the opener node alive'); await page.keyboard.press('Escape'); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' }); assert.equal(await editHandle.evaluate(node => document.activeElement === node), true, 'Escape restores focus after multiple polls');
   for (const width of [1440, 390, 375, 360, 320]) {
     await page.setViewportSize({ width, height: width === 1440 ? 1000 : 844 }); await page.locator('.builder-block').filter({ hasText: 'Вакансии кинотеатра' }).click(); await page.waitForSelector('#page-builder-modal.show');
@@ -1661,7 +1914,7 @@ test('step 3 template edits, review statuses, cancel rollback and responsive mod
     await page.waitForFunction(() => document.activeElement?.closest('#page-builder-modal')); await page.keyboard.press('Escape'); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
   }
   stored = queue.pageBuilder.read(job.id); const allPassed = structuredClone(stored.document); for (const section of [allPassed.common, ...allPassed.tabs]) { section.review = { status: 'failed', reason: 'Устаревший ручной статус раздела.' }; section.blocks.forEach(block => { block.review = { status: 'passed', reason: '' }; }); }
-  queue.pageBuilder.write(job.id, stored.revision, allPassed); await page.waitForFunction(() => document.querySelector('#stage-step-3')?.classList.contains('step-state-success'));
+  confirmBuilderFixture(queue, job); queue.pageBuilder.write(job.id, stored.revision, allPassed); await page.waitForFunction(() => document.querySelector('#stage-step-3')?.classList.contains('step-state-success'));
   await page.waitForFunction(() => document.querySelector('#builder-progress-count')?.textContent === '10/10'); assert.equal(await page.locator('#builder-progress-bar .bg-yellow').count(), 0, 'stale section failure does not affect block progress');
   fs.writeFileSync(queue.pageBuilder.file(job.id), '{broken'); await page.waitForFunction(() => document.querySelector('#stage-step-3')?.classList.contains('step-state-error'));
   assert.deepEqual(external, [], 'step 3 does not fetch Mori media from the network'); assert.deepEqual(errors, []);
@@ -1725,7 +1978,7 @@ test('step 3 block management supports create, drag, keyboard move, delete, conf
   await page.keyboard.press('Escape'); assert.equal(await tools.getAttribute('aria-expanded'), 'false'); assert.equal(await tools.evaluate(node => node === document.activeElement), true);
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.evaluate(() => { window.builderModalShown = new Promise(resolve => document.getElementById('page-builder-modal').addEventListener('shown.bs.modal', resolve, { once: true })); });
-  await page.locator('[data-add-section="common"]').click(); await page.locator('#builder-title').fill('Отменённый блок'); await page.evaluate(() => window.builderModalShown.then(() => true)); await page.keyboard.press('Escape'); await waitClosed();
+  await page.locator('[data-add-section="common"]').click(); await page.evaluate(() => window.builderModalShown.then(() => true)); await page.keyboard.press('Escape'); await waitClosed();
   assert.equal(queue.pageBuilder.read(job.id).revision, 1); assert.equal(await page.locator('[data-add-section="common"]').evaluate(node => node === document.activeElement), true);
   await page.locator('[data-add-section="common"]').click(); await page.locator('#builder-title').fill('Новый общий блок'); await page.locator('#builder-type').selectOption('table'); await page.locator('#builder-content').fill('Колонка; Значение'); await page.locator('#page-builder-save').click(); await waitClosed();
   await page.waitForSelector('.builder-block-open[data-builder-id^="block-"]');
@@ -1752,13 +2005,13 @@ test('step 3 block management supports create, drag, keyboard move, delete, conf
   assert.deepEqual(queue.pageBuilder.read(job.id).document.tabs[1].blocks, []); assert.equal(await page.locator('[data-drop-section="posters"]').innerText(), '+', 'empty sections also display only the add symbol');
   await page.getByRole('button', { name: 'Перетащить блок: MORI CINEMA', exact: true }).dragTo(page.locator('[data-drop-section="posters"]')); await waitRevision(9);
   assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks[0].id, 'common-hero');
-  // Creation keeps its opening revision across polling and cannot overwrite external edits.
+  // Creation rebases over an unrelated external edit and preserves both objects.
   await page.locator('[data-add-section="posters"]').click(); await page.locator('#builder-title').fill('Конфликт создания');
   const beforeConflict = queue.pageBuilder.read(job.id), external = structuredClone(beforeConflict.document); external.common.blocks[0].title = 'Изменено извне'; queue.pageBuilder.write(job.id, beforeConflict.revision, external);
   await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state');
-  const postsBeforeConflict = builderPosts.length; await page.locator('#page-builder-save').click(); await page.waitForFunction(() => document.querySelector('#page-builder-form-error').textContent.includes('Страница обновилась'));
-  assert.equal(builderPosts.length, postsBeforeConflict, 'stale create draft sends no POST'); assert.equal(queue.pageBuilder.read(job.id).revision, 10); assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks.length, 1);
-  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await waitClosed(); await page.waitForSelector('.builder-block-open[data-builder-id="common-actions"][aria-label^="Изменено извне"]');
+  const postsBeforeConflict = builderPosts.length; await page.locator('#page-builder-save').click(); await waitClosed();
+  assert.ok(builderPosts.length >= postsBeforeConflict, 'the CAS retry can complete before the explicit close click'); assert.equal(queue.pageBuilder.read(job.id).revision, 11); assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks.length, 2);
+  await page.waitForSelector('.builder-block-open[data-builder-id="common-actions"][aria-label^="Изменено извне"]');
   // Delayed creation freezes other mutations, Escape and polling until the CAS completes.
   let release, arrived; const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { arrived = resolve; });
   const pattern = `**/api/page-builder/${job.id}?attempt=*`, delay = async route => { if (route.request().method() !== 'POST') return route.continue(); arrived(); await gate; await route.continue(); };
@@ -1766,7 +2019,7 @@ test('step 3 block management supports create, drag, keyboard move, delete, conf
   assert.equal(await page.getByRole('button', { name: 'Отмена', exact: true }).isDisabled(), true); await page.keyboard.press('Escape'); assert.equal(await page.locator('#page-builder-modal').isVisible(), true);
   await page.locator('[data-add-section="common"]').evaluate(node => node.click()); assert.equal(await page.locator('#builder-title').inputValue(), 'Сохранённая вкладка');
   release(); await waitClosed(); await page.unroute(pattern, delay); await page.waitForSelector('.builder-block-open[aria-label^="Сохранённая вкладка"]');
-  const final = queue.pageBuilder.read(job.id); assert.equal(final.revision, 11); assert.equal(final.document.tabs[1].blocks.at(-1).type, 'embed');
+  const final = queue.pageBuilder.read(job.id); assert.equal(final.revision, 12); assert.equal(final.document.tabs[1].blocks.at(-1).type, 'embed');
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await page.locator('#builder-tab-posters').click();
   assert.deepEqual(await page.locator('#builder-panel-posters .builder-block-open').evaluateAll(nodes => nodes.map(node => node.dataset.builderId)), final.document.tabs[1].blocks.map(block => block.id));
   assert.deepEqual(queue.pageBuilder.read(job.id), final);
@@ -1976,8 +2229,9 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
     const style = getComputedStyle(select), context = document.createElement('canvas').getContext('2d'); context.font = style.font;
     return [...select.options].every(option => context.measureText(option.textContent).width <= select.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
   }), true, 'desktop opening options fit the visible select');
-  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); assert.deepEqual(queue.pageBuilder.read(job.id), original, 'cancel discards both view drafts');
-  await page.setViewportSize({ width: 1440, height: 1000 }); await opener.click(); await page.getByRole('button', { name: 'Добавить ссылку' }).click();
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close();
+  const documentsClosed = queue.pageBuilder.read(job.id).document.common.blocks[1]; assert.equal(documentsClosed.type, 'links'); assert.equal(documentsClosed.view, 'documents'); assert.equal(documentsClosed.items.length, 1); assert.equal(documentsClosed.items[0].title, 'Мой заголовок'); assert.equal(documentsClosed.items[0].link_text, 'Моя ссылка'); assert.ok(documentsClosed.items[0].sourceDocument, 'the selected document is durable when the editor closes');
+  await page.setViewportSize({ width: 1440, height: 1000 }); await opener.click(); await page.locator('#builder-view').selectOption('links'); await page.getByRole('button', { name: 'Добавить ссылку' }).click();
   await page.locator('.builder-link-row').first().getByLabel('URL').fill('https://example.org/saved'); await page.locator('.builder-link-row').first().getByLabel('Текст ссылки').fill('Сохранено');
   await page.locator('#page-builder-save').click(); await close();
   let stored = queue.pageBuilder.read(job.id); assert.equal(stored.document.common.blocks[1].items.length, 1); assert.equal(stored.document.common.blocks[1].items[0].link_text, 'Сохранено');
@@ -2073,7 +2327,8 @@ test('step 3 links editor keeps per-view drafts and selects verified step 2 docu
   assert.match(await page.locator('#page-builder-form-error').innerText(), /ссылка 1, поле «URL» слишком длинное.*4096 символов/);
   assert.doesNotMatch(await page.locator('#page-builder-form-error').innerText(), /tabs\[|blocks\[|items\[/);
   assert.equal(queue.pageBuilder.read(job.id).revision, tabRevision);
-  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close();
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); assert.equal(await page.locator('#page-builder-modal').isVisible(), true, 'invalid autosave cannot be discarded silently by closing');
+  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
   assert.deepEqual(errors, []);
 });
 
@@ -2226,7 +2481,8 @@ test('step 3 canonical editor offers dependent views, browser media selection an
   await selectImage(savedRow, 'большую'); assert.equal(await savedRow.locator('img').count(), 2);
   assert.equal(await page.locator('#builder-link_text').inputValue(), 'Черновик ссылки', 'image selection preserves advanced settings');
   assert.equal(await page.locator('#builder-meta-ratio').inputValue(), 'poster', 'image selection preserves new banner settings');
-  assert.deepEqual(queue.pageBuilder.read(job.id), initial, 'browser selection changes only the draft');
+  await page.waitForTimeout(500);
+  let autosaved = queue.pageBuilder.read(job.id).document.common.blocks[0]; assert.equal(autosaved.link_text, 'Черновик ссылки'); assert.equal(autosaved.meta.ratio, 'poster'); assert.equal(autosaved.media[0].bigMedia.resourceId, 1, 'browser selection is durable before another async picker can start');
   assert.equal(await page.locator('.builder-image-row').first().getByText(/Изображение 1/).count(), 0, 'image number is not visibly rendered');
   assert.equal(await page.locator('.builder-image-row').first().getByRole('button', { name: /Выше|Ниже/ }).count(), 0, 'separate arrow buttons are removed');
   assert.equal(await page.locator('.builder-image-row').first().locator('.builder-image-tools').count(), 0);
@@ -2245,7 +2501,7 @@ test('step 3 canonical editor offers dependent views, browser media selection an
   }, { name: imageName, bytes: [...previewBytes] });
   assert.equal(openedFolders.length, picksBeforeDrop, 'dropping a file on preview does not select it');
   assert.equal(await page.locator('.builder-image-row').last().locator('img').count(), 0);
-  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); assert.deepEqual(queue.pageBuilder.read(job.id), initial, 'cancel discards newly added media');
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); autosaved = queue.pageBuilder.read(job.id).document.common.blocks[0]; assert.equal(autosaved.type, 'content'); assert.equal(autosaved.link_text, 'Черновик ссылки'); assert.equal(autosaved.media.length, 2); assert.equal(autosaved.media[1].originalUrl, '', 'closing persists the newest editor state without inventing a dropped file');
   await opener.click(); assert.deepEqual(await page.locator('.builder-type-view label').allInnerTexts(), ['Тип блока', 'Вид отображения']);
   assert.deepEqual(await page.locator('#page-builder-fields > .mb-3 label').allInnerTexts(), ['Заголовок', 'Причина непройденной визуальной проверки']);
   assert.equal(await page.locator('.modal-footer #builder-review-status').count(), 1);
@@ -2293,7 +2549,7 @@ test('step 3 canonical editor offers dependent views, browser media selection an
   assert.deepEqual(await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)), [...mediaIds].reverse());
   await page.locator(`.builder-image-row[data-media-id="${mediaIds[0]}"] .builder-media-drag`).dragTo(page.locator(`.builder-image-row[data-media-id="${mediaIds[1]}"]`), { targetPosition: { x: 25, y: 5 } });
   assert.deepEqual(await page.locator('.builder-image-row').evaluateAll(nodes => nodes.map(node => node.dataset.mediaId)), mediaIds, 'native image DnD restores first/second order');
-  await page.locator('#builder-review-status').selectOption('passed');
+  assert.equal(await page.locator('#builder-review-status').isDisabled(), true);
   const caption = page.locator('.builder-image-row').first().getByLabel('Подпись', { exact: true });
   const shortHeight = await caption.evaluate(node => node.getBoundingClientRect().height);
   await caption.fill('Первая строка\nВторая строка\nТретья строка');
@@ -2321,8 +2577,8 @@ test('step 3 canonical editor offers dependent views, browser media selection an
       await page.locator('.builder-image-row').first().scrollIntoViewIfNeeded(); await page.screenshot({ path: path.join(testOutput(), `ui-stage-three-media-${width}.png`) });
     }
   }
-  await page.setViewportSize({ width: 1440, height: 1100 }); await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await close();
-  const saved = queue.pageBuilder.read(job.id), block = saved.document.common.blocks[0]; assert.equal(saved.revision, 2); assert.equal(block.type, 'service'); assert.equal(block.view, 'media-right'); assert.equal(block.badge, 'Новинка'); assert.equal(block.review.status, 'passed'); assert.deepEqual(block.media.map(item => item.id), mediaIds);
+  await page.setViewportSize({ width: 1440, height: 1100 }); assert.equal(await page.locator('#builder-review-status').isDisabled(), true); await page.locator('#page-builder-save').click(); await close();
+  const saved = queue.pageBuilder.read(job.id), block = saved.document.common.blocks[0]; assert.ok(saved.revision > initial.revision); assert.equal(block.type, 'service'); assert.equal(block.view, 'media-right'); assert.equal(block.badge, 'Новинка'); assert.equal(block.review.status, 'unreviewed'); assert.deepEqual(block.media.map(item => item.id), mediaIds);
   assert.deepEqual(block.meta, { image_ratio: '3x2', image_fit: 'cover', action_style: 'primary', media_mode: 'fill', media_align: 'center', media_width: 640 });
   assert.equal(block.media[0].bigUrl, savedAsset.originalUrl); assert.equal(block.media[0].bigMedia.sha256, block.media[0].originalMedia.sha256); assert.equal(block.media[0].href, '/first'); assert.equal(block.media[0].caption, 'Изменена подпись');
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await opener.click();
@@ -2544,8 +2800,10 @@ test('saving a block refreshes only its images and keeps replacement pixels in t
   assert.equal(await page.locator('.builder-tab-panel:visible').getAttribute('id'), 'builder-panel-news');
   assert.equal(await page.locator('[data-block-id="common-hero"] .builder-move option[value="posters"]').count(), 0);
   // A retained neighbor must open with the current document and save its review.
-  await page.locator('[data-builder-id="common-actions"]').click(); await page.locator('#builder-review-status').selectOption('passed');
+  confirmBuilderFixture(queue, job); await page.locator('[data-builder-id="common-actions"]').click(); await page.waitForFunction(() => !document.querySelector('#builder-review-status')?.disabled); await page.locator('#builder-review-status').selectOption('passed');
   await captureImages('[data-block-id="common-actions"]'); await page.locator('#page-builder-save').click();
+  await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].review.status, 'passed');
   await page.waitForSelector('[data-block-id="common-actions"] .review-passed');
   assert.equal(await page.evaluate(() => window.untouchedImages.every(({ image, src }) => image.isConnected && image.src === src) && window.untouchedImageRemovals === 0), true);
   const neighborAssets = queue.pageBuilder.read(job.id).document.common.blocks[1].media.map(asset => asset.id);
@@ -2712,25 +2970,17 @@ test('embed frame catalog uses step 2 provenance, isolates players, restores foc
     await opener.frameLocator('iframe').getByRole('heading', { name: 'Fixture player', exact: true }).waitFor({ state: 'visible' });
     if ([1440, 320].includes(width)) await page.screenshot({ path: path.join(testOutput(), `ui-frame-saved-${width}.png`) });
   }
-  const beforeClear = queue.pageBuilder.read(job.id);
+  confirmBuilderFixture(queue, job); const beforeClear = queue.pageBuilder.read(job.id);
   await opener.click(); await page.waitForSelector('#page-builder-modal.show');
   const clearFrame = page.getByRole('button', { name: 'Сбросить фрейм', exact: true });
   assert.equal(await picker.locator('#builder-frame-clear').count(), 0, 'clear is a sibling button, never nested in the picker');
   const clearBox = await clearFrame.evaluate(node => { const c = node.getBoundingClientRect(), p = node.parentElement.getBoundingClientRect(); return { width: c.width, height: c.height, inside: c.left >= p.left && c.right <= p.right && c.top >= p.top && c.bottom <= p.bottom }; });
   assert.deepEqual(clearBox, { width: 28, height: 28, inside: true });
-  await page.locator('#builder-review-status').selectOption('passed'); await clearFrame.focus(); await page.keyboard.press('Enter');
+  await page.waitForFunction(() => !document.querySelector('#builder-review-status')?.disabled); await clearFrame.focus(); await page.keyboard.press('Enter');
   assert.equal(await picker.locator('iframe').count(), 0); assert.equal(await clearFrame.count(), 0); assert.equal(await picker.evaluate(node => node === document.activeElement), true);
   assert.equal(await page.locator('#builder-review-status').inputValue(), 'unreviewed'); assert.equal(await page.locator('#builder-link').inputValue(), '/new-watch'); assert.equal(await page.locator('#builder-provider').inputValue(), 'video');
   await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
-  assert.deepEqual(queue.pageBuilder.read(job.id), beforeClear, 'Cancel leaves the saved source and provenance intact');
-  await opener.click(); assert.equal(await picker.locator('iframe').getAttribute('src'), second);
-  const concurrent = queue.pageBuilder.read(job.id); concurrent.document.common.title = 'Concurrent title'; queue.pageBuilder.write(job.id, concurrent.revision, concurrent.document);
-  await clearFrame.click(); await page.locator('#page-builder-save').click();
-  await page.waitForFunction(() => /изменены|обновилась/.test(document.querySelector('#page-builder-form-error')?.textContent || ''));
-  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].source_url, second, 'a stale clear loses CAS and cannot overwrite the saved source');
-  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
-  await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await opener.click();
-  await clearFrame.click(); await page.locator('#page-builder-save').click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' });
+  assert.equal(queue.pageBuilder.read(job.id).revision, beforeClear.revision + 1, 'closing flushes the cleared frame and its provenance');
   const cleared = queue.pageBuilder.read(job.id).document.common.blocks[0]; assert.equal(Object.hasOwn(cleared, 'source_url'), false); assert.equal(Object.hasOwn(cleared, 'sourceFrame'), false);
   assert.equal(cleared.link, '/new-watch'); assert.equal(cleared.provider, 'video'); assert.equal(cleared.review.status, 'unreviewed');
   await opener.locator('.builder-media-preview').waitFor({ state: 'detached' });
@@ -3064,9 +3314,9 @@ test('table type drafts keep their large pool while non-table saves discard it',
   await page.locator('#builder-type').selectOption('links'); assert.equal(await page.locator('.builder-image-row').count(), 0, 'a fresh links draft does not render the table pool');
   await page.locator('#builder-type').selectOption('table'); assert.equal(await page.locator('.builder-table-cell-images .builder-image-row').count(), 13, 'the table draft restores its ordered pool');
   await page.locator('#builder-type').selectOption('links'); await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close();
-  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].type, 'table'); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].media.length, 13, 'cancel leaves the durable table intact');
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].type, 'links'); assert.deepEqual(queue.pageBuilder.read(job.id).document.common.blocks[0].media, [], 'closing persists the non-table type without its hidden table pool'); assert.deepEqual(posts, [200]);
   await open(); await page.locator('#builder-type').selectOption('links'); await page.locator('#page-builder-save').click(); await close();
-  let stored = queue.pageBuilder.read(job.id), block = stored.document.common.blocks[0]; assert.equal(block.type, 'links'); assert.deepEqual(block.media, []); assert.deepEqual(posts, [200], 'links saves without the hidden over-limit table pool');
+  let stored = queue.pageBuilder.read(job.id), block = stored.document.common.blocks[0]; assert.equal(block.type, 'links'); assert.deepEqual(block.media, []); assert.deepEqual(posts, [200], 'an unchanged explicit save does not duplicate the durable autosave');
   const restored = structuredClone(stored.document); restored.common.blocks[0] = structuredClone(savedTableBlock); queue.pageBuilder.write(job.id, stored.revision, restored); await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
   await open(); assert.equal(await page.locator('.builder-table-cell-images .builder-image-row').count(), 13); await page.locator('#builder-type').selectOption('data-table'); assert.equal(await page.locator('#builder-add-data-column').count(), 1); assert.equal(await page.locator('.builder-image-row').count(), 0);
   await page.locator('#page-builder-save').click(); await close(); stored = queue.pageBuilder.read(job.id); block = stored.document.common.blocks[0]; assert.equal(block.type, 'data-table'); assert.deepEqual(block.media, []); assert.deepEqual(posts, [200, 200], 'data-table also saves without hidden table media');
@@ -3124,19 +3374,19 @@ test('step 3 type and view changes keep drafts and expose every structured edito
   await page.locator('#builder-type').selectOption('rich-content'); assert.equal(await page.getByRole('textbox', { name: 'HTML', exact: true }).getAttribute('contenteditable'), 'true'); assert.equal(await page.getByLabel('Обоснование', { exact: true }).getAttribute('required'), '');
   await page.locator('#builder-type').selectOption('service'); assert.equal(await page.locator('#builder-view').inputValue(), 'default'); assert.equal(await page.locator('#builder-badge').inputValue(), 'Черновик метки');
   assert.equal(await page.locator('.builder-image-row').count(), Math.max(2, original.document.common.blocks[0].media.length), 'service slots and hidden media survive type/view switches');
-  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); assert.deepEqual(queue.pageBuilder.read(job.id), original, 'type and view exploration never writes data');
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); const explored = queue.pageBuilder.read(job.id), exploredBlock = explored.document.common.blocks[0]; assert.equal(exploredBlock.type, 'service'); assert.equal(exploredBlock.view, 'default'); assert.equal(exploredBlock.badge, 'Черновик метки'); assert.equal(exploredBlock.text, 'Черновик текста');
   // A legacy structured block can still update its real common fields and review;
   // its existing text, media and settings are not replaced by pretend rows/items.
-  const structured = structuredClone(original.document); Object.assign(structured.common.blocks[0], { type: 'grid', view: 'gallery' }); queue.pageBuilder.write(job.id, original.revision, structured);
+  confirmBuilderFixture(queue, job); const structured = structuredClone(original.document); Object.assign(structured.common.blocks[0], { type: 'grid', view: 'gallery', review: { status: 'unreviewed', reason: '' } }); delete structured.common.blocks[0].reviewedRevision; queue.pageBuilder.write(job.id, explored.revision, structured);
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await opener.click();
   assert.equal(await page.locator('.builder-editor-placeholder').count(), 0); assert.equal(await page.locator('#builder-add-gallery-item').count(), 1);
   for (const width of [1440, 600, 390, 320]) {
     await page.setViewportSize({ width, height: 1000 }); await page.locator('#builder-add-gallery-item').scrollIntoViewIfNeeded();
     assert.equal(await page.locator('#page-builder-modal .modal-body').evaluate(node => node.scrollWidth <= node.clientWidth), true, `${width}: gallery editor has no horizontal overflow`);
   }
-  await page.locator('#builder-title').fill('Галерея с новым заголовком'); await page.locator('#builder-review-status').selectOption('passed'); await page.locator('#page-builder-save').click(); await close();
+  await page.locator('#builder-title').fill('Галерея с новым заголовком'); assert.equal(await page.locator('#builder-review-status').isDisabled(), true); await page.locator('#page-builder-save').click(); await close();
   const saved = queue.pageBuilder.read(job.id).document.common.blocks[0];
-  assert.equal(saved.review.status, 'passed'); assert.equal(saved.title, 'Галерея с новым заголовком');
+  assert.equal(saved.review.status, 'unreviewed'); assert.equal(saved.title, 'Галерея с новым заголовком');
   for (const field of ['text', 'content', 'settings', 'media']) assert.deepEqual(saved[field], original.document.common.blocks[0][field], `${field} survives a structured block edit`);
   assert.deepEqual(errors, []);
 });
@@ -3365,9 +3615,10 @@ test('step 3 Markdown editor preserves source, optional fields, safe previews an
     assert.equal(geometry.overflow, false, `${width}: no horizontal form overflow`); assert.ok(geometry.status.left >= 0 && geometry.save.right <= width && geometry.status.right <= geometry.cancel.left, `${width}: footer controls fit without overlap`);
     assert.ok(Math.abs(geometry.linkGap - geometry.previewGap) < 1, `${width}: link inputs and Markdown preview have equal vertical gaps`);
     assert.ok(Math.abs(geometry.status.bottom - geometry.save.bottom) < 2, `${width}: review and buttons share baseline`);
-    await page.locator('#builder-review-status').focus(); await page.keyboard.press('Tab'); assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Отмена'); await page.keyboard.press('Tab'); assert.equal(await page.evaluate(() => document.activeElement.id), 'page-builder-save');
+    assert.equal(await page.locator('#builder-review-status').isDisabled(), true); await page.locator('#builder-review-status').evaluate(node => node.closest('.modal-footer').querySelector('[data-bs-dismiss]').focus()); assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Отмена'); await page.keyboard.press('Tab'); assert.equal(await page.evaluate(() => document.activeElement.id), 'page-builder-save');
     await page.locator('#builder-content').scrollIntoViewIfNeeded(); await page.screenshot({ path: path.join(testOutput(), `ui-stage-three-markdown-${width}.png`) });
   }
+  await page.locator('#page-builder-save').click(); await close(); confirmBuilderFixture(queue, job); await opener.click(); await page.waitForFunction(() => !document.querySelector('#builder-review-status')?.disabled);
   await page.locator('#builder-review-status').selectOption('failed'); assert.equal(await page.locator('#builder-review-reason').isVisible(), true); assert.equal(await page.locator('#builder-review-reason').evaluate(node => node.required), true);
   assert.equal(await page.locator('#builder-review-reason').getAttribute('placeholder'), 'Что не так с блоком или какие правки нужны?');
   const beforeFailure = posts.length; await page.locator('#page-builder-save').click(); assert.equal(posts.length, beforeFailure); assert.equal(await page.evaluate(() => document.activeElement.id), 'builder-review-reason');
@@ -3802,9 +4053,9 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   const attemptHeaderInner = await page.locator('#attempt-header').evaluate(node => { const box = node.getBoundingClientRect(), style = getComputedStyle(node); return { left: box.left + parseFloat(style.paddingLeft), right: box.right - parseFloat(style.paddingRight) }; });
   assert.ok(attemptHeaderPositions[0].bottom < attemptHeaderPositions[1].top, 'QA progress occupies a separate row below the attempt controls');
   assert.ok(Math.abs(attemptHeaderPositions[1].left - attemptHeaderInner.left) <= 1 && Math.abs(attemptHeaderPositions[1].right - attemptHeaderInner.right) <= 1, 'QA progress uses the full header width');
-  const liveAttemptControlBoxes = await page.locator('#detail-url, #attempt-controls > *').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right }; }));
-  const liveAttemptControlGaps = [liveAttemptControlBoxes[1].left - liveAttemptControlBoxes[0].right, liveAttemptControlBoxes[2].left - liveAttemptControlBoxes[1].right];
-  assert.ok(Math.abs(liveAttemptControlGaps[0] - liveAttemptControlGaps[1]) <= .5, 'URL, time and restart retain equal visible spacing');
+  const liveAttemptControlBoxes = await page.locator('#detail-url, #company-id, #attempt-controls > *').evaluateAll(nodes => nodes.map(node => { const box = node.getBoundingClientRect(); return { left: box.left, right: box.right }; }));
+  const liveAttemptControlGaps = liveAttemptControlBoxes.slice(1).map((box, index) => box.left - liveAttemptControlBoxes[index].right);
+  assert.ok(Math.max(...liveAttemptControlGaps) - Math.min(...liveAttemptControlGaps) <= .5, 'URL, company ID, time and restart retain equal visible spacing');
   await page.locator('#stage-step-1').click();
   attempt.status = 'complete'; queue.save();
   await page.waitForFunction(() => document.querySelector('#stage-step-2').getAttribute('aria-disabled') === 'false');
@@ -3860,7 +4111,7 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
     assert.equal(await page.locator('#attempt-controls').evaluate(node => node.firstElementChild.id), 'attempt-duration');
     assert.equal(await page.locator('#results-header #detail-status').count(), 0);
     assert.equal(await page.locator('#results-common > #header-control-group + .result-steps').count(), 1, 'the control group precedes steps in the upper header');
-    assert.equal(await page.locator('#header-control-group > #detail-url + #attempt-controls').count(), 1, 'URL immediately precedes attempt controls in their shared group');
+    assert.equal(await page.locator('#header-control-group > #detail-url + #company-id + #attempt-controls').count(), 1, 'company ID stays between the URL and time controls');
     assert.equal(await page.locator('#attempt-header > #qa-progress').count(), 1);
     assert.equal(await page.locator('#gallery-message').count(), 0);
     assert.equal(await page.locator('#metadata-panel select').count(), 0);

@@ -553,12 +553,11 @@ browserTest('missing HTML warning retains focus and tooltip across another runni
   const warning = page.locator(`[data-job-id="${ctx.job.id}"] .queue-status-control`);
   await warning.focus(); await page.waitForSelector('.tooltip.show');
   const original = await warning.elementHandle();
-  // Two automatic heartbeat/poll-driven replacements, without a manual state
-  // mutation or focus operation between them, must keep the warning accessible.
-  await page.waitForFunction(element => !element.isConnected, original);
-  assert.equal(await warning.evaluate(node => document.activeElement === node), true);
-  const replacement = await warning.elementHandle();
-  await page.waitForFunction(element => !element.isConnected, replacement);
+  // Duration checkpoints must update the clock without replacing status nodes
+  // or interrupting keyboard focus and tooltip visibility.
+  while (attempt.activeDurationMs < initialElapsed + 1500) await page.waitForResponse(response => new URL(response.url()).pathname === '/api/state');
+  await page.waitForFunction(initial => document.querySelector('#attempt-duration').textContent !== initial, initialDuration);
+  assert.equal(await original.evaluate(element => element.isConnected && document.activeElement === element), true, 'duration-only snapshots preserve the original warning node and focus');
   assert.ok(attempt.activeDurationMs >= initialElapsed + 1500, 'the real duration heartbeat advanced');
   assert.equal(await warning.evaluate(node => document.activeElement === node), true);
   assert.equal(await warning.getAttribute('aria-label'), 'HTML не найден.');

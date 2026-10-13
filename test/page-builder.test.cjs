@@ -12,7 +12,7 @@ const { Queue, createServer } = require('../src/server.cjs');
 
 function root(t) { const value = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-')); t.after(() => fs.rmSync(value, { recursive: true, force: true })); return value; }
 async function fixture(t, { existing = true, mediaPicker, onShutdown } = {}) {
-  const queue = new Queue({ root: root(t), autoStart: false, mediaPicker }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0];
+  const queue = new Queue({ root: root(t), autoStart: false, mediaPicker, beget: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0];
   if (existing) seedMoriPage(queue, job);
   const server = createServer(queue, { onShutdown }); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => { await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); });
@@ -49,6 +49,22 @@ test('retry isolates documents, revisions, progress and media while historical a
   const snapshot = queue.snapshot('token').jobs[0];
   assert.equal(snapshot.pageBuilder.total, 0); assert.equal(snapshot.attempts[0].pageBuilder.total, 10); assert.equal(snapshot.attempts[1].pageBuilder.total, 0);
   assert.equal((await fetch(`${endpoint}?attempt=999`)).status, 409);
+});
+
+test('known company ID survives retry before the new attempt has a page-builder document', async t => {
+  const queue = new Queue({ root: root(t), autoStart: false, beget: { autoStart: false,
+    destination: { host: 'fixture.test', user: 'fixture', remoteScript: '/fixture/rest/arm_sync.php' }, transport: async () => ({ ok: true }) } });
+  t.after(() => queue.shutdown());
+  queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  const record = queue.beget.record(job.id, 1); record.destination = queue.beget.destination; record.company = { id: 203370 }; queue.beget.persist(record);
+  assert.equal(queue.pageBuilder.summary(job.id, 1).companyId, 203370);
+  job.attempts[0].status = 'paused'; queue.retry(job.id);
+  const freshFile = queue.pageBuilder.file(job.id, 2);
+  assert.equal(fs.existsSync(freshFile), false, 'retry does not create a step 3 document');
+  assert.deepEqual(queue.pageBuilder.summary(job.id, 2), { status: 'unreviewed', total: 0, passed: 0, failed: 0, unreviewed: 0, revision: 0, companyId: 203370 });
+  fs.mkdirSync(path.dirname(freshFile), { recursive: true }); fs.writeFileSync(freshFile, '{bad');
+  const broken = queue.pageBuilder.summary(job.id, 2);
+  assert.equal(broken.status, 'system_error'); assert.equal(broken.companyId, 203370, 'document read errors do not hide the known company ID');
 });
 
 test('legacy migration binds to the last existing attempt before retry and preserves original bytes', async t => {

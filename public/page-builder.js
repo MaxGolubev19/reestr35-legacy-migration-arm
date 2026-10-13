@@ -1,6 +1,7 @@
 (() => {
   'use strict';
   const STATUS = {
+    pending: { label: 'Ожидает отправки', className: 'review-pending' },
     unreviewed: { label: 'Не проверено', className: 'review-unreviewed' },
     passed: { label: 'Пройдено', className: 'review-passed' },
     failed: { label: 'Не пройдено', className: 'review-failed' },
@@ -34,6 +35,7 @@
   const node = (tag, className, text) => { const item = document.createElement(tag); if (className) item.className = className; if (text !== undefined) item.textContent = text; return item; };
   const clear = item => item.replaceChildren();
   const live = node('div', 'visually-hidden'); live.setAttribute('role', 'status'); live.setAttribute('aria-live', 'polite'); root.after(live);
+  const syncNotice = node('div', 'alert alert-warning d-none'); syncNotice.id = 'page-builder-sync-notice'; syncNotice.setAttribute('role', 'status'); root.before(syncNotice);
   const sections = (doc = state.document) => [doc.common, ...doc.tabs];
   const busy = () => Boolean(state.draft || state.saving || state.mutation);
   const samePage = job => state.jobId === job.id && state.attempt === job.builderAttempt;
@@ -167,7 +169,41 @@
     const previous = mediaRevisions;
     mediaRevisions = new Map(sections(stored.document).flatMap(section => section.blocks.flatMap(block => block.media.map(asset => [asset.id,
       refreshBlockId === undefined || block.id === refreshBlockId ? stored.revision : previous.get(asset.id) ?? stored.revision]))));
-    state.revision = stored.revision; state.document = stored.document; state.frames = stored.frames || {}; state.mediaContext = stored.mediaContext || state.mediaContext;
+    state.revision = stored.revision; state.document = stored.document; state.frames = stored.frames || {}; state.mediaContext = stored.mediaContext || state.mediaContext; state.sync = stored.sync || null;
+  }
+  function blockReview(block) {
+    const sync = state.sync?.blocks?.[block.id];
+    return sync?.status === 'synced' ? block.review : { status: 'pending', reason: sync?.error || '' };
+  }
+  function blockLabel(block, review) {
+    const count = block.type === 'links' && block.view === 'documents' ? (block.items || []).filter(item => item.link && (item.sourceDocument || item.meta?.kind === 'document')).length : 0;
+    return `${block.title.trim() || 'Без заголовка'}. ${TYPE[block.type]}. ${STATUS[review.status].label}.${review.reason ? ` Ошибка отправки: ${review.reason}.` : ''}${count ? ` Документов: ${count}.` : ''} Открыть настройки`;
+  }
+  function renderSyncNotice() {
+    const message = state.sync?.lastError || '';
+    syncNotice.textContent = message ? `Синхронизация с Beget: ${message}` : '';
+    syncNotice.classList.toggle('d-none', !message);
+  }
+  function updateSync(sync, force = false) {
+    if (!force && JSON.stringify(sync) === JSON.stringify(state.sync)) return;
+    state.sync = sync || null;
+    if (!state.document) return;
+    for (const block of sections().flatMap(section => section.blocks)) {
+      const button = root.querySelector(`[data-builder-id="${CSS.escape(block.id)}"]`), card = button?.closest('.builder-block');
+      if (!card) continue;
+      const review = blockReview(block);
+      Object.values(STATUS).forEach(status => card.classList.remove(status.className)); card.classList.add(STATUS[review.status].className);
+      button.setAttribute('aria-label', blockLabel(block, review));
+      card.querySelector('.builder-failure-reason')?.classList.toggle('d-none', review.status === 'pending');
+      const syncError = card.querySelector('.builder-sync-error'); if (syncError) { syncError.textContent = review.status === 'pending' ? review.reason : ''; syncError.classList.toggle('d-none', !syncError.textContent); }
+    }
+    for (const tab of state.document.tabs) {
+      const button = root.querySelector(`[data-tab-id="${CSS.escape(tab.id)}"]`), review = sectionReview(tab);
+      if (!button) continue;
+      button.setAttribute('aria-label', `${tab.title}: ${STATUS[review.status].label}`);
+      button.querySelector('.builder-status-dot').className = `builder-status-dot ${STATUS[review.status].className}`;
+    }
+    renderProgress(summary()); renderSyncNotice(); updateReviewAvailability();
   }
   function mediaUrl(asset, kind = asset.originalUrl ? 'original' : 'big') { return `/api/page-builder/${encodeURIComponent(state.jobId)}/media/${encodeURIComponent(asset.id)}?kind=${kind}&revision=${mediaRevisions.get(asset.id) ?? state.revision}&attempt=${state.attempt}`; }
   function framePreview(entity, frames) {
@@ -183,34 +219,38 @@
     return viewport;
   }
   function summary() {
-    const reviews = [state.document.common, ...state.document.tabs].flatMap(section => section.blocks.map(block => block.review));
+    const reviews = [state.document.common, ...state.document.tabs].flatMap(section => section.blocks.map(blockReview));
     const failed = reviews.filter(item => item.status === 'failed').length, passed = reviews.filter(item => item.status === 'passed').length, unreviewed = reviews.length - failed - passed;
     return { status: failed ? 'failed' : unreviewed || !reviews.length ? 'unreviewed' : 'passed', passed, failed, unreviewed, reviewed: passed + failed, total: reviews.length, reviews };
   }
   function sectionReview(section) {
+    if (state.sync?.tabs?.[section.id]?.status !== 'synced' || section.blocks.some(block => blockReview(block).status === 'pending')) return { status: 'pending', reason: '' };
     const failed = section.blocks.find(block => block.review.status === 'failed');
     return failed ? { status: 'failed', reason: failed.review.reason } : { status: section.blocks.length && section.blocks.every(block => block.review.status === 'passed') ? 'passed' : 'unreviewed', reason: '' };
   }
   function renderProgress(totals = { reviewed: 0, total: 0, passed: 0, failed: 0, unreviewed: 0, reviews: [] }) {
     progressCount.textContent = `${totals.reviewed}/${totals.total}`; clear(progressBar);
-    const classes = { passed: 'bg-green', failed: 'bg-yellow', unreviewed: 'bg-secondary' }, labels = { passed: 'Пройдено', failed: 'Не пройдено', unreviewed: 'Не проверено' };
+    const classes = { passed: 'bg-green', failed: 'bg-yellow', unreviewed: 'bg-blue', pending: 'bg-secondary' }, labels = { passed: 'Пройдено', failed: 'Не пройдено', unreviewed: 'Не проверено', pending: 'Ожидает отправки' };
     totals.reviews.forEach(review => { const segment = node('span', `progress-bar qa-progress-segment ${classes[review.status] || classes.unreviewed}`); segment.title = labels[review.status] || labels.unreviewed; segment.setAttribute('aria-hidden', 'true'); progressBar.append(segment); });
     const percent = totals.total ? Math.round((totals.reviewed / totals.total) * 100) : 0;
     progressBar.setAttribute('aria-valuenow', String(percent));
-    progressBar.setAttribute('aria-label', `Проверено ${totals.reviewed} из ${totals.total} блоков: пройдено ${totals.passed}, не пройдено ${totals.failed}, не проверено ${totals.unreviewed}`);
+    const pending = totals.reviews.filter(review => review.status === 'pending').length;
+    progressBar.setAttribute('aria-label', `Проверено ${totals.reviewed} из ${totals.total} блоков: пройдено ${totals.passed}, не пройдено ${totals.failed}, не проверено ${totals.unreviewed - pending}${pending ? `, ожидает отправки ${pending}` : ''}`);
   }
   function blockCard(block, sectionId) {
+    const review = blockReview(block);
     const title = block.title.trim() || 'Без заголовка';
     const documents = block.type === 'links' && block.view === 'documents' ? (block.items || []).filter(item => item.link && (item.sourceDocument || item.meta?.kind === 'document')) : [];
     const cardKind = block.type === 'embed' ? 'builder-embed-block ' : block.type === 'links' && block.view === 'documents' ? 'builder-document-block ' : '';
-    const column = node('div', 'col-12'), card = node('div', `card builder-block ${cardKind}${STATUS[block.review.status].className}`), button = node('button', 'builder-block-open'); button.type = 'button';
-    button.setAttribute('aria-label', `${title}. ${TYPE[block.type]}. ${STATUS[block.review.status].label}.${documents.length ? ` Документов: ${documents.length}.` : ''} Открыть настройки`);
+    const column = node('div', 'col-12'), card = node('div', `card builder-block ${cardKind}${STATUS[review.status].className}`), button = node('button', 'builder-block-open'); button.type = 'button';
+    button.setAttribute('aria-label', blockLabel(block, review));
     Object.assign(button.dataset, { builderKind: 'block', builderSectionId: sectionId, builderId: block.id });
     const body = node('span', 'card-body builder-block-body text-start'), copy = node('span', 'builder-block-copy');
     copy.append(node('strong', 'builder-block-title', title));
     const preview = window.BuilderMarkdown.plainText(block.text, block.type === 'rich-content');
     if (preview) copy.append(node('span', 'text-secondary builder-text-preview', preview.length > 300 ? `${preview.slice(0, 300)}…` : preview));
-    if (block.review.reason) copy.append(node('span', 'builder-failure-reason', block.review.reason));
+    if (block.review.reason) { const reason = node('span', 'builder-failure-reason', block.review.reason); reason.classList.toggle('d-none', review.status === 'pending'); copy.append(reason); }
+    const syncError = node('span', 'builder-sync-error', review.status === 'pending' ? review.reason : ''); syncError.classList.toggle('d-none', !syncError.textContent); copy.append(syncError);
     body.append(blockTypeIcon(block.type), copy);
     const visibleMedia = block.media.filter(asset => asset.originalUrl || asset.bigUrl);
     if (block.type === 'embed') {
@@ -360,6 +400,7 @@
       const selected = state.activeTab === tab.id, panel = tabs.querySelector(`#builder-panel-${CSS.escape(tab.id)}`) || node('div', 'builder-tab-panel'); panel.id = `builder-panel-${tab.id}`; panel.setAttribute('role', 'tabpanel'); panel.setAttribute('aria-labelledby', `builder-tab-${tab.id}`); panel.tabIndex = selected ? 0 : -1; panel.hidden = !selected;
       renderSection(tab, panel, target); if (!panel.isConnected) tabs.append(panel);
     }); if (!tabs.isConnected) root.append(tabs); nav.scrollLeft = tabScroll;
+    if (target) updateSync(state.sync, true); else renderSyncNotice();
     loading.classList.add('d-none'); renderMutationError(); root.classList.remove('d-none');
     if (openMenu) {
       const tab = doc.tabs.find(item => item.id === openMenu.id), trigger = root.querySelector(`[data-tab-menu-id="${CSS.escape(openMenu.id)}"]`);
@@ -385,13 +426,26 @@
     const reason = textarea('builder-review-reason', entity.review.reason || '', 3); reason.placeholder = 'Что не так с блоком или какие правки нужны?'; reason.maxLength = 1000;
     const update = () => { const failed = status.value === 'failed'; reason.required = failed; reason.closest('.mb-3').classList.toggle('d-none', !failed); if (!failed) reason.value = ''; };
     reviewFooter.hidden = false; reviewFooter.append(field('Визуальная проверка', status));
-    fields.append(field('Причина непройденной визуальной проверки', reason)); status.addEventListener('change', () => { update(); state.draft.reviewConfirmed = true; if (status.value === 'failed') reason.scrollIntoView({ block: 'nearest' }); }); update();
+    fields.append(field('Причина непройденной визуальной проверки', reason)); status.addEventListener('change', () => { update(); state.draft.reviewConfirmed = true; scheduleAutosave(false); if (status.value === 'failed') reason.scrollIntoView({ block: 'nearest' }); });
+    reason.addEventListener('input', () => { state.draft.reviewConfirmed = true; scheduleAutosave(false); }); update(); updateReviewAvailability();
+  }
+  function updateReviewAvailability() {
+    const status = document.getElementById('builder-review-status'), draft = state.draft;
+    if (!status || !draft || state.saving || state.pendingSaved) return;
+    const pending = state.sync?.blocks?.[draft.target.id]?.status !== 'synced' || draft.contentChanged || draft.revision !== state.revision;
+    status.disabled = Boolean(pending);
+    status.title = pending ? 'Проверка доступна после отправки текущей версии в Beget' : '';
+    status.options[0].textContent = pending ? STATUS.pending.label : STATUS.unreviewed.label;
+    if (pending) { status.value = 'unreviewed'; draft.reviewConfirmed = false; }
+    const reason = document.getElementById('builder-review-reason');
+    if (reason) { reason.disabled = Boolean(pending); if (pending) { reason.required = false; reason.closest('.mb-3').classList.add('d-none'); } }
   }
   function resetReview() {
-    if (!state.draft) return; state.draft.reviewConfirmed = false;
+    if (!state.draft) return; state.draft.reviewConfirmed = false; state.draft.contentChanged = true;
     const status = document.getElementById('builder-review-status'), reason = document.getElementById('builder-review-reason');
     if (status) status.value = 'unreviewed';
     if (reason) { reason.value = ''; reason.required = false; reason.closest('.mb-3').classList.add('d-none'); }
+    updateReviewAvailability(); scheduleAutosave(true);
   }
   function bind(control, object, key) {
     control.addEventListener(control.tagName === 'SELECT' || control.type === 'checkbox' ? 'change' : 'input', () => { object[key] = control.type === 'checkbox' ? control.checked : control.value; resetReview(); }); return control;
@@ -606,6 +660,7 @@
   }
   async function openFrameCatalog(draft, entity, trigger, updatePreview) {
     if (state.picking || state.saving || state.draft !== draft) return;
+    await drainAutosave(draft); if (state.picking || state.saving || state.draft !== draft) return;
     const controller = new AbortController(); state.picking = controller; save.disabled = true;
     const clearFrame = fields.querySelector('#builder-frame-clear'); if (clearFrame) clearFrame.disabled = true;
     const layer = node('div', 'builder-catalog-layer builder-frame-catalog'); layer.setAttribute('role', 'dialog'); layer.setAttribute('aria-modal', 'true'); layer.setAttribute('aria-labelledby', 'builder-frame-catalog-title');
@@ -617,6 +672,7 @@
       controller.abort(); layer.remove();
       if (state.picking === controller) state.picking = null;
       if (state.draft === draft) { save.disabled = false; if (clearFrame?.isConnected) clearFrame.disabled = false; }
+      if (state.draft === draft && draft.autosave.savedGeneration < draft.autosave.generation) void drainAutosave(draft);
       if (restoreFocus && trigger.isConnected) trigger.focus({ preventScroll: true });
     };
     closeButton.addEventListener('click', () => close());
@@ -687,6 +743,7 @@
   }
   async function openMediaCatalog(draft, entity, asset, kind, key, trigger, renderMedia) {
     if (state.picking || state.saving || state.draft !== draft) return;
+    await drainAutosave(draft); if (state.picking || state.saving || state.draft !== draft) return;
     const controller = new AbortController(); state.picking = controller; save.disabled = true;
     const layer = node('div', 'builder-catalog-layer'); layer.setAttribute('role', 'dialog'); layer.setAttribute('aria-modal', 'true'); layer.setAttribute('aria-labelledby', 'builder-catalog-title');
     const panel = node('div', 'builder-catalog-panel'), header = node('div', 'builder-catalog-header'), title = node('h4', '', `Выбор ${kind === 'original' ? 'основной' : 'большой'} картинки`), closeButton = node('button', 'btn-close');
@@ -697,6 +754,7 @@
       controller.abort(); layer.remove();
       if (state.picking === controller) state.picking = null;
       if (state.draft === draft) save.disabled = false;
+      if (state.draft === draft && draft.autosave.savedGeneration < draft.autosave.generation) void drainAutosave(draft);
       if (restoreFocus) document.getElementById(trigger.id)?.focus({ preventScroll: true });
     };
     layer.addEventListener('keydown', event => {
@@ -780,6 +838,7 @@
   }
   async function openDocumentCatalog(draft, entity, item, trigger, renderItems) {
     if (state.picking || state.saving || state.draft !== draft) return;
+    await drainAutosave(draft); if (state.picking || state.saving || state.draft !== draft) return;
     const controller = new AbortController(); state.picking = controller; save.disabled = true;
     const layer = node('div', 'builder-catalog-layer builder-document-catalog'); layer.setAttribute('role', 'dialog'); layer.setAttribute('aria-modal', 'true'); layer.setAttribute('aria-labelledby', 'builder-document-catalog-title');
     const panel = node('div', 'builder-catalog-panel'), header = node('div', 'builder-catalog-header'), title = node('h4', '', 'Выбрать документ'), closeButton = node('button', 'btn-close');
@@ -790,6 +849,7 @@
       controller.abort(); layer.remove();
       if (state.picking === controller) state.picking = null;
       if (state.draft === draft) save.disabled = false;
+      if (state.draft === draft && draft.autosave.savedGeneration < draft.autosave.generation) void drainAutosave(draft);
       if (restoreFocus) document.getElementById(trigger.id)?.focus({ preventScroll: true });
     };
     closeButton.addEventListener('click', () => close());
@@ -1575,7 +1635,8 @@
   function open(entity, kind, sectionId, trigger, mode = 'edit') {
     if (busy()) return;
     ++state.request;
-    const target = { kind, sectionId, id: entity.id }, draft = { jobId: state.jobId, attempt: state.attempt, revision: state.revision, mediaContext: { ...state.mediaContext }, previews: {}, frames: structuredClone(state.frames || {}), document: structuredClone(state.document), originalEntity: structuredClone(entity), target: structuredClone(target), mode };
+    const target = { kind, sectionId, id: entity.id }, draft = { jobId: state.jobId, attempt: state.attempt, revision: state.revision, mediaContext: { ...state.mediaContext }, previews: {}, frames: structuredClone(state.frames || {}), document: structuredClone(state.document), baseDocument: structuredClone(state.document), originalEntity: structuredClone(mode === 'create' ? entity : locate(target, state.document) || entity), target: structuredClone(target), mode,
+      autosave: { generation: 0, savedGeneration: 0, contentGeneration: 0, blockedGeneration: null, conflict: '', timer: null, inFlight: null, allowClose: false, persisted: false, lastStored: null } };
     if (mode === 'create') {
       if (kind === 'tab') draft.document.tabs.push(structuredClone(entity));
       else sections(draft.document).find(section => section.id === sectionId).blocks.push(structuredClone(entity));
@@ -1589,10 +1650,14 @@
       fields.append(node('p', '', kind === 'tab' ? `Вкладка «${draftEntity.title}» будет удалена вместе с ${draftEntity.blocks.length} блоками, изображениями и проверками.` : `Блок «${draftEntity.title}» будет удалён из раздела вместе с изображениями и проверкой.`));
       window.tabler.Modal.getOrCreateInstance(modalElement).show(trigger); return;
     }
-    if (kind === 'tab') { fields.append(field('Название вкладки', input('builder-title', draftEntity.title))); window.tabler.Modal.getOrCreateInstance(modalElement).show(trigger); return; }
+    if (kind === 'tab') {
+      const title = input('builder-title', draftEntity.title); title.maxLength = 200;
+      title.addEventListener('input', () => { draftEntity.title = title.value; scheduleAutosave(true); }); fields.append(field('Название вкладки', title));
+      window.tabler.Modal.getOrCreateInstance(modalElement).show(trigger); return;
+    }
     blockFields(draftEntity);
     if (mode !== 'create') reviewFields(draftEntity);
-    else fields.append(node('p', 'text-secondary small', 'Новый блок сохраняется со статусом «Не проверено».'));
+    else fields.append(node('p', 'text-secondary small', 'Новый блок сохраняется со статусом «Ожидает отправки».'));
     window.tabler.Modal.getOrCreateInstance(modalElement).show(trigger);
   }
   function locate(target, document) {
@@ -1622,7 +1687,160 @@
     save.disabled = busy; save.classList.toggle('btn-loading', busy); modalElement.toggleAttribute('aria-busy', busy);
     modalElement.querySelectorAll('[data-bs-dismiss="modal"]').forEach(control => { control.disabled = busy; control.setAttribute('aria-disabled', String(busy)); });
   }
-  modalElement.addEventListener('hide.bs.modal', event => { if (state.saving || state.picking) event.preventDefault(); });
+  function scheduleAutosave(contentChanged) {
+    const draft = state.draft;
+    if (!draft?.autosave || draft.mode === 'delete') return;
+    const autosave = draft.autosave; autosave.generation++;
+    if (contentChanged) { draft.contentChanged = true; autosave.contentGeneration = autosave.generation; }
+    window.clearTimeout(autosave.timer); autosave.timer = null;
+    if (!state.picking && !autosave.conflict) autosave.timer = window.setTimeout(() => { autosave.timer = null; void drainAutosave(draft); }, 300);
+  }
+  function replaceDraftTarget(document, draft, entity) {
+    if (draft.target.kind === 'tab') {
+      const index = document.tabs.findIndex(tab => tab.id === draft.target.id);
+      if (index < 0) document.tabs.push(entity); else document.tabs[index] = entity;
+      return entity;
+    }
+    const section = sections(document).find(item => item.id === draft.target.sectionId);
+    if (!section) return null;
+    const index = section.blocks.findIndex(block => block.id === draft.target.id);
+    if (index < 0) section.blocks.push(entity); else section.blocks[index] = entity;
+    return entity;
+  }
+  function invalidDraft(message, control, showErrors) {
+    if (showErrors) {
+      formError.textContent = message; formError.classList.remove('d-none');
+      control?.focus?.();
+    }
+    return { invalid: true };
+  }
+  function saveErrorMessage(error, prefix = 'Не удалось сохранить') {
+    const href = /Некорректный URL \S+\.media\[(\d+)\]\.href/.exec(error.message);
+    const longHref = /Некорректное поле \S+\.media\[(\d+)\]\.href/.exec(error.message);
+    const itemLink = /Некорректный URL (?:common|tabs\[\d+\])\.blocks\[\d+\]\.items\[(\d+)\]\.link/.exec(error.message);
+    const longItemLink = /Некорректное поле (?:common|tabs\[\d+\])\.blocks\[\d+\]\.items\[(\d+)\]\.link/.exec(error.message);
+    return itemLink ? `${prefix}: ссылка ${Number(itemLink[1]) + 1}, поле «URL». Укажите полный адрес http:// или https://, ссылку mailto: или tel:, либо путь на сайте с «/». Пробелы недопустимы.`
+      : longItemLink ? `${prefix}: ссылка ${Number(longItemLink[1]) + 1}, поле «URL» слишком длинное. Максимум 4096 символов.`
+        : href ? `${prefix}: изображение ${Number(href[1]) + 1}, поле «Ссылка изображения». Укажите полный адрес http:// или https://, ссылку mailto: или tel:, либо путь на сайте с «/». Пробелы недопустимы.`
+          : longHref ? `${prefix}: изображение ${Number(longHref[1]) + 1}, поле «Ссылка изображения» слишком длинное. Максимум 4096 символов.`
+            : `${prefix}: ${error.message}`;
+  }
+  function prepareDraft(draft, showErrors = false) {
+    const source = locate(draft.target, draft.document);
+    if (!source) return invalidDraft('Редактируемый объект больше не существует.', null, showErrors);
+    const next = structuredClone(draft.baseDocument), reviewStatus = document.getElementById('builder-review-status')?.value || 'unreviewed';
+    const reviewReason = document.getElementById('builder-review-reason')?.value.trim() || '';
+    let edited = structuredClone(source);
+    if (draft.target.kind === 'tab') {
+      edited.title = document.getElementById('builder-title').value.trim();
+      if (!edited.title) return invalidDraft('Название не может быть пустым.', document.getElementById('builder-title'), showErrors);
+      if (edited.title.length > 200) return invalidDraft('Название не может быть длиннее 200 символов.', document.getElementById('builder-title'), showErrors);
+    } else if (!draft.contentChanged && draft.reviewConfirmed) {
+      if (reviewStatus === 'failed' && !reviewReason) return invalidDraft('Укажите причину непройденной проверки.', document.getElementById('builder-review-reason'), showErrors);
+      edited = structuredClone(draft.originalEntity); edited.review = { status: reviewStatus, reason: reviewStatus === 'failed' ? reviewReason : '' }; edited.reviewedRevision = draft.revision;
+    } else {
+      if (reviewStatus === 'failed' && !reviewReason) return invalidDraft('Укажите причину непройденной проверки.', document.getElementById('builder-review-reason'), showErrors);
+      if (edited.type === 'rich-content') {
+        if (!edited.text.trim()) return invalidDraft('Заполните поле «HTML».', document.querySelector('#builder-content .cm-content'), showErrors);
+        if (edited.text.length > 12000) return invalidDraft('Поле «HTML» не может быть длиннее 12000 символов.', document.querySelector('#builder-content .cm-content'), showErrors);
+        const reason = document.getElementById('builder-reason');
+        if (!reason?.value.trim()) return invalidDraft('Заполните поле «Обоснование».', reason, showErrors);
+      }
+      edited.title = document.getElementById('builder-title').value.trim();
+      edited.review = document.getElementById('builder-review-status')?.disabled && !draft.contentChanged ? structuredClone(draft.originalEntity.review) : { status: reviewStatus, reason: reviewStatus === 'failed' ? reviewReason : '' };
+      if (edited.type === 'big-media') edited.media = edited.media.slice(0, 1);
+      if (edited.type === 'service' || edited.type === 'content') edited.media = edited.media.slice(0, 2);
+      if (edited.type === 'table') { const referenced = tableReferencedMedia(edited); edited.media = edited.media.filter(asset => referenced.has(asset.id)); }
+      if (edited.type === 'rich-content' || edited.type === 'data-table') edited.media = [];
+      if (draft.reviewConfirmed && reviewStatus !== 'unreviewed') edited.reviewedRevision = draft.revision;
+    }
+    if (!replaceDraftTarget(next, draft, edited)) return invalidDraft('Раздел редактируемого объекта больше не существует.', null, showErrors);
+    return { document: next, entity: edited };
+  }
+  function same(value, other) { return JSON.stringify(value) === JSON.stringify(other); }
+  async function reconcileAutosaveConflict(draft, prepared, sentGeneration) {
+    const stored = await state.api(pageUrl(draft.jobId, draft.attempt));
+    if (state.draft !== draft) return { resolved: false };
+    const current = locate(draft.target, stored.document), sent = locate(draft.target, prepared.document);
+    if (current && sent && same(current, sent)) return { resolved: true, stored };
+    const unchanged = draft.mode === 'create' ? !current : current && same(current, draft.originalEntity);
+    if (!unchanged) {
+      throw Object.assign(new Error('Страница обновилась в другом окне. Локальные правки оставлены в редакторе; перезагрузите страницу и сверяйте их с новой версией.'), { status: 409, persistentConflict: true });
+    }
+    draft.baseDocument = structuredClone(stored.document); draft.revision = stored.revision; acceptDocument(stored);
+    return { resolved: false, retry: true };
+  }
+  function acceptAutosave(draft, stored, sentGeneration, sentContentGeneration) {
+    if (state.draft !== draft) return;
+    acceptDocument(stored, draft.target.kind === 'block' ? draft.target.id : null);
+    draft.revision = stored.revision; draft.baseDocument = structuredClone(stored.document);
+    draft.originalEntity = structuredClone(locate(draft.target, stored.document) || draft.originalEntity);
+    draft.autosave.savedGeneration = Math.max(draft.autosave.savedGeneration, sentGeneration);
+    draft.autosave.blockedGeneration = null; draft.autosave.persisted = true; draft.autosave.lastStored = stored;
+    if (draft.autosave.contentGeneration <= sentContentGeneration) draft.contentChanged = false;
+    state.mutationError = ''; formError.classList.add('d-none'); updateReviewAvailability();
+  }
+  async function drainAutosave(draft, showErrors = false) {
+    if (state.draft !== draft || !draft.autosave) return false;
+    if (state.picking) return false;
+    const autosave = draft.autosave; window.clearTimeout(autosave.timer); autosave.timer = null;
+    if (autosave.conflict) {
+      formError.textContent = saveErrorMessage(new Error(autosave.conflict), 'Не удалось сохранить локальные изменения'); formError.classList.remove('d-none'); live.textContent = formError.textContent;
+      return false;
+    }
+    if (autosave.blockedGeneration === autosave.generation) return false;
+    if (autosave.inFlight) { await autosave.inFlight; return autosave.savedGeneration === autosave.generation; }
+    autosave.inFlight = (async () => {
+      while (state.draft === draft && autosave.savedGeneration < autosave.generation) {
+        const sentGeneration = autosave.generation, sentContentGeneration = autosave.contentGeneration, prepared = prepareDraft(draft, showErrors);
+        if (prepared.invalid) return false;
+        if (draft.mode === 'edit' && same(prepared.entity, draft.originalEntity)) { autosave.savedGeneration = sentGeneration; continue; }
+        live.textContent = 'Сохранение локальных изменений…'; modalElement.setAttribute('aria-busy', 'true');
+        try {
+          let stored;
+          try {
+            stored = await state.api(pageUrl(draft.jobId, draft.attempt), { method: 'POST', body: JSON.stringify({ revision: draft.revision, document: prepared.document }) });
+          } catch (error) {
+            if (error.status !== 409) throw error;
+            const reconciled = await reconcileAutosaveConflict(draft, prepared, sentGeneration);
+            if (reconciled.resolved) stored = reconciled.stored;
+            else if (reconciled.retry) continue;
+            else return false;
+          }
+          acceptAutosave(draft, stored, sentGeneration, sentContentGeneration); live.textContent = 'Локальные изменения сохранены.';
+        } catch (error) {
+          if (state.draft === draft) { autosave.blockedGeneration = autosave.generation; if (error.persistentConflict) autosave.conflict = error.message; formError.textContent = saveErrorMessage(error, 'Не удалось сохранить локальные изменения'); formError.classList.remove('d-none'); live.textContent = formError.textContent; }
+          return false;
+        }
+      }
+      return state.draft === draft && autosave.savedGeneration === autosave.generation;
+    })();
+    try { return await autosave.inFlight; }
+    finally {
+      autosave.inFlight = null;
+      if (state.draft === draft && !state.saving) modalElement.removeAttribute('aria-busy');
+      if (state.draft === draft && autosave.savedGeneration < autosave.generation && autosave.blockedGeneration !== autosave.generation && !autosave.conflict && !autosave.timer && !state.picking) autosave.timer = window.setTimeout(() => { autosave.timer = null; void drainAutosave(draft); }, 300);
+    }
+  }
+  async function closeAfterAutosave(draft, showErrors = false, fence = false) {
+    if (fence && prepareDraft(draft, showErrors).invalid) return false;
+    if (fence) { state.saving = draft; savingUi(true); }
+    const saved = await drainAutosave(draft, showErrors);
+    if (fence && state.saving === draft) state.saving = null;
+    if (!saved || state.draft !== draft || state.picking) {
+      if (state.draft === draft) { modalElement.removeAttribute('aria-busy'); savingUi(false); updateReviewAvailability(); }
+      return false;
+    }
+    draft.autosave.allowClose = true;
+    if (!state.modalShown) { draft.closeWhenShown = true; return true; }
+    window.tabler.Modal.getInstance(modalElement)?.hide(); return true;
+  }
+  modalElement.addEventListener('hide.bs.modal', event => {
+    if (state.saving || state.picking) { event.preventDefault(); return; }
+    const draft = state.draft, autosave = draft?.autosave;
+    if (!autosave || autosave.allowClose) { if (autosave) autosave.allowClose = false; return; }
+    if (autosave.savedGeneration < autosave.generation || autosave.inFlight) { event.preventDefault(); void closeAfterAutosave(draft, true); }
+  });
   modalElement.addEventListener('hidden.bs.modal', clearMediaPreviewObservers);
   modalElement.addEventListener('shown.bs.modal', () => {
     state.modalShown = true;
@@ -1631,42 +1849,20 @@
   form.addEventListener('submit', async event => {
     event.preventDefault(); if (state.saving || state.pendingSaved || state.picking) return;
     formError.classList.add('d-none'); const draft = state.draft, target = draft && locate(draft.target, draft.document); if (!target) return;
-    const advertised = state.pendingJob, currentJobId = advertised?.id || state.jobId, currentRevision = advertised ? Number(advertised.pageBuilder?.revision || 0) : state.revision;
-    if (draft.jobId !== currentJobId || draft.attempt !== (advertised?.builderAttempt ?? state.attempt) || draft.revision !== currentRevision) { formError.textContent = 'Страница обновилась. Закройте редактор и откройте блок снова.'; formError.classList.remove('d-none'); return; }
+    const advertised = state.pendingJob, currentJobId = advertised?.id || state.jobId;
+    if (draft.jobId !== currentJobId || draft.attempt !== (advertised?.builderAttempt ?? state.attempt)) { formError.textContent = 'Страница обновилась: открыта другая попытка. Локальные правки оставлены в редакторе.'; formError.classList.remove('d-none'); return; }
     if (draft.mode === 'delete') {
       const next = structuredClone(draft.document);
       if (draft.target.kind === 'tab') next.tabs = next.tabs.filter(tab => tab.id !== draft.target.id);
       else { const section = sections(next).find(section => section.id === draft.target.sectionId); section.blocks = section.blocks.filter(block => block.id !== draft.target.id); }
       await persistDraft(draft, next); return;
     }
-    if (draft.target.kind === 'tab') {
-      const title = document.getElementById('builder-title').value.trim();
-      if (!title) { formError.textContent = 'Название не может быть пустым.'; formError.classList.remove('d-none'); return; }
-      if (title.length > 200) { formError.textContent = 'Название не может быть длиннее 200 символов.'; formError.classList.remove('d-none'); return; }
-      const next = structuredClone(draft.document); locate(draft.target, next).title = title;
-      if (draft.mode === 'edit' && title === draft.originalEntity.title) { if (state.modalShown) window.tabler.Modal.getInstance(modalElement).hide(); else draft.closeWhenShown = true; return; }
-      await persistDraft(draft, next); return;
+    if (target.type === 'data-table' && draft.contentChanged && !validateDataTableFields()) return;
+    if (!draft.autosave.generation) {
+      const prepared = prepareDraft(draft, true); if (prepared.invalid) return;
+      if (draft.mode === 'create' || !same(prepared.entity, draft.originalEntity)) scheduleAutosave(true);
     }
-    const status = document.getElementById('builder-review-status')?.value || 'unreviewed', reason = document.getElementById('builder-review-reason')?.value.trim() || '';
-    if (target.type === 'data-table' && !validateDataTableFields()) return;
-    if (status === 'failed' && !reason) { formError.textContent = 'Укажите причину непройденной проверки.'; formError.classList.remove('d-none'); document.getElementById('builder-review-reason').focus(); return; }
-    if (target.type === 'rich-content') {
-      if (!target.text.trim()) { formError.textContent = 'Заполните поле «HTML».'; formError.classList.remove('d-none'); document.querySelector('#builder-content .cm-content')?.focus(); return; }
-      if (target.text.length > 12000) { formError.textContent = 'Поле «HTML» не может быть длиннее 12000 символов.'; formError.classList.remove('d-none'); document.querySelector('#builder-content .cm-content')?.focus(); return; }
-      const reason = document.getElementById('builder-reason');
-      if (!reason.value.trim()) { formError.textContent = 'Заполните поле «Обоснование».'; formError.classList.remove('d-none'); reason.focus(); return; }
-    }
-    const next = structuredClone(draft.document), edited = locate(draft.target, next); edited.title = document.getElementById('builder-title').value.trim(); edited.review = { status, reason: status === 'failed' ? reason : '' };
-    if (edited.type === 'big-media') edited.media = edited.media.slice(0, 1);
-    if (edited.type === 'service' || edited.type === 'content') edited.media = edited.media.slice(0, 2);
-    if (edited.type === 'table') { const referenced = tableReferencedMedia(edited); edited.media = edited.media.filter(asset => referenced.has(asset.id)); }
-    if (edited.type === 'rich-content' || edited.type === 'data-table') edited.media = [];
-    if (draft.reviewConfirmed && status !== 'unreviewed') edited.reviewedRevision = draft.revision;
-    if (draft.mode === 'edit' && !draft.reviewConfirmed && JSON.stringify(edited) === JSON.stringify(draft.originalEntity)) {
-      if (state.modalShown) window.tabler.Modal.getInstance(modalElement).hide(); else draft.closeWhenShown = true;
-      return;
-    }
-    await persistDraft(draft, next);
+    await closeAfterAutosave(draft, true, true);
   });
   async function persistDraft(draft, next) {
     state.saving = draft; savingUi(true);
@@ -1677,43 +1873,37 @@
       if (state.modalShown) window.tabler.Modal.getInstance(modalElement).hide();
     } catch (error) {
       if (state.draft === draft && state.saving === draft) {
-        const href = /Некорректный URL \S+\.media\[(\d+)\]\.href/.exec(error.message);
-        const longHref = /Некорректное поле \S+\.media\[(\d+)\]\.href/.exec(error.message);
-        const itemLink = /Некорректный URL (?:common|tabs\[\d+\])\.blocks\[\d+\]\.items\[(\d+)\]\.link/.exec(error.message);
-        const longItemLink = /Некорректное поле (?:common|tabs\[\d+\])\.blocks\[\d+\]\.items\[(\d+)\]\.link/.exec(error.message);
-        formError.textContent = itemLink ? `Не удалось сохранить: ссылка ${Number(itemLink[1]) + 1}, поле «URL». Укажите полный адрес http:// или https://, ссылку mailto: или tel:, либо путь на сайте с «/». Пробелы недопустимы.`
-          : longItemLink ? `Не удалось сохранить: ссылка ${Number(longItemLink[1]) + 1}, поле «URL» слишком длинное. Максимум 4096 символов.`
-          : href ? `Не удалось сохранить: изображение ${Number(href[1]) + 1}, поле «Ссылка изображения». Укажите полный адрес http:// или https://, ссылку mailto: или tel:, либо путь на сайте с «/». Пробелы недопустимы.`
-          : longHref ? `Не удалось сохранить: изображение ${Number(longHref[1]) + 1}, поле «Ссылка изображения» слишком длинное. Максимум 4096 символов.`
-            : `Не удалось сохранить: ${error.message}`;
+        formError.textContent = saveErrorMessage(error);
         formError.classList.remove('d-none');
       }
     } finally {
       if (state.saving === draft) state.saving = null;
-      if (state.draft === draft && !state.pendingSaved) savingUi(false);
+      if (state.draft === draft && !state.pendingSaved) { savingUi(false); updateReviewAvailability(); }
     }
   }
   async function fetchAndRender(job, advertisedRevision) {
     if (busy() || state.drag) { state.pendingJob = job; return; }
+    if (state.documentRead?.jobId === job.id && state.documentRead.attempt === job.builderAttempt && state.documentRead.request === state.request) return;
     const switching = !samePage(job);
-    if (switching) { state.jobId = job.id; state.attempt = job.builderAttempt; state.revision = 0; state.document = null; state.activeTab = null; state.mutationError = ''; renderProgress(); root.classList.add('d-none'); errorBox.classList.add('d-none'); loading.classList.remove('d-none'); }
-    const request = ++state.request;
+    if (switching) { state.jobId = job.id; state.attempt = job.builderAttempt; state.revision = 0; state.document = null; state.sync = null; state.activeTab = null; state.mutationError = ''; renderProgress(); renderSyncNotice(); root.classList.add('d-none'); errorBox.classList.add('d-none'); loading.classList.remove('d-none'); }
+    const request = ++state.request, documentRead = { jobId: job.id, attempt: job.builderAttempt, request }; state.documentRead = documentRead;
     try {
       const stored = await state.api(pageUrl(job.id, job.builderAttempt)); if (request !== state.request) return;
       if (busy() || state.drag) { state.pendingJob = job; return; }
       const sameFrames = JSON.stringify(state.frames) === JSON.stringify(stored.frames);
       state.mediaContext = stored.mediaContext;
-      if (samePage(job) && state.document && state.revision === stored.revision && sameFrames) { loading.classList.add('d-none'); renderMutationError(); root.classList.remove('d-none'); return; }
+      if (samePage(job) && state.document && state.revision === stored.revision && sameFrames) { updateSync(stored.sync); loading.classList.add('d-none'); renderMutationError(); root.classList.remove('d-none'); return; }
       state.jobId = job.id; state.attempt = job.builderAttempt; acceptDocument(stored); state.blockTypes = stored.blockTypes;
       state.blockTypes.forEach(type => { TYPE[type.name] = type.label; }); render();
       if (!advertisedRevision) await state.refresh?.();
     } catch (error) {
       if (request !== state.request || busy() || state.drag) return;
       loading.classList.add('d-none'); errorBox.textContent = [state.mutationError, `Системная ошибка шага 3: ${error.message}`].filter(Boolean).join(' '); errorBox.classList.remove('d-none');
-    }
+    } finally { if (state.documentRead === documentRead) state.documentRead = null; }
   }
   modalElement.addEventListener('hidden.bs.modal', () => {
-    const trigger = state.trigger, target = state.target, saved = state.pendingSaved, pendingJob = state.pendingJob;
+    const trigger = state.trigger, target = state.target, draft = state.draft, saved = state.pendingSaved || draft?.autosave?.lastStored, pendingJob = state.pendingJob;
+    if (draft?.autosave) { window.clearTimeout(draft.autosave.timer); draft.autosave.timer = null; }
     state.target = null; state.trigger = null; state.draft = null; state.saving = null; state.pendingSaved = null; state.pendingJob = null; savingUi(false); window.ArmEditors.destroy('builder-content'); clear(fields); clear(reviewFooter); reviewFooter.hidden = true;
     if (trigger?.isConnected) trigger.focus({ preventScroll: true });
     window.setTimeout(async () => {
@@ -1732,7 +1922,17 @@
     const attempt = options.attempt || job.attempts.at(-1);
     job = { ...job, builderAttempt: attempt.number, pageBuilder: attempt.pageBuilder, mediaContext: { attempt: attempt.number, htmlRevision: attempt.htmlMedia?.revision || 0 } };
     state.api = options.api; state.refresh = options.refresh; const revision = Number(job.pageBuilder?.revision || 0);
-    if (samePage(job) && state.document && revision === state.revision && state.mediaContext?.htmlRevision === job.mediaContext.htmlRevision) { state.mediaContext = job.mediaContext; if (state.pendingJob && !samePage(state.pendingJob)) { root.classList.remove('d-none'); renderProgress(summary()); } state.pendingJob = null; return; }
+    const syncChanged = job.pageBuilder?.syncVersion !== state.sync?.version;
+    if (samePage(job) && state.document && syncChanged && state.draft && !state.saving && !state.syncRequest) {
+      const current = state.draft, generation = state.request; state.syncRequest = current;
+      try {
+        const stored = await state.api(pageUrl(job.id, job.builderAttempt));
+        if (generation === state.request && samePage(job) && state.draft === current && stored.revision === current.revision) updateSync(stored.sync);
+      } catch { /* Local editing stays available; the main polling loop retries. */ }
+      finally { if (state.syncRequest === current) state.syncRequest = null; }
+      if (generation !== state.request || state.draft !== current || !samePage(job)) return;
+    }
+    if (samePage(job) && state.document && revision === state.revision && !syncChanged && state.mediaContext?.htmlRevision === job.mediaContext.htmlRevision) { state.mediaContext = job.mediaContext; if (state.pendingJob && !samePage(state.pendingJob)) { root.classList.remove('d-none'); renderProgress(summary()); } state.pendingJob = null; return; }
     if (busy() || state.drag) { state.pendingJob = job; if (!samePage(job)) { ++state.request; root.classList.add('d-none'); renderProgress(); } return; }
     await fetchAndRender(job, revision);
   }

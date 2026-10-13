@@ -8,6 +8,7 @@ const { PageBuilderStore } = require('./stages/page-builder/store.cjs');
 const { MediaPicker } = require('./stages/page-builder/media-picker.cjs');
 const { FramePicker } = require('./stages/page-builder/frame-picker.cjs');
 const { DocumentPicker } = require('./stages/page-builder/document-picker.cjs');
+const { BegetSync } = require('./stages/beget/sync.cjs');
 
 // Public Queue API remains compatible while the page scheduler owns no stage implementation.
 class Queue extends PageQueue {
@@ -23,12 +24,15 @@ class Queue extends PageQueue {
     // Bind legacy pages before any subsequent retry can change the latest attempt.
     for (const job of this.jobs) { try { this.pageBuilder.migrateLegacy(job.id); } catch { /* surfaced by the page summary; retry also refuses incomplete migration */ } }
     this.stage.media?.deletion.recoverAll();
+    if (options.beget !== false) { this.beget = new BegetSync(this, options.beget || {}); this.pageBuilder.sync = this.beget; }
   }
   retry(id) { this.stage.media?.deletion.assertReady(); this.pageBuilder.migrateLegacy(id); return super.retry(id); }
   async shutdown() {
     const pickerStopped = this.mediaPicker.shutdown();
-    try { await super.shutdown(); } finally { await pickerStopped; }
+    const syncStopped = this.beget?.shutdown();
+    try { await super.shutdown(); } finally { await pickerStopped; await syncStopped; }
   }
+  snapshot(csrfToken) { const result = super.snapshot(csrfToken); if (this.beget) result.beget = this.beget.snapshot(); return result; }
   get reviewListeners() { return this.listenersFor('qa-review'); }
   set reviewListeners(listeners) { this.listeners.set('qa-review', listeners); }
   subscribeReviews(listener) { return this.subscribe('qa-review', listener); }

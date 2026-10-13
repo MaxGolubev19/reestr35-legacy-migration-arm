@@ -91,7 +91,8 @@ class MediaDeletion {
       }
       if (used) {
         const prepared = selected.queue.pageBuilder.prepareWrite(jobId, request.revision, document, request.attempt);
-        nextBuilder = { revision: prepared.revision, updatedAt: prepared.updatedAt, document: prepared.document };
+        nextBuilder = { revision: prepared.revision, updatedAt: prepared.updatedAt, document: prepared.document,
+          ...(prepared.syncRequested ? { syncRequested: true } : {}) };
       }
     }
     const nextManifest = structuredClone(selected.manifest), target = nextManifest.resources.find(value => value.id === item.id);
@@ -128,6 +129,7 @@ class MediaDeletion {
     if (manifestHash === record.manifestBefore) atomicJson(manifestFile, record.nextManifest);
     if (this.fileHash(builderFile) !== record.builderAfter || this.fileHash(manifestFile) !== record.manifestAfter) throw new Error('Удаление медиа не завершено');
     this.stage.project(attempt, record.nextManifest); this.stage.queue.save(); fs.unlinkSync(journalFile);
+    this.stage.queue.pageBuilder.sync?.wake();
     return true;
   }
   recoverAll() {
