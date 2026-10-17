@@ -65,3 +65,52 @@ test('UI active duration freezes in paused/queued/complete and continues only a 
   assert.equal(format({ ...attempt, activeDurationMs: 8000, activeSince: 1000000 }, 1002000), '00:00:10');
   assert.equal(format({ status: 'paused', activeDurationMs: 0, durationIncomplete: true }, 1000000), '≥00:00:00');
 });
+
+test('a running step 3 assembly keeps a complete attempt timed until the build ends', t => {
+  const ctx = setup(t), { queue } = ctx;
+  queue.add('https://build.reestr35.ru/'); const job = queue.jobs[0], attempt = job.attempts[0];
+  queue.pump();                                   // clock 1000: running, activeSince opened
+  ctx.advance(2000); ctx.heartbeat();             // 2000 ms of ordinary active work
+  attempt.status = 'complete'; queue.active.delete(job.id); queue.save();
+  ctx.advance(3000); queue.save();
+  assert.equal(attempt.activeDurationMs, 2000); assert.equal(attempt.activeSince, null, 'without a build the interval stays closed');
+  attempt.builder = { status: 'running' };
+  ctx.advance(1000); queue.save();
+  assert.equal(attempt.activeDurationMs, 2000); assert.equal(attempt.activeSince, 7000, 'the assembly reopens the interval');
+  ctx.advance(4000); ctx.heartbeat();
+  assert.equal(attempt.activeDurationMs, 6000, 'the heartbeat checkpoints accumulate assembly time');
+  attempt.builder.status = 'pausing'; ctx.advance(3000); ctx.heartbeat();
+  assert.equal(attempt.activeDurationMs, 9000, 'a pausing assembly keeps the interval open until the session closes');
+  attempt.builder.status = 'complete'; ctx.advance(2000); queue.save();
+  assert.equal(attempt.activeDurationMs, 11000); assert.equal(attempt.activeSince, null, 'finishing the build fixes the checkpoint');
+  ctx.advance(100000); queue.save();
+  assert.equal(attempt.activeDurationMs, 11000);
+});
+
+test('a backend restart during a build preserves the checkpoint and marks it incomplete', t => {
+  const ctx = setup(t), { queue } = ctx;
+  queue.add('https://crash-build.reestr35.ru/'); queue.pump();
+  ctx.advance(4000); ctx.heartbeat();
+  const attempt = queue.jobs[0].attempts[0];
+  attempt.status = 'complete'; attempt.builder = { status: 'running', generation: 1 }; queue.active.delete(queue.jobs[0].id);
+  ctx.advance(7000); queue.save();
+  assert.equal(attempt.activeDurationMs, 11000); assert.ok(Number.isFinite(attempt.activeSince));
+  const restored = setup(t, ctx.root, 1000000), resumed = restored.queue.jobs[0].attempts[0];
+  assert.equal(resumed.activeDurationMs, 11000); assert.equal(resumed.durationIncomplete, true);
+  assert.ok(!Number.isFinite(resumed.activeSince) || resumed.activeSince >= 1000000, 'downtime while the ARM was off is never counted');
+  // BuilderRunner.restore marks the run failed; from then on the interval stays closed.
+  resumed.builder.status = 'failed';
+  restored.queue.save();
+  restored.advance(100000); restored.queue.save();
+  assert.equal(resumed.activeDurationMs, 11000); assert.equal(resumed.activeSince, null);
+});
+
+test('UI duration extrapolates only a running assembly on an otherwise complete attempt', () => {
+  const format = loadFormatDuration();
+  const attempt = { status: 'complete', builder: { status: 'running' }, activeDurationMs: 5000, activeSince: 10000 };
+  assert.equal(format(attempt, 13000), '00:00:08');
+  assert.equal(format({ ...attempt, builder: { status: 'pausing' } }, 13000), '00:00:08');
+  assert.equal(format({ ...attempt, activeSince: 1000000 }, 1002000), '00:00:07');
+  for (const status of ['queued', 'complete', 'cancelled']) assert.equal(format({ ...attempt, builder: { status } }, 1000000), '00:00:05');
+  assert.equal(format({ ...attempt, builder: undefined }, 1000000), '00:00:05');
+});

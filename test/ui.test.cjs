@@ -11,6 +11,7 @@ const sharp = require('sharp');
 const { Queue, createServer } = require('../src/server.cjs');
 const { seedMoriPage } = require('./page-builder-fixture.cjs');
 const { layout, normalizeUrl } = require('../src/lib.cjs');
+const { paths: qaPaths, atomicJson, QA_POLICY } = require('../src/qa.cjs');
 const { publishLease } = require('../src/launcher.cjs');
 const { filename } = require('../src/infrastructure/media.cjs');
 
@@ -92,7 +93,7 @@ test('step 3 same-object CAS conflict fences later saves, close and navigation u
   await page.locator('[data-builder-id="common-actions"]').click(); await page.waitForSelector('#page-builder-modal.show');
   await page.locator('#builder-title').fill('LOCAL TITLE FIRST');
   const externalStored = queue.pageBuilder.read(job.id), externalDocument = structuredClone(externalStored.document);
-  externalDocument.common.blocks[1].text = 'EXTERNAL TEXT MUST SURVIVE'; queue.pageBuilder.write(job.id, externalStored.revision, externalDocument);
+  externalDocument.common.blocks[1].text = 'EXTERNAL TEXT MUST SURVIVE'; fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: externalStored.revision + 1, updatedAt: externalStored.updatedAt, document: externalDocument }));
   await page.waitForFunction(() => document.querySelector('#page-builder-form-error')?.textContent.includes('перезагрузите страницу'));
   assert.equal(posts.length, 1); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].text, 'EXTERNAL TEXT MUST SURVIVE');
   await page.locator('#builder-title').fill('LOCAL TITLE SECOND'); await page.waitForTimeout(700);
@@ -154,6 +155,47 @@ test('Beget pending blocks stay editable offline and unlock review only after th
     assert.equal(await page.locator('#page-builder-modal .modal-footer').evaluate(node => { const select = node.querySelector('select').getBoundingClientRect(), cancel = node.querySelector('[data-bs-dismiss]').getBoundingClientRect(), save = node.querySelector('[type="submit"]').getBoundingClientRect(); return select.right <= cancel.left && save.right <= innerWidth; }), true, `${width}: pending review and save fit`);
   }
   await page.locator('#page-builder-save').click(); await close(); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].review.status, 'unreviewed'); assert.match(await card.getAttribute('class'), /review-pending/);
+  assert.deepEqual(errors, []);
+});
+
+test('step 3 editor write paths lock while the assembly agent is running and unlock on pause', { timeout: 60000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'page-builder-assembly-lock-ui-'));
+  const queue = new Queue({ root, autoStart: false }); queue.add('https://mori-cinema.reestr35.ru/'); const job = queue.jobs[0]; seedMoriPage(queue, job);
+  Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } });
+  job.attempts[0].builder = { status: 'running', generation: 1, policy: { version: 3, hash: '0'.repeat(64) }, revision: 1, saveAttempts: 0, retries: 0, lastMeaningfulAt: 0 }; queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), posts = [], errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.route(`**/api/page-builder/${job.id}?attempt=*`, route => {
+    if (route.request().method() === 'POST') posts.push(route.request().postDataJSON());
+    return route.continue();
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}`); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
+  const hint = 'Идёт сборка страницы агентом', addBlock = page.locator('[data-add-section]').first(), addTab = page.locator('[data-tab-add]'), removeBlock = page.locator('.builder-delete').first();
+  assert.equal(await addBlock.isDisabled(), true); assert.equal(await addBlock.getAttribute('title'), hint);
+  assert.equal(await addTab.isDisabled(), true); assert.equal(await addTab.getAttribute('title'), hint);
+  assert.equal(await removeBlock.isDisabled(), true); assert.equal(await removeBlock.getAttribute('title'), hint);
+  await page.locator('[data-builder-id="common-actions"]').click(); await page.waitForSelector('#page-builder-modal.show');
+  const save = page.locator('#page-builder-save'), review = page.locator('#builder-review-status');
+  assert.equal(await save.isDisabled(), true); assert.equal(await save.getAttribute('title'), hint);
+  assert.equal(await review.isDisabled(), true); assert.equal(await review.getAttribute('title'), hint);
+  await page.locator('#builder-title').fill('Правка во время сборки'); await page.waitForTimeout(700);
+  assert.equal(posts.length, 0, 'assembly locks every write path, including autosave');
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  assert.equal(posts.length, 0); assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].title, 'Быстрые действия', 'closing during assembly discards local edits silently');
+  job.attempts[0].builder.status = 'paused'; queue.save();
+  queue.emit('builder', { jobId: job.id, attempt: 1, status: 'paused' });
+  await page.waitForFunction(hint => { const control = document.querySelector('[data-add-section]'); return control && !control.disabled && control.title !== hint; }, hint);
+  assert.equal(await addTab.isDisabled(), false); assert.equal(await addTab.getAttribute('title'), 'Добавить вкладку');
+  assert.equal(await removeBlock.isDisabled(), false);
+  await page.locator('[data-builder-id="common-actions"]').click(); await page.waitForSelector('#page-builder-modal.show');
+  assert.equal(await save.isDisabled(), false, 'paused assembly reopens manual editing'); assert.equal(await save.getAttribute('title'), '');
+  await page.locator('#builder-title').fill('Правка на паузе'); await save.click();
+  await page.waitForSelector('#page-builder-modal', { state: 'hidden' }); await page.waitForSelector('.modal-backdrop', { state: 'hidden' });
+  assert.ok(posts.length >= 1, 'edits are written once the assembly pauses');
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[1].title, 'Правка на паузе');
   assert.deepEqual(errors, []);
 });
 
@@ -321,7 +363,7 @@ test('queue panel stays within the viewport while the right result scrolls', { t
   const stored = queue.pageBuilder.read(job.id);
   for (let index = 0; index < 16; index++) {
     const block = structuredClone(stored.document.common.blocks[1]); block.id = `queue-extra-${index}`;
-    block.media = (block.media || []).map((item, slot) => ({ ...item, id: `queue-extra-media-${index}-${slot}` }));
+    block.media = [];
     block.items = (block.items || []).map((item, slot) => ({ ...item, id: `queue-extra-item-${index}-${slot}` }));
     stored.document.common.blocks.push(block);
   }
@@ -888,6 +930,22 @@ test('favicon follows workload, errors, paused/cancelled and every state poll wi
   await waitForIcon('#d63939');
   assert.match(await readIcon(), />4<\/text>/, 'errors take priority over paused and cancelled jobs');
 
+  const builderJob = (id, attempt) => ({ id: `00000000-0000-4000-8000-${String(id).padStart(12, '0')}`, url: `https://favicon-${id}.reestr35.ru/`, status: 'complete', attempts: [{ number: 1, status: 'complete', files: [], ...attempt }] });
+  const waitForIconState = fragments => page.waitForFunction(fragments => {
+    const svg = decodeURIComponent(document.querySelector('#dynamic-favicon').href.split(',')[1]);
+    return fragments.every(fragment => svg.includes(fragment));
+  }, fragments);
+  jobs = [makeJob(1, 'paused'), builderJob(2, { builder: { status: 'failed' } }),
+    builderJob(3, { builder: { status: 'failed', retryAt: Date.now() + 4000 } }),
+    builderJob(4, { builder: { status: 'running' } }),
+    builderJob(5, { builder: { status: 'complete' }, pageBuilder: { status: 'failed' } }),
+    builderJob(6, { builder: { status: 'complete' }, pageBuilder: { status: 'unreviewed' } })];
+  await waitForIconState(['#d63939', '>1</text>']);
+  assert.match(await readIcon(), />1<\/text>/, 'only a stable builder failure counts as an error');
+  jobs = [builderJob(3, { builder: { status: 'failed', retryAt: Date.now() + 4000 } })];
+  await waitForIconState(['#2fb344', 'stroke="#fff"']);
+  assert.doesNotMatch(await readIcon(), /<text/, 'a builder auto-retry alone stays a non-error state');
+
   jobs = [makeJob(1, 'failed'), makeJob(2, 'running', true), makeJob(3, 'queued', true), makeJob(4, 'queued'), makeJob(5, 'paused'), makeJob(6, 'cancelled')];
   await waitForIcon('#206bc4');
   assert.match(await readIcon(), />3<\/text>/, 'live processes take priority; workload includes queued, excludes paused/cancelled and counts overlap once');
@@ -1009,7 +1067,7 @@ test('queue icons expose every action, preserve selection, handle races and show
   const expected = [
     ['resume', 'pause', 'secondary', 'Продолжить'], ['pause', 'clock', 'blue', 'Приостановить'],
     ['pause', 'running', 'blue', 'Приостановить'], ['', 'running', 'secondary', 'Недоступно'],
-    ['retry', 'check', 'green', 'Перезапустить'], ['retry', 'alert', 'red', 'Перезапустить'],
+    ['assemble', 'pause', 'secondary', 'Продолжить'], ['retry', 'alert', 'red', 'Перезапустить'],
     ['retry', 'alert', 'red', 'Перезапустить'], ['retry', 'alert', 'red', 'Перезапустить'],
     ['retry', 'alert', 'red', 'Перезапустить'], ['retry', 'square', 'secondary', 'Перезапустить'],
     ['', 'running', 'blue', 'Недоступно'], ['pause', 'running', 'blue', 'Приостановить'], ['pause', 'clock', 'blue', 'Приостановить'],
@@ -1095,8 +1153,9 @@ test('queue icons expose every action, preserve selection, handle races and show
   await select(4); assert.equal(await page.locator('#attempt-duration').innerText(), '00:00:05');
   const recapture = page.locator('#recapture-button');
   assert.equal(await recapture.innerText(), '', 'restart is an icon-only button');
-  assert.equal(await recapture.getAttribute('aria-label'), 'Перезапустить');
-  assert.equal(await recapture.getAttribute('title'), 'Перезапустить');
+  assert.equal(await recapture.getAttribute('aria-label'), 'Перезапустить с шага 2');
+  assert.equal(await recapture.getAttribute('title'), 'Перезапустить с шага 2');
+  assert.equal(await recapture.isDisabled(), true, 'step 2 restart waits for the html-media phase');
   assert.equal(await recapture.locator('svg.icon').count(), 1, 'restart uses one recognizable refresh icon');
   assert.equal(await recapture.locator('svg').getAttribute('aria-hidden'), 'true');
   assert.equal(await recapture.locator('path').count(), 2);
@@ -1339,7 +1398,11 @@ test('queue icons expose every action, preserve selection, handle races and show
   for (const i of [4, 6, 7, 8, 9]) {
     const oldStatus = queue.jobs[i].attempts[0].status;
     await select(i);
-    if (i === 4) assert.equal(await page.locator('#stage-step-2').getAttribute('aria-selected'), 'true', 'complete attempt exposes restart on step 2');
+    if (i === 4) {
+      assert.equal(await page.locator('#stage-step-2').getAttribute('aria-selected'), 'true', 'complete attempt exposes restart on step 2');
+      await page.locator('#stage-step-1').click();
+      assert.equal(await page.locator('#recapture-button').getAttribute('title'), 'Перезапустить задачу', 'step 1 keeps the full restart hint');
+    }
     await ([4, 9].includes(i) ? page.locator('#recapture-button') : action(i)).click(); await waitStatus(i, 'queued');
     assert.equal(queue.jobs[i].attempts.length, 2);
     assert.equal(queue.jobs[i].attempts[0].status, oldStatus, 'terminal and legacy attempts remain history');
@@ -1366,6 +1429,132 @@ test('queue icons expose every action, preserve selection, handle races and show
   await select(0);
   assert.equal(await page.locator('#detail-url').innerText(), '—', 'missing URL renders a safe placeholder');
   for (const attribute of ['href', 'target', 'rel']) assert.equal(await page.locator('#detail-url').getAttribute(attribute), null, `missing URL omits ${attribute}`);
+});
+
+test('queue step 3 statuses render every builder state and route assembly clicks to their endpoints', { timeout: 60000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'queue-builder-status-ui-'));
+  const queue = new Queue({ root, autoStart: false, beget: { autoStart: false } });
+  const complete = { phase: 'html-media', status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } };
+  const seed = (url, builder, review, withDocument = true) => {
+    queue.add(url);
+    const job = queue.jobs.at(-1);
+    if (withDocument) seedMoriPage(queue, job);
+    Object.assign(job.attempts[0], structuredClone(complete));
+    if (builder) job.attempts[0].builder = builder;
+    if (review) {
+      const stored = queue.pageBuilder.read(job.id);
+      for (const section of [stored.document.common, ...stored.document.tabs]) for (const block of section.blocks) block.review = { status: review, reason: '' };
+      fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: stored.revision, updatedAt: stored.updatedAt, document: stored.document }));
+    }
+    return job;
+  };
+  const builderBase = () => ({ generation: 1, policy: { version: 3, hash: '0'.repeat(64) }, revision: 1, saveAttempts: 0, retries: 0, lastMeaningfulAt: 0 });
+  const firstBuild = seed('https://builder-first.reestr35.ru/');
+  const queued = seed('https://builder-queued.reestr35.ru/', { ...builderBase(), status: 'queued' });
+  const autoRetry = seed('https://builder-retry.reestr35.ru/', { ...builderBase(), status: 'failed', error: 'Сборка сорвалась', retryAt: Date.now() + 4000 });
+  const running = seed('https://builder-running.reestr35.ru/', { ...builderBase(), status: 'running' });
+  const pausingBuild = seed('https://builder-pausing.reestr35.ru/', { ...builderBase(), status: 'pausing' });
+  const pausedBuild = seed('https://builder-paused.reestr35.ru/', { ...builderBase(), status: 'paused' });
+  const failed = seed('https://builder-failed.reestr35.ru/', { ...builderBase(), status: 'failed', error: 'Повторы исчерпаны' });
+  const cancelled = seed('https://builder-cancelled.reestr35.ru/', { ...builderBase(), status: 'cancelled' });
+  const reviewFailed = seed('https://builder-review-failed.reestr35.ru/', { ...builderBase(), status: 'complete' });
+  const reviewUnreviewed = seed('https://builder-review-pending.reestr35.ru/', { ...builderBase(), status: 'skipped' }, 'unreviewed');
+  const ready = seed('https://builder-ready.reestr35.ru/', { ...builderBase(), status: 'complete' }, 'passed');
+  const locked = seed('https://builder-locked.reestr35.ru/', { ...builderBase(), status: 'failed', error: 'Повторы исчерпаны', finalizationError: { message: 'state.json недоступен' } });
+  const noDocument = seed('https://builder-empty.reestr35.ru/', { ...builderBase(), status: 'complete' }, undefined, false);
+  queue.save();
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } }), posts = [];
+  // Hold the queued row's pause request open: while the fetch hangs, the
+  // pending fence is stable and isDisabled() cannot race the re-render.
+  let releasePause; const pauseGate = new Promise(resolve => { releasePause = resolve; });
+  const heldPause = `/api/page-builder/${queued.id}/assemble-pause`;
+  await page.route('**/api/page-builder/*/assemble*', async route => {
+    if (route.request().method() !== 'POST') return route.continue();
+    posts.push({ path: new URL(route.request().url()).pathname, body: route.request().postData() });
+    if (new URL(route.request().url()).pathname === heldPause) await pauseGate;
+    return route.fulfill({ status: 200, contentType: 'application/json', body: '{"status":"queued"}' });
+  });
+  await page.route('**/api/jobs/*/retry', async route => {
+    posts.push({ path: new URL(route.request().url()).pathname, body: route.request().postData() });
+    return route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' });
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+  await page.waitForFunction(() => document.querySelectorAll('#jobs-body [data-job-action]').length === 13);
+  assert.equal(await page.locator('#progress-label').innerText(), '1 / 13', 'the bar counts only the fully finished checkmark row');
+  assert.equal(await page.locator('#progress-bar').evaluate(node => node.style.width), '8%');
+  const rows = [
+    [firstBuild, 'assemble', 'pause', 'secondary', 'На паузе · Продолжить'],
+    [queued, 'assemble-pause', 'clock', 'blue', 'Сборка в очереди · Приостановить'],
+    [autoRetry, 'assemble-cancel', 'clock', 'blue', 'Сборка в очереди · Приостановить'],
+    [running, 'assemble-pause', 'running', 'blue', 'Собирается · Приостановить'],
+    [pausingBuild, '', 'running', 'secondary', 'Приостанавливается · Недоступно'],
+    [pausedBuild, 'assemble-resume', 'pause', 'secondary', 'На паузе · Продолжить'],
+    [failed, 'assemble', 'alert', 'red', 'Ошибка сборки · Пересобрать'],
+    [cancelled, 'assemble', 'square', 'secondary', 'Сборка остановлена · Собрать страницу'],
+    [reviewFailed, '', 'alert', 'yellow', 'Проверка не пройдена'],
+    [reviewUnreviewed, '', 'check', 'secondary', 'Ждёт проверки'],
+    [noDocument, '', 'check', 'secondary', 'Ждёт проверки'],
+    [ready, 'retry', 'check', 'green', 'Готово · Перезапустить'],
+    [locked, '', 'alert', 'red', 'Ошибка сборки · Недоступно']
+  ];
+  for (const [job, operation, icon, color, title] of rows) {
+    const button = page.locator(`[data-job-action="${job.id}"]`);
+    assert.equal(await button.getAttribute('data-action'), operation, `${job.url} action`);
+    assert.equal(await button.getAttribute('data-icon'), icon, `${job.url} icon`);
+    assert.ok((await button.getAttribute('class')).includes(`text-${color}`), `${job.url} color`);
+    assert.equal(await button.getAttribute('title'), title, `${job.url} title`);
+    assert.equal(await button.isDisabled(), !operation, `${job.url} disabled`);
+    assert.ok((await button.getAttribute('aria-label')).includes(job.url), `${job.url} aria-label carries the URL`);
+    assert.equal(await button.innerText(), '', `${job.url} has no visible text badge`);
+    assert.equal(await button.locator(icon === 'running' ? `.status-dot-animated.bg-${color}` : 'svg.icon').count(), 1, `${job.url} icon graphic`);
+  }
+  for (const job of [firstBuild, reviewFailed, reviewUnreviewed, noDocument]) {
+    const button = page.locator(`[data-job-action="${job.id}"]`);
+    assert.equal((await button.getAttribute('data-icon')) === 'check' && (await button.getAttribute('class')).includes('text-green'), false,
+      `${job.url} shows no green check before a passed review`);
+  }
+  assert.equal(await page.locator(`[data-job-warning="${reviewFailed.id}"]`).getAttribute('role'), 'img', 'a failed review row is an informational image');
+  assert.equal(await page.locator(`[data-job-warning="${reviewUnreviewed.id}"]`).getAttribute('role'), 'img', 'an unreviewed row is an informational image');
+  const settled = url => page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === url);
+  const clickRow = async (job, suffix) => {
+    const waited = settled(`/api/page-builder/${job.id}/${suffix}`);
+    await page.locator(`[data-job-action="${job.id}"]`).click();
+    await waited;
+  };
+  await clickRow(firstBuild, 'assemble');
+  assert.equal(await page.locator('#job-detail').isVisible(), false, 'a status click does not select the row');
+  const queuedButton = page.locator(`[data-job-action="${queued.id}"]`);
+  const pauseSettled = settled(heldPause);
+  await queuedButton.click();
+  assert.equal(await queuedButton.isDisabled(), true, 'a pending builder action fences the row button');
+  releasePause();
+  await pauseSettled;
+  await page.waitForFunction(id => !document.querySelector(`[data-job-action="${id}"]`)?.disabled, queued.id);
+  await clickRow(running, 'assemble-pause');
+  await clickRow(pausedBuild, 'assemble-resume');
+  await clickRow(autoRetry, 'assemble-cancel');
+  const retrySettled = settled(`/api/jobs/${ready.id}/retry`);
+  await page.locator(`[data-job-action="${ready.id}"]`).click();
+  await retrySettled;
+  for (const job of [reviewFailed, reviewUnreviewed, noDocument, locked, pausingBuild]) {
+    const before = posts.length;
+    await page.locator(`[data-job-action="${job.id}"]`).evaluate(button => button.click());
+    await page.waitForTimeout(150);
+    assert.equal(posts.length, before, `${job.url} status stays informational and sends no request`);
+  }
+  assert.deepEqual(posts.map(item => [item.path, item.body]), [
+    [`/api/page-builder/${firstBuild.id}/assemble`, '{"force":true}'],
+    [`/api/page-builder/${queued.id}/assemble-pause`, '{}'],
+    [`/api/page-builder/${running.id}/assemble-pause`, '{}'],
+    [`/api/page-builder/${pausedBuild.id}/assemble-resume`, '{}'],
+    [`/api/page-builder/${autoRetry.id}/assemble-cancel`, '{}'],
+    [`/api/jobs/${ready.id}/retry`, '{}']
+  ], 'every click reaches its agreed endpoint and body');
+  assert.equal(posts.filter(item => item.path === `/api/page-builder/${autoRetry.id}/assemble-pause`).length, 0,
+    'an auto-retry pause is routed to assemble-cancel, never assemble-pause');
 });
 
 test('technical area follows steps and attempts, preserves modern capture evidence and media outcomes', { timeout: 30000 }, async t => {
@@ -2007,11 +2196,11 @@ test('step 3 block management supports create, drag, keyboard move, delete, conf
   assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks[0].id, 'common-hero');
   // Creation rebases over an unrelated external edit and preserves both objects.
   await page.locator('[data-add-section="posters"]').click(); await page.locator('#builder-title').fill('Конфликт создания');
-  const beforeConflict = queue.pageBuilder.read(job.id), external = structuredClone(beforeConflict.document); external.common.blocks[0].title = 'Изменено извне'; queue.pageBuilder.write(job.id, beforeConflict.revision, external);
+  const beforeConflict = queue.pageBuilder.read(job.id), external = structuredClone(beforeConflict.document); external.tabs[1].blocks[0].title = 'Изменено извне'; fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: beforeConflict.revision + 1, updatedAt: beforeConflict.updatedAt, document: external }));
   await page.waitForRequest(request => new URL(request.url()).pathname === '/api/state');
   const postsBeforeConflict = builderPosts.length; await page.locator('#page-builder-save').click(); await waitClosed();
   assert.ok(builderPosts.length >= postsBeforeConflict, 'the CAS retry can complete before the explicit close click'); assert.equal(queue.pageBuilder.read(job.id).revision, 11); assert.equal(queue.pageBuilder.read(job.id).document.tabs[1].blocks.length, 2);
-  await page.waitForSelector('.builder-block-open[data-builder-id="common-actions"][aria-label^="Изменено извне"]');
+  await page.waitForSelector('.builder-block-open[data-builder-id="common-hero"][aria-label^="Изменено извне"]');
   // Delayed creation freezes other mutations, Escape and polling until the CAS completes.
   let release, arrived; const gate = new Promise(resolve => { release = resolve; }), started = new Promise(resolve => { arrived = resolve; });
   const pattern = `**/api/page-builder/${job.id}?attempt=*`, delay = async route => { if (route.request().method() !== 'POST') return route.continue(); arrived(); await gate; await route.continue(); };
@@ -2831,7 +3020,7 @@ test('media selection is immediately available when switching grid gallery to co
   seedMoriPage(queue, job);
   installLocalPreview(queue, job, queue.pageBuilder.read(job.id).document.common.blocks[0].media[0]);
   const stored = queue.pageBuilder.read(job.id), grid = structuredClone(stored.document);
-  Object.assign(grid.common.blocks[0], { type: 'grid', view: 'gallery' }); queue.pageBuilder.write(job.id, stored.revision, grid);
+  Object.assign(grid.common.blocks[0], { type: 'grid', view: 'gallery', media: [], items: [] }); queue.pageBuilder.write(job.id, stored.revision, grid);
   Object.assign(job.attempts[0], { status: 'complete', captureStatus: 'complete', htmlMedia: { status: 'complete', revision: 1, source: { bytes: 0 }, total: 0, pending: 0 } }); queue.save();
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -2858,7 +3047,7 @@ test('embed frame catalog uses step 2 provenance, isolates players, restores foc
   const manifest = queue.stage.media.create(job, attempt, Buffer.from(`<iframe src="${first}"></iframe><iframe src="${second}"></iframe><iframe src="https://yandex.ru/map-widget/v1/?ll=37,55&amp;z=13"></iframe><iframe srcdoc="hello"></iframe><iframe src="http://127.0.0.1/private"></iframe>`), 'test');
   const initial = queue.pageBuilder.read(job.id), document = structuredClone(initial.document), block = document.common.blocks[0];
   const selected = queue.framePicker.choose(job.id, { revision: initial.revision, attempt: 1, htmlRevision: 1 }, 1);
-  Object.assign(block, { type: 'embed', view: 'default', text: 'Прежний Markdown', source_url: selected.source_url, sourceFrame: selected.sourceFrame, link: '/watch', provider: 'video', ratio: '4:3' });
+  Object.assign(block, { type: 'embed', view: 'default', media: [], text: 'Прежний Markdown', source_url: selected.source_url, sourceFrame: selected.sourceFrame, link: '/watch', provider: 'video', ratio: '4:3' });
   queue.pageBuilder.write(job.id, initial.revision, document); manifest.status = 'ready_with_issues'; queue.stage.media.publish(job, attempt, manifest); Object.assign(attempt, { status: 'complete', captureStatus: 'complete' }); queue.save();
   const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const browser = await chromium.launch({ channel: 'chrome', headless: true });
   t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
@@ -3377,7 +3566,7 @@ test('step 3 type and view changes keep drafts and expose every structured edito
   await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close(); const explored = queue.pageBuilder.read(job.id), exploredBlock = explored.document.common.blocks[0]; assert.equal(exploredBlock.type, 'service'); assert.equal(exploredBlock.view, 'default'); assert.equal(exploredBlock.badge, 'Черновик метки'); assert.equal(exploredBlock.text, 'Черновик текста');
   // A legacy structured block can still update its real common fields and review;
   // its existing text, media and settings are not replaced by pretend rows/items.
-  confirmBuilderFixture(queue, job); const structured = structuredClone(original.document); Object.assign(structured.common.blocks[0], { type: 'grid', view: 'gallery', review: { status: 'unreviewed', reason: '' } }); delete structured.common.blocks[0].reviewedRevision; queue.pageBuilder.write(job.id, explored.revision, structured);
+  confirmBuilderFixture(queue, job); const structured = structuredClone(original.document); Object.assign(structured.common.blocks[0], { type: 'grid', view: 'gallery', review: { status: 'unreviewed', reason: '' } }); delete structured.common.blocks[0].reviewedRevision; fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: explored.revision, updatedAt: explored.updatedAt, document: structured }));
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)'); await opener.click();
   assert.equal(await page.locator('.builder-editor-placeholder').count(), 0); assert.equal(await page.locator('#builder-add-gallery-item').count(), 1);
   for (const width of [1440, 600, 390, 320]) {
@@ -3700,7 +3889,7 @@ test('step 3 Markdown editor preserves source, optional fields, safe previews an
   await page.locator('#page-builder-save').click(); await close();
   const beforeExtra = queue.pageBuilder.read(job.id), extra = structuredClone(beforeExtra.document), oldService = extra.common.blocks.at(-1);
   assert.equal(oldService.media.length, 2); oldService.media.push({ id: 'legacy-service-extra', originalUrl: '', bigUrl: '', href: '', alt: '', caption: '' });
-  queue.pageBuilder.write(job.id, beforeExtra.revision, extra);
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: beforeExtra.revision, updatedAt: beforeExtra.updatedAt, document: extra }));
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
   await page.locator(`[data-builder-id="${oldService.id}"]`).click(); await page.waitForSelector('#page-builder-modal.show');
   assert.equal(await page.locator('.builder-image-row').count(), 2, 'older extra image stays hidden beyond the two fixed slots');
@@ -3729,7 +3918,7 @@ test('step 3 Markdown editor preserves source, optional fields, safe previews an
   await page.getByRole('button', { name: 'Отмена', exact: true }).click(); await close();
   const beforeHistorical = queue.pageBuilder.read(job.id), historical = structuredClone(beforeHistorical.document), oldBanner = historical.common.blocks.at(-1);
   oldBanner.media.push({ id: 'legacy-banner-extra', originalUrl: '', bigUrl: '', href: '', alt: '', caption: '' });
-  queue.pageBuilder.write(job.id, beforeHistorical.revision, historical);
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: beforeHistorical.revision, updatedAt: beforeHistorical.updatedAt, document: historical }));
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
   await page.locator(`[data-builder-id="${oldBanner.id}"]`).click(); await page.waitForSelector('#page-builder-modal.show');
   assert.equal(await page.locator('.builder-image-row').count(), 1, 'existing banner still shows its single slot');
@@ -3761,7 +3950,7 @@ test('step 3 Markdown editor preserves source, optional fields, safe previews an
   assert.equal(savedContent.link_text, 'Подробнее');
   const beforeContentTail = queue.pageBuilder.read(job.id), contentTail = structuredClone(beforeContentTail.document);
   contentTail.common.blocks.at(-1).media.push({ id: 'legacy-content-extra', originalUrl: '', bigUrl: '', href: '', alt: '', caption: '' });
-  queue.pageBuilder.write(job.id, beforeContentTail.revision, contentTail);
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: beforeContentTail.revision, updatedAt: beforeContentTail.updatedAt, document: contentTail }));
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
   await page.locator(`[data-builder-id="${savedContent.id}"]`).click(); await page.waitForSelector('#page-builder-modal.show');
   assert.equal(await page.locator('.builder-image-row').count(), 2);
@@ -3783,7 +3972,7 @@ test('step 3 Markdown editor preserves source, optional fields, safe previews an
   assert.equal(queue.pageBuilder.read(job.id).document.common.blocks.at(-1).media.length, 0, 'saving rich-content clears all inherited media');
   const beforeRichTail = queue.pageBuilder.read(job.id), richTail = structuredClone(beforeRichTail.document);
   richTail.common.blocks.at(-1).media.push({ id: 'legacy-rich-extra', originalUrl: '', bigUrl: '', href: '', alt: '', caption: '' });
-  queue.pageBuilder.write(job.id, beforeRichTail.revision, richTail);
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: beforeRichTail.revision + 1, updatedAt: beforeRichTail.updatedAt, document: richTail }));
   await page.reload(); await page.locator('#jobs-body tr').first().click(); await page.waitForSelector('#page-builder-content:not(.d-none)');
   await page.locator(`[data-builder-id="${savedContent.id}"]`).click(); await page.waitForSelector('#page-builder-modal.show');
   const richRevision = queue.pageBuilder.read(job.id).revision; await page.locator('#page-builder-save').click(); await close();
@@ -4345,9 +4534,107 @@ test('Tabler workspace, single URL, gallery, polling and responsive modal', { ti
   assert.equal(await page.locator('#batch-form input').count(), 1);
   queue.add('https://p1.reestr35.ru\nhttps://p2.reestr35.ru\nhttps://p3.reestr35.ru\nhttps://p4.reestr35.ru\nhttps://p5.reestr35.ru');
   ['complete', 'needs_review', 'incomplete', 'failed', 'cancelled', 'interrupted', 'queued', 'running'].forEach((status, index) => { queue.jobs[index].attempts.at(-1).status = status; });
+  // The bar counts full completion now: give the complete job a finished step 3
+  // (assembled document, every block passed) so it stays the one counted task.
+  seedMoriPage(queue, job);
+  const stored = queue.pageBuilder.read(job.id);
+  for (const section of [stored.document.common, ...stored.document.tabs]) for (const block of section.blocks) block.review = { status: 'passed', reason: '' };
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: stored.revision, updatedAt: stored.updatedAt, document: stored.document }));
+  job.attempts.at(-1).builder = { status: 'complete', generation: 1, policy: { version: 3, hash: '0'.repeat(64) }, revision: stored.revision, saveAttempts: 0, retries: 0, lastMeaningfulAt: 0 };
   await page.waitForFunction(() => document.querySelector('#progress-label').textContent === '1 / 8');
   assert.equal(await page.locator('#progress-bar').evaluate(node => node.style.width), '13%');
   queue.newAttempt(job);
   await page.waitForFunction(() => document.querySelector('#progress-label').textContent === '0 / 8');
   assert.deepEqual(errors, []);
+});
+
+test('header restart is contextual: full retry, step 2 restart, agent assembly and its timer', { timeout: 90000 }, async t => {
+  const root = fs.mkdtempSync(path.join(testTempRoot(), 'restart-stages-ui-'));
+  const queue = new Queue({ root, autoStart: false, beget: { autoStart: false } });
+  const tinyPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j9WQAAAAASUVORK5CYII=', 'base64');
+  // A finished attempt: sealed capture with a passed QA review plus a complete
+  // step 2 manifest, exactly what retry-stage and assembly expect.
+  const seedFinished = job => {
+    const attempt = job.attempts[0], p = layout(root, job, attempt);
+    fs.mkdirSync(p.hostDir, { recursive: true });
+    fs.writeFileSync(path.join(p.hostDir, '00_страница.png'), tinyPng);
+    fs.writeFileSync(p.report, JSON.stringify({ url: job.url, finalUrl: job.url, model: { layout: 'plain', root: null, groups: [] }, status: 'complete', errors: [], finished: '2026-10-17T00:00:00Z', segments: [{ file: '00_страница.png', spec: { kind: 'page' }, chain: [], box: { x: 0, y: 0, width: 1, height: 1 }, png: { width: 1, height: 1, strips: 1 }, status: 'ok' }] }));
+    queue.refreshArtifacts(job, attempt);
+    const qa = queue.qaState(job, attempt), file = qa.manifest.files[0];
+    Object.assign(qa.progress, { generation: 1, policy: QA_POLICY, checkpoints: [{ generation: 1, policy: QA_POLICY, manifestHash: qa.manifest.hash, threadId: 'fixture', turnId: 'fixture', review: { name: file.name, sha256: file.sha256, status: 'passed', issues: [] } }] });
+    atomicJson(qaPaths(root, job, attempt).progress, qa.progress);
+    const manifest = queue.stage.media.create(job, attempt, Buffer.from('<html><body><h1>Страница</h1><img src="/photo.png"></body></html>'), 'bundled');
+    const sha = crypto.createHash('sha256').update(tinyPng).digest('hex');
+    fs.writeFileSync(path.join(queue.stage.media.directory(job, attempt), 'objects', sha), tinyPng);
+    Object.assign(manifest.resources[0], { status: 'downloaded', finalUrl: `https://${new URL(job.url).hostname}/photo.png`, redirects: [], mime: 'image/png', bytes: tinyPng.length, sha256: sha, object: `objects/${sha}` });
+    manifest.status = 'complete';
+    queue.stage.media.publish(job, attempt, manifest);
+    Object.assign(attempt, { phase: 'html-media', status: 'complete', captureStatus: 'complete' });
+    queue.save();
+  };
+  queue.add('https://fixture.reestr35.ru/');
+  const first = queue.jobs[0];
+  seedFinished(first);
+  queue.add('https://assemble.reestr35.ru/');
+  const second = queue.jobs[1];
+  seedFinished(second);
+  seedMoriPage(queue, second);
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  t.after(async () => { await browser.close(); await queue.shutdown(); await new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }); fs.rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  const dialogs = [];
+  page.on('dialog', dialog => { dialogs.push(dialog.message()); return dialog.dismiss(); });
+  await page.goto(`http://127.0.0.1:${server.address().port}`);
+
+  const recapture = page.locator('#recapture-button');
+  const hint = () => recapture.getAttribute('title');
+  await page.locator(`[data-job-id="${first.id}"]`).click();
+  assert.equal(await page.locator('#stage-step-3').getAttribute('aria-selected'), 'true', 'a finished page opens on step 3');
+  assert.equal(await hint(), 'Пересобрать страницу');
+  await page.locator('#stage-step-2').click();
+  assert.equal(await hint(), 'Перезапустить с шага 2');
+  assert.equal(await recapture.isDisabled(), false);
+  await page.locator('#stage-step-1').click();
+  assert.equal(await hint(), 'Перезапустить задачу');
+  await page.locator('#stage-step-2').click();
+
+  const restartPosted = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${first.id}/retry-stage`) && response.status() === 200);
+  const restartBody = page.waitForRequest(request => request.url().endsWith(`/api/jobs/${first.id}/retry-stage`) && request.postData() === '{"stage":2}');
+  await recapture.click();
+  assert.equal((await restartPosted).status(), 200);
+  await restartBody;
+  assert.equal(first.attempts.length, 2);
+  assert.equal(first.attempts[1].phase, 'html-media');
+  assert.equal(first.attempts[1].captureStatus, 'complete');
+  assert.equal(first.attempts[1].status, 'queued');
+  assert.equal(first.attempts[0].status, 'complete', 'the finished attempt stays history');
+  await page.waitForFunction(() => document.querySelector('#attempt-select')?.options.length === 2);
+  assert.equal(await page.locator('#attempt-select').inputValue(), '2', 'the view follows the restarted attempt');
+  assert.equal(await page.locator('#stage-step-2').getAttribute('aria-selected'), 'true', 'a step 2 restart keeps the user on step 2');
+  assert.equal(await hint(), 'Перезапустить с шага 2');
+
+  await page.locator(`[data-job-id="${second.id}"]`).click();
+  assert.equal(await page.locator('#stage-step-3').getAttribute('aria-selected'), 'true');
+  assert.equal(await hint(), 'Пересобрать страницу');
+  const assembleBody = page.waitForRequest(request => request.url().endsWith(`/api/page-builder/${second.id}/assemble`) && request.postData() === '{"force":true}');
+  await recapture.click();
+  await assembleBody;
+  await page.waitForFunction(() => !document.querySelector('#global-alert').classList.contains('d-none') && /Ошибка сборки: /.test(document.querySelector('#global-alert').textContent));
+  assert.deepEqual(dialogs, [], 'assembly from the header never asks for confirmation');
+  assert.equal(await page.locator('#builder-agent-panel, #builder-assemble, #builder-assemble-cancel, #builder-agent-status').count(), 0, 'the assembly panel is gone');
+  assert.equal(second.attempts[0].builder.status, 'failed');
+
+  const built = second.attempts[0];
+  built.builder.status = 'running'; built.activeDurationMs = 5000; built.activeSince = Date.now() - 1000; queue.save();
+  const readSeconds = async () => page.locator('#attempt-duration').innerText().then(value => value.split(':').reduce((sum, part) => sum * 60 + Number(part), 0));
+  await page.waitForFunction(() => document.querySelector('#attempt-duration').textContent !== '00:00:05');
+  const growing = await readSeconds();
+  await page.waitForFunction(from => { const value = document.querySelector('#attempt-duration').textContent.split(':').reduce((sum, part) => sum * 60 + Number(part), 0); return value > from; }, growing, { timeout: 8000 });
+  built.builder.status = 'complete'; queue.save();
+  await page.waitForFunction(() => document.querySelector('#global-alert').classList.contains('d-none'), null, { timeout: 8000 });
+  const frozen = await readSeconds();
+  await page.waitForTimeout(2200);
+  assert.equal(await readSeconds(), frozen, 'the timer stops when the assembly finishes');
+  assert.deepEqual(dialogs, []);
 });

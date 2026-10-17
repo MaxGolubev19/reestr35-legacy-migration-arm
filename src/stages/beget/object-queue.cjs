@@ -2,9 +2,12 @@
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const { readChecked } = require('../../infrastructure/media.cjs');
 const { assetResolvers } = require('./assets.cjs');
+const { computeSorts, indexSorts, sectionKey } = require('./sorts.cjs');
 const keyOf = (kind, id) => `${kind}:${id}`;
 const validId = id => Number.isSafeInteger(id) && id > 0;
 const emptyBindings = () => ({ tabs: {}, blocks: {}, content: {}, media: {}, files: {} });
+const hasStoredSorts = sorts => !!(sorts && (Object.keys(sorts.tabs || {}).length
+  || Object.values(sorts.sections || {}).some(list => list && typeof list === 'object' && Object.keys(list).length)));
 
 // Transport/destination guards and binary spooling are shared with the legacy
 // journal reader; only object operations can be sent by this queue.
@@ -26,26 +29,48 @@ module.exports = (Base, { desired, digest, legacyId, snapshotAssets, withoutRevi
       if (value.inFlight) value.inFlight.legacySnapshot = true;
       this.persist(value);
     }
+    // A journal from before sticky sorts carries no sorts at all; treat it as
+    // empty history. The first enqueue fills the real values and rebases the
+    // old index-based receipts, so nothing is re-sent for the migration alone.
+    if (!value.sorts || typeof value.sorts !== 'object' || Array.isArray(value.sorts)) value.sorts = { tabs: {}, sections: {} };
     if (!value.pending || typeof value.pending !== 'object' || Array.isArray(value.pending)) throw new Error('Повреждена объектная очередь Beget');
     this.records.set(key, value); return value;
   }
-  objects(document) {
-    const target = desired(document), result = {};
-    document.tabs.forEach((tab, index) => { result[keyOf('tabs', tab.id)] = {
-      kind: 'tabs', localId: tab.id, hash: target.tabs[tab.id], sort: (index + 1) * 10,
+  objects(record, document) {
+    const sorts = computeSorts(record.sorts || null, document), target = desired(document, sorts), result = {};
+    document.tabs.forEach(tab => { result[keyOf('tabs', tab.id)] = {
+      kind: 'tabs', localId: tab.id, hash: target.tabs[tab.id], sort: sorts.tabs[tab.id],
       section: null, data: { id: tab.id, title: tab.title }
     }; });
-    [document.common, ...document.tabs].forEach(section => section.blocks.forEach((block, index) => {
-      result[keyOf('blocks', block.id)] = { kind: 'blocks', localId: block.id,
-        hash: target.blocks[block.id], sort: (index + 1) * 10,
-        contentHash: digest(withoutReview(block)),
-        section: section === document.common ? null : section.id, data: structuredClone(block) };
-    }));
+    [document.common, ...document.tabs].forEach(section => {
+      const key = sectionKey(document, section);
+      section.blocks.forEach(block => {
+        result[keyOf('blocks', block.id)] = { kind: 'blocks', localId: block.id,
+          hash: target.blocks[block.id], sort: sorts.sections[key][block.id],
+          contentHash: digest(withoutReview(block)),
+          section: section === document.common ? null : section.id, data: structuredClone(block) };
+      });
+    });
     return result;
   }
   enqueue(jobId, attempt, document, documentRevision) {
-    const record = this.record(jobId, attempt), objects = this.objects(document), ack = record.acknowledged;
+    const record = this.record(jobId, attempt), ack = record.acknowledged;
     if (this.queue.get(jobId).attempts.at(-1).number !== attempt) return record;
+    const sorts = computeSorts(record.sorts || null, document), objects = this.objects(record, document);
+    // A journal written before sticky sorts hashed `sort` as the list index.
+    // Rebase the matching receipts once so adopting an old journal does not
+    // phantom-update every already synchronized object.
+    let rebased = false;
+    if (!hasStoredSorts(record.sorts) && ack) {
+      const legacy = desired(document, indexSorts(document));
+      for (const object of Object.values(objects)) {
+        const received = ack[object.kind]?.[object.localId];
+        if (received !== undefined && received === legacy[object.kind]?.[object.localId] && received !== object.hash) {
+          ack[object.kind][object.localId] = object.hash; rebased = true;
+        }
+      }
+      if (rebased) ack.hash = digest({ tabs: ack.tabs, blocks: ack.blocks });
+    }
     let learnedContent = false;
     const pending = {};
     for (const [key, object] of Object.entries(objects)) {
@@ -74,7 +99,9 @@ module.exports = (Base, { desired, digest, legacyId, snapshotAssets, withoutRevi
           ...(previous?.action === 'delete' ? { failures: previous.failures || 0, nextAt: previous.nextAt || 0, lastError: previous.lastError || '', blocked: previous.blocked || false } : {}) };
       }
     }
-    if (JSON.stringify(record.pending) !== JSON.stringify(pending) || learnedContent) { record.pending = pending; this.persist(record); }
+    const sortsChanged = JSON.stringify(record.sorts || null) !== JSON.stringify(sorts);
+    record.sorts = sorts;
+    if (JSON.stringify(record.pending) !== JSON.stringify(pending) || learnedContent || sortsChanged || rebased) { record.pending = pending; this.persist(record); }
     return record;
   }
   mayBeChangedByFlight(record, kind, id) {
@@ -102,7 +129,7 @@ module.exports = (Base, { desired, digest, legacyId, snapshotAssets, withoutRevi
     if (this.closed || this.queue.get(record.jobId).attempts.at(-1)?.number !== flight.attempt) return false;
     const page = this.queue.pageBuilder.read(record.jobId, { attempt: flight.attempt, create: false });
     if (!page?.syncRequested) return false;
-    const object = this.objects(page.document)[flight.key];
+    const object = this.objects(record, page.document)[flight.key];
     return flight.target.action === 'delete' ? !object : object?.hash === flight.target.hash;
   }
   refresh(record) {
@@ -260,7 +287,7 @@ module.exports = (Base, { desired, digest, legacyId, snapshotAssets, withoutRevi
         for (const kind of ['tabs', 'blocks']) for (const [id, bitrixId] of Object.entries(ack.bindings?.[kind] || {})) {
           if (!validId(bitrixId) || remote.bindings[kind]?.[id] !== bitrixId) fail();
         }
-        const objects = this.objects(page.document);
+        const objects = this.objects(record, page.document);
         for (const [id, bitrixId] of Object.entries(ack.bindings?.blocks || {})) {
           const parent = remote.block_tabs[id];
           if (!Number.isSafeInteger(parent) || parent < 0

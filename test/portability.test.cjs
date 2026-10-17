@@ -6,7 +6,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const { APP_ROOT, dataRoot } = require('../src/data-dir.cjs');
 const { acquireLock } = require('../src/server.cjs');
-const { testTempRoot } = require('./support.cjs');
+const { testTempRoot, copyTree } = require('./support.cjs');
 const { configuration } = require('./run.cjs');
 
 // start.ps1 targets both PowerShell editions; prefer 7, fall back to 5.1.
@@ -63,7 +63,7 @@ test('standalone application starts clean and captures with its bundled helper f
   const app = path.join(sandbox, 'app'), foreign = path.join(sandbox, 'foreign');
   fs.mkdirSync(app); fs.mkdirSync(foreign);
   for (const name of ['src', 'public', 'start.ps1']) {
-    fs.cpSync(path.join(__dirname, '..', name), path.join(app, name), { recursive: true });
+    copyTree(path.join(__dirname, '..', name), path.join(app, name));
   }
   assert.equal(fs.existsSync(path.join(app, 'local')), false);
   const script = `

@@ -10,13 +10,15 @@ const { atomicJson } = require('../infrastructure/files.cjs');
 const { resolveRuntime } = require('../infrastructure/runtime.cjs');
 const { stopTree } = require('../infrastructure/process.cjs');
 const { launchWorker } = require('../infrastructure/launcher.cjs');
-const { restoreDuration, checkpointDuration } = require('./duration.cjs');
+const { restoreDuration, checkpointDuration, isTimed } = require('./duration.cjs');
 const pidAlive = pid => { if (!Number.isInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; } };
 const now = () => new Date().toISOString();
 const last = job => job.attempts.at(-1);
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
 
 // Page lifecycle and global FIFO scheduler. A registered stage owns its work units.
+// Concurrency is one shared pool: active stage 1-2 jobs plus running step 3
+// assemblies never exceed the limit; occupancy is derived from live registries.
 class PageQueue {
   constructor({ root = dataRoot(), workspace = APP_ROOT, concurrency = 2, spawnFn = launchWorker, stopFn = stopTree, zcode, autoStart = true,
     idleTimeoutMs = Number(process.env.ARM_IDLE_TIMEOUT_MS || 600000), launchGraceMs = 5000,
@@ -56,7 +58,10 @@ class PageQueue {
     }
     this.save();
     this.recoveryTimer = this.setTimer(() => {
-      if (!this.closing && this.jobs.some(job => job.attempts.some(attempt => Number.isFinite(attempt.activeSince)))) {
+      // isTimed covers step 3 assemblies (attempt.status stays complete); the
+      // activeSince disjunct lets one save close an interval a transition no
+      // longer owns before it lingers in state.json.
+      if (!this.closing && this.jobs.some(job => job.attempts.some(attempt => isTimed(attempt) || Number.isFinite(attempt.activeSince)))) {
         try { this.save(); } catch (error) { console.error('Active duration checkpoint:', error.message); }
       }
       if (this.autoStart && !this.closing) this.pump();
@@ -82,6 +87,11 @@ class PageQueue {
       try { listener(event); } catch {}
     }
   }
+  // Derived occupancy: a slot is held by the very fact of living in a registry
+  // (active worker, recovered QA, running assembly), so a slot can never leak
+  // and a restart recomputes the pool from the restored state automatically.
+  usedSlots() { return this.active.size + this.stage.occupiedSlots() + (this.builder ? this.builder.running.size : 0); }
+  hasFreeSlot() { return this.usedSlots() < this.concurrency; }
   setConcurrency(concurrency) {
     if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) throw new Error('concurrency должен быть целым числом 1–8');
     const previous = this.concurrency;
@@ -165,6 +175,23 @@ class PageQueue {
     try { this.save(); } catch (error) { job.attempts.pop(); throw error; }
     if (this.autoStart) this.pump();
   }
+  // Restart a finished attempt from a later step: the new attempt reuses the
+  // finished steps as evidence (the stage copies and re-validates it) and
+  // re-runs the rest. Step 2 restarts also work during a live media download:
+  // the worker is stopped first, exactly like the header stop button.
+  async retryStage(id, stage) {
+    if (stage !== 2) throw Object.assign(new Error('Недоступный шаг для перезапуска'), { statusCode: 400 });
+    const job = this.get(id);
+    if (this.pendingFinalizations.has(id)) throw conflict('Завершение попытки ещё не сохранено; запись будет повторена.');
+    if (last(job).phase !== 'html-media' || last(job).captureStatus !== 'complete') throw conflict('Перезапуск с шага 2 доступен после завершения шага 1 (скриншоты и проверка)');
+    if (this.active.has(id)) await this.stop(id);
+    const previous = last(job);
+    if (!(TERMINAL.has(previous.status) || previous.status === 'paused') || this.active.has(id) || !this.stage.launchFinished(job, previous)) throw conflict('Перезапуск доступен после доказанного завершения текущей попытки');
+    const attempt = this.newAttempt(job);
+    try { this.stage.retryFrom(job, attempt, previous); this.save(); }
+    catch (error) { job.attempts.pop(); throw error; }
+    if (this.autoStart) this.pump();
+  }
   pause(id) {
     const job = this.get(id), attempt = last(job);
     if (['running', 'validating'].includes(attempt.status) && this.active.get(id)?.exitCode === null) return this.stage.pause(job, attempt);
@@ -192,7 +219,12 @@ class PageQueue {
     }
     this.stage.recoverPending();
     for (const job of this.jobs) if (!last(job).finalizationError) this.stage.recoverJob(job);
-    while (this.active.size + this.stage.occupiedSlots() < this.concurrency) {
+    // Fairness: a free slot is offered to the assembly queue first; stage 1-2
+    // jobs start when the build queue is empty or cannot take the slot.
+    this.builder?.pump();
+    // hasFreeSlot() inlined (same derivation): pump must stay callable on bare
+    // duck-typed queue objects that carry only the data fields.
+    while (this.active.size + this.stage.occupiedSlots() + (this.builder ? this.builder.running.size : 0) < this.concurrency) {
       const queued = this.jobs.filter(job => last(job).status === 'queued' && this.stage.isRunnable(last(job), this.clock())).sort((a, b) => last(a).queueOrder - last(b).queueOrder);
       if (!queued.length) return;
       this.launch(queued[0]);

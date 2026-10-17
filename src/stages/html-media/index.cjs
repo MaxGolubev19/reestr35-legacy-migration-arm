@@ -209,6 +209,9 @@ class HtmlMediaStage {
         manifest.status = paused ? 'paused' : manifest.resources.some(r => ['failed','unsupported'].includes(r.status)) ? 'ready_with_issues' : 'complete';
         this.publish(job, attempt, manifest); attempt.status = paused ? 'paused' : 'complete';
         attempt.finishedAt = new Date().toISOString();
+        // Stage 2 completion is the only live auto-assembly trigger; the
+        // builder hook never breaks the attempt's own completion path.
+        if (attempt.status === 'complete') { try { queue.builder?.consider(job, attempt); } catch (error) { console.error(`Builder autostart (${job.id}): ${error.message}`); } }
       } catch (error) { attempt.status = 'interrupted'; attempt.error = error.message; }
       finally {
         child.exitCode = 0; child.armClosed = true; queue.active.delete(job.id); delete attempt.pauseRequested; delete attempt.cancellationRequested;

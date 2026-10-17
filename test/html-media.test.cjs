@@ -11,7 +11,7 @@ const { chromium } = require('playwright');
 const { Queue, createServer } = require('../src/server.cjs');
 const { INLINE_IMAGES } = require('../src/http/server.cjs');
 const { layout } = require('../src/lib.cjs');
-const { paths, atomicJson, QA_POLICY } = require('../src/qa.cjs');
+const { paths, atomicJson, QA_POLICY, loadQa } = require('../src/qa.cjs');
 const { inventory } = require('../src/stages/html-media/inventory.cjs');
 const { download, resolvePublic, publicAddress, LIMITS } = require('../src/stages/html-media/download.cjs');
 const { testTempRoot, testOutput } = require('./support.cjs');
@@ -589,7 +589,8 @@ browserTest('missing HTML warning is keyboard accessible and upload resumes auto
   const source = Buffer.from(`<img src="/first.png"><template><template>${templateFrame}</template></template>${iframe1}${iframe2}`);
   ctx.queue.autoStart = true;
   await page.locator('#html-media-content input[type=file]').setInputFiles({ name: 'source.html', mimeType: 'text/html', buffer: source });
-  await page.waitForFunction(() => document.querySelector('#jobs-body button[data-job-action]').dataset.status === 'complete');
+  // Step 2 completion auto-enqueues the assembly, so the queue row settles on the builder status key.
+  await page.waitForFunction(() => document.querySelector('#jobs-body button[data-job-action]').dataset.status === 'builderQueued');
   assert.equal(ctx.attempt.status, 'complete'); assert.equal(ctx.attempt.htmlMedia.downloaded, 1);
   assert.deepEqual(posts, [`/api/html-media/${ctx.job.id}/1/upload`], 'upload resumes on the server without a second browser action');
   for (const [file, expected] of ctx.proof) assert.equal(hash(fs.readFileSync(file)), expected);
@@ -844,3 +845,91 @@ browserTest('HTML card, modal actions, sequential stage guards and desktop/mobil
   assert.deepEqual(errors, []);
 });
 if (browserCaseCount !== 8) throw new Error(`Expected 8 explicitly marked HTML media browser cases, found ${browserCaseCount}`);
+
+test('retry-stage restarts step 2 from copied step 1 evidence and downloads media again', async t => {
+  const resources = temp(t), fixture = await fixtureServer(t);
+  fs.mkdirSync(path.join(resources, 'html')); fs.writeFileSync(path.join(resources, 'html/fixture.reestr35.ru.html'), '<img src="/photo.png">');
+  const ctx = completed(t, { htmlResources: resources, mediaDownload: fixture.fetchAsset });
+  const { queue, job, attempt, root } = ctx;
+  queue.pump(); await queue.active.get(job.id).completion;
+  assert.equal(attempt.status, 'complete'); assert.equal(attempt.htmlMedia.downloaded, 1);
+  const firstManifest = queue.stage.media.read(job, attempt);
+
+  await queue.retryStage(job.id, 2);
+  const second = job.attempts.at(-1);
+  assert.equal(second.number, 2); assert.equal(job.attempts.length, 2);
+  assert.equal(second.phase, 'html-media'); assert.equal(second.status, 'queued');
+  assert.equal(second.captureSealed, true); assert.equal(second.captureStatus, 'complete');
+  assert.equal(second.qa.total, 1); assert.equal(second.qa.unreviewed, 0, 'QA progress from step 1 is carried over');
+  assert.ok(fs.existsSync(path.join(layout(root, job, second).hostDir, '00_страница.png')), 'captured PNG is copied');
+  const copied = loadQa(root, job, second).manifest, original = loadQa(root, job, attempt).manifest;
+  assert.equal(copied.attempt, 2, 'the copied manifest is re-bound to the new attempt');
+  assert.equal(copied.reportHash, original.reportHash); assert.deepEqual(copied.files, original.files);
+  const dir = queue.stage.media.directory(job, second);
+  const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json')));
+  assert.equal(manifest.revision, 1); assert.equal(manifest.status, 'ready'); assert.equal(manifest.checkpoint, 1);
+  assert.equal(manifest.source.sha256, firstManifest.source.sha256); assert.equal(manifest.source.origin, 'bundled');
+  assert.deepEqual(manifest.resources.map(resource => resource.status), ['pending'], 'media downloads start clean');
+  assert.equal(attempt.status, 'complete', 'the finished attempt stays untouched');
+  assert.equal(second.activeDurationMs, 0, 'the new attempt counts its own time');
+
+  queue.pump(); await queue.active.get(job.id).completion;
+  assert.equal(second.status, 'complete'); assert.equal(second.htmlMedia.downloaded, 1);
+  assert.deepEqual(fixture.hits, ['/photo.png', '/photo.png'], 'media is downloaded again');
+  for (const [file, expected] of ctx.proof) assert.equal(hash(fs.readFileSync(file)), expected);
+});
+
+test('retry-stage interrupts a running media download and restarts only step 2', async t => {
+  const resources = temp(t), fixture = await fixtureServer(t);
+  fs.mkdirSync(path.join(resources, 'html')); fs.writeFileSync(path.join(resources, 'html/fixture.reestr35.ru.html'), '<img src="/slow">');
+  const ctx = completed(t, { htmlResources: resources, mediaDownload: fixture.fetchAsset });
+  const { queue, job, attempt } = ctx;
+  queue.pump(); await fixture.started;
+  assert.equal(attempt.status, 'running'); assert.ok(queue.active.has(job.id));
+
+  await queue.retryStage(job.id, 2);
+  const second = job.attempts.at(-1);
+  assert.equal(attempt.status, 'paused', 'the stopped worker parks the old attempt');
+  assert.equal(queue.active.has(job.id), false);
+  assert.equal(second.number, 2); assert.equal(second.status, 'queued');
+  assert.equal(second.captureStatus, 'complete'); assert.equal(second.qa.unreviewed, 0);
+
+  queue.pump();
+  const child = queue.active.get(job.id);
+  await new Promise(resolve => { const timer = setInterval(() => { if (fixture.hits.filter(hit => hit === '/slow').length >= 2) { clearInterval(timer); resolve(); } }, 10); });
+  fixture.release(); await child.completion;
+  assert.equal(second.status, 'complete'); assert.equal(second.htmlMedia.downloaded, 1);
+  for (const [file, expected] of ctx.proof) assert.equal(hash(fs.readFileSync(file)), expected);
+});
+
+test('retry-stage refuses unfinished step 1, queued work and invalid bodies over HTTP', async t => {
+  const resources = temp(t);
+  fs.mkdirSync(path.join(resources, 'html')); fs.writeFileSync(path.join(resources, 'html/fixture.reestr35.ru.html'), '<img src="/photo.png">');
+  const ctx = completed(t, { htmlResources: resources });
+  const { queue, job, attempt } = ctx;
+  await assert.rejects(queue.retryStage(job.id, 3), { statusCode: 400 });
+
+  const fresh = new Queue({ root: temp(t), autoStart: false });
+  t.after(() => fresh.shutdown());
+  fresh.add('https://capture-only.reestr35.ru/');
+  await assert.rejects(fresh.retryStage(fresh.jobs[0].id, 2), /Перезапуск с шага 2 доступен после завершения шага 1/);
+  assert.equal(fresh.jobs[0].attempts.length, 1);
+
+  await assert.rejects(queue.retryStage(job.id, 2), /Перезапуск доступен после доказанного завершения текущей попытки/, 'a queued attempt is not restartable');
+  assert.equal(job.attempts.length, 1);
+
+  const server = createServer(queue); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const state = await (await fetch(`${base}/api/state`)).json();
+  const headers = { 'Content-Type': 'application/json', 'x-csrf-token': state.csrfToken, origin: base, 'sec-fetch-site': 'same-origin' };
+  const endpoint = `${base}/api/jobs/${job.id}/retry-stage`;
+  for (const value of [[], null, false, {}, { stage: 1 }, { stage: 2, force: true }]) assert.equal((await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(value) })).status, 400);
+  assert.equal((await fetch(endpoint, { method: 'POST', headers: { ...headers, 'x-csrf-token': 'bad' }, body: '{"stage":2}' })).status, 403);
+
+  queue.pump(); await queue.active.get(job.id).completion;
+  const accepted = await fetch(endpoint, { method: 'POST', headers, body: '{"stage":2}' });
+  assert.equal(accepted.status, 200); assert.deepEqual(await accepted.json(), { ok: true });
+  assert.equal(job.attempts.length, 2);
+  assert.equal(attempt.status, 'complete'); assert.equal(job.attempts.at(-1).status, 'queued');
+});

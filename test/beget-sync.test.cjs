@@ -2,6 +2,7 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const { BegetSync, desired, legacyId, destinationIdentity } = require('../src/stages/beget/sync.cjs');
+const { indexSorts } = require('../src/stages/beget/sorts.cjs');
 const { PageBuilderStore } = require('../src/stages/page-builder/store.cjs');
 const { atomicJson } = require('../src/infrastructure/files.cjs');
 const { loadConfig } = require('../src/stages/beget/config.cjs');
@@ -428,4 +429,175 @@ test('new attempt adoption rejects changed fingerprints, bindings and parent own
     await f.tick(); assert.equal(f.api.applies.length, writes); assert.equal(f.sync.record(f.job.id, 2).acknowledged.attempt, 1);
     assert.equal(f.queue.pageBuilder.read(f.job.id).sync.blocks.child.status, 'pending');
   }
+});
+
+test('moving a block inside a section sends exactly one move with a midpoint sort', async t => {
+  const f = fixture(t); f.create();
+  f.edit(doc => { doc.common.blocks.push(block('mid'), block('last')); });
+  await f.tick();
+  assert.deepEqual(f.api.applies.map(apply => apply.object.value.sort), [10, 20, 30]);
+  const written = f.api.applies.length;
+  const moved = f.edit(doc => { doc.common.blocks.splice(1, 0, doc.common.blocks.shift()); }); // [mid, block-one, last]
+  assert.equal(moved.sync.blocks.mid.status, 'synced'); assert.equal(moved.sync.blocks.last.status, 'synced');
+  assert.equal(moved.sync.blocks['block-one'].status, 'pending');
+  await f.tick();
+  assert.equal(f.api.applies.length - written, 1, 'neighbour blocks are not re-sent');
+  assert.deepEqual(f.api.applies.at(-1).object.value, { local_id: 'block-one', tab_local_id: null, sort: 25 });
+  assert.equal(f.api.applies.at(-1).object.action, 'move');
+  const page = f.queue.pageBuilder.read(f.job.id);
+  assert.equal(page.sync.pendingCount, 0);
+  assert.equal(page.sync.blocks['block-one'].status, 'synced');
+});
+
+test('exhausting the gap between neighbours renumbers the section by tens and converges', async t => {
+  const f = fixture(t); f.create();
+  f.edit(doc => doc.common.blocks.push(block('tail'))); await f.tick(); // 10, 20
+  for (const [name, sort] of [['first', 15], ['second', 12], ['third', 11]]) {
+    const written = f.api.applies.length;
+    f.edit(doc => doc.common.blocks.splice(1, 0, block(name))); await f.tick();
+    assert.equal(f.api.applies.length - written, 1);
+    assert.equal(f.api.applies.at(-1).object.local_id, name);
+    assert.equal(f.api.applies.at(-1).object.value.sort, sort);
+  }
+  const written = f.api.applies.length;
+  f.edit(doc => doc.common.blocks.splice(1, 0, block('fourth'))); await f.tick();
+  const renumbered = f.api.applies.slice(written).filter(apply => apply.object.kind === 'block');
+  // No room between 10 and 11: the whole section takes fresh sorts 10..60.
+  // block-one already holds 10 and its hash is untouched, so it is not sent.
+  assert.deepEqual(renumbered.map(apply => [apply.object.local_id, apply.object.action, apply.object.value.sort]),
+    [['fourth', 'create', 20], ['third', 'move', 30], ['second', 'move', 40], ['first', 'move', 50], ['tail', 'move', 60]]);
+  assert.equal(f.queue.pageBuilder.read(f.job.id).sync.pendingCount, 0);
+  const settled = f.api.applies.length; await f.tick();
+  assert.equal(f.api.applies.length, settled, 'synchronization converges after renumbering');
+});
+
+test('moving to the front uses first minus ten and an underflow renumbers the section', async t => {
+  const f = fixture(t); f.create();
+  f.edit(doc => { doc.common.blocks.push(block('mid'), block('last')); }); await f.tick(); // 10, 20, 30
+  let written = f.api.applies.length;
+  f.edit(doc => { doc.common.blocks.push(doc.common.blocks.shift()); }); await f.tick(); // to the end: last + 10
+  assert.equal(f.api.applies.length - written, 1);
+  assert.equal(f.api.applies.at(-1).object.local_id, 'block-one');
+  assert.equal(f.api.applies.at(-1).object.value.sort, 40);
+  written = f.api.applies.length;
+  f.edit(doc => { doc.common.blocks.unshift(doc.common.blocks.pop()); }); await f.tick(); // to the front: first - 10
+  assert.equal(f.api.applies.length - written, 1);
+  assert.equal(f.api.applies.at(-1).object.local_id, 'block-one');
+  assert.equal(f.api.applies.at(-1).object.value.sort, 10);
+  written = f.api.applies.length;
+  f.edit(doc => { doc.common.blocks.unshift(doc.common.blocks.pop()); }); await f.tick(); // sort 0 is allowed
+  assert.equal(f.api.applies.length - written, 1);
+  assert.equal(f.api.applies.at(-1).object.local_id, 'last');
+  assert.equal(f.api.applies.at(-1).object.value.sort, 0);
+  written = f.api.applies.length;
+  f.edit(doc => { doc.common.blocks.unshift(doc.common.blocks.pop()); }); await f.tick(); // below 0 renumbers
+  assert.deepEqual(f.api.applies.slice(written).map(apply => [apply.object.local_id, apply.object.value.sort]),
+    [['mid', 10], ['last', 20], ['block-one', 30]]);
+  assert.equal(f.queue.pageBuilder.read(f.job.id).sync.pendingCount, 0);
+});
+
+test('reordering tabs sends one tab update with a midpoint sort and a rename keeps the sort', async t => {
+  const f = fixture(t);
+  f.edit(doc => { doc.tabs.push(tab('alpha'), tab('beta'), tab('gamma')); }); await f.tick();
+  assert.deepEqual(f.api.applies.map(apply => apply.object.value.sort), [10, 20, 30]);
+  let written = f.api.applies.length;
+  f.edit(doc => { doc.tabs.splice(1, 0, doc.tabs.shift()); }); await f.tick(); // [beta, alpha, gamma]
+  assert.equal(f.api.applies.length - written, 1, 'tab blocks and untouched tabs are not re-sent');
+  assert.equal(f.api.applies.at(-1).object.kind, 'tab');
+  assert.equal(f.api.applies.at(-1).object.action, 'update');
+  assert.equal(f.api.applies.at(-1).object.local_id, 'alpha');
+  assert.equal(f.api.applies.at(-1).object.value.sort, 25);
+  written = f.api.applies.length;
+  f.edit(doc => { doc.tabs[1].title = 'Переименованная'; }); await f.tick();
+  assert.equal(f.api.applies.length - written, 1);
+  assert.equal(f.api.applies.at(-1).object.local_id, 'alpha');
+  assert.equal(f.api.applies.at(-1).object.value.sort, 25);
+  assert.equal(f.api.applies.at(-1).object.value.name, 'Переименованная');
+  assert.equal(f.queue.pageBuilder.read(f.job.id).sync.pendingCount, 0);
+});
+
+test('every published sort is an integer within the arm_int range', async t => {
+  const f = fixture(t);
+  f.edit(doc => { doc.common.blocks.push(block('mid'), block('last')); doc.tabs.push(tab('alpha'), tab('beta')); });
+  await f.tick();
+  f.edit(doc => { doc.common.blocks.unshift(doc.common.blocks.pop()); }); await f.tick(); // front: 0
+  f.edit(doc => { doc.common.blocks.unshift(doc.common.blocks.pop()); }); await f.tick(); // underflow: renumber
+  f.edit(doc => { doc.tabs.unshift(doc.tabs.pop()); }); await f.tick();
+  f.edit(doc => { doc.common.blocks.splice(1, 0, block('fresh')); }); await f.tick();
+  f.edit(doc => { doc.common.blocks = []; doc.tabs = []; }); await f.tick(); // deletes carry no sort
+  for (const apply of f.api.applies) {
+    if (apply.object.action === 'delete') continue;
+    const sort = apply.object.value?.sort;
+    assert.ok(Number.isSafeInteger(sort), `sort must be an integer, got ${sort}`);
+    assert.ok(sort >= 0 && sort <= 2147483647, `sort out of the arm_int range: ${sort}`);
+  }
+  assert.equal(f.queue.pageBuilder.read(f.job.id).sync.pendingCount, 0);
+});
+
+test('a version 2 journal without sorts migrates without phantom operations', async t => {
+  const f = fixture(t); f.create();
+  f.edit(doc => { doc.common.blocks.push(block('mid')); doc.tabs.push(tab('alpha')); }); await f.tick();
+  const record = f.sync.record(f.job.id, 1), document = f.queue.pageBuilder.read(f.job.id).document;
+  // Rewrite the journal as the previous ARM wrote it: no sorts field, receipts
+  // hashed from the list indexes.
+  const legacy = desired(document, indexSorts(document));
+  for (const kind of ['tabs', 'blocks']) for (const [id, value] of Object.entries(legacy[kind])) record.acknowledged[kind][id] = value;
+  record.acknowledged.hash = hash(JSON.stringify({ tabs: record.acknowledged.tabs, blocks: record.acknowledged.blocks }));
+  delete record.sorts;
+  f.sync.persist(record);
+  await f.restart();
+  const written = f.api.applies.length;
+  await f.tick();
+  assert.equal(f.api.applies.length, written, 'adopting an old journal re-sends nothing');
+  const page = f.queue.pageBuilder.read(f.job.id);
+  assert.equal(page.sync.pendingCount, 0);
+  assert.equal(page.sync.blocks['block-one'].status, 'synced');
+  assert.equal(page.sync.blocks.mid.status, 'synced');
+  assert.equal(page.sync.tabs.alpha.status, 'synced');
+  assert.deepEqual(f.sync.record(f.job.id, 1).sorts, { tabs: { alpha: 10 }, sections: { common: { 'block-one': 10, mid: 20 }, 'tab:alpha': {} } });
+  f.edit(doc => { doc.common.blocks.push(doc.common.blocks.shift()); }); await f.tick();
+  assert.equal(f.api.applies.length - written, 1, 'a move right after the migration is still one operation');
+  assert.equal(f.api.applies.at(-1).object.local_id, 'block-one');
+  assert.equal(f.api.applies.at(-1).object.value.sort, 30);
+});
+
+test('a move resets the review of only the moved block', async t => {
+  const f = fixture(t); f.create();
+  f.edit(doc => { doc.common.blocks.push(block('mid'), block('last')); }); await f.tick();
+  f.edit(doc => { for (const item of doc.common.blocks) item.review.status = 'passed'; });
+  const moved = f.edit(doc => { doc.common.blocks.splice(1, 0, doc.common.blocks.shift()); }); // [mid, block-one, last]
+  assert.deepEqual(Object.fromEntries(moved.document.common.blocks.map(item => [item.id, item.review.status])),
+    { mid: 'passed', 'block-one': 'unreviewed', last: 'passed' });
+  const written = f.api.applies.length;
+  await f.tick();
+  assert.equal(f.api.applies.length - written, 1);
+  assert.equal(f.api.applies.at(-1).object.local_id, 'block-one');
+  assert.equal(f.queue.pageBuilder.read(f.job.id).sync.pendingCount, 0);
+});
+
+test('a tab named like the fixed common key keeps both section sort lists separate', async t => {
+  const f = fixture(t);
+  // The store allows any common-section id and lets a tab take the fixed sorts
+  // key 'common' as its own id; the journal keys sections by role, so the two
+  // block lists must never overwrite one another.
+  f.edit(doc => {
+    doc.common.id = 'custom-common';
+    doc.common.blocks.push(block('shared-a'), block('shared-b'));
+    doc.tabs.push(tab('common', [block('tab-a'), block('tab-b')]));
+  });
+  await f.tick();
+  assert.deepEqual(f.sync.record(f.job.id, 1).sorts, { tabs: { common: 10 },
+    sections: { common: { 'shared-a': 10, 'shared-b': 20 }, 'tab:common': { 'tab-a': 10, 'tab-b': 20 } } });
+  assert.equal(f.queue.pageBuilder.read(f.job.id).sync.pendingCount, 0);
+  for (const apply of f.api.applies) {
+    const sort = apply.object.value?.sort;
+    assert.ok(Number.isSafeInteger(sort), `sort must be an integer, got ${sort}`);
+  }
+  const written = f.api.applies.length;
+  f.edit(doc => { doc.common.blocks.push(doc.common.blocks.shift()); }); // move shared-a to the end
+  await f.tick();
+  assert.equal(f.api.applies.length - written, 1);
+  assert.equal(f.api.applies.at(-1).object.local_id, 'shared-a');
+  assert.equal(f.api.applies.at(-1).object.value.sort, 30);
+  assert.equal(f.queue.pageBuilder.read(f.job.id).sync.pendingCount, 0);
 });

@@ -31,7 +31,7 @@
           <div class="card-body border-top" id="queue-progress">
             <div class="d-flex justify-content-between align-items-center mb-2"><span class="form-label mb-0">Прогресс</span><output id="progress-label" class="badge bg-blue-lt" aria-live="polite">0 / 0</output></div>
             <div class="progress progress-sm" role="progressbar" aria-label="Общий прогресс" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-bar" class="progress-bar bg-primary" style="width:0%"></div></div>
-            <div id="concurrency-label-row" class="d-flex justify-content-between align-items-center mt-3 mb-1"><label for="concurrency-slider" class="form-label mb-0">Параллельность</label><output id="concurrency-value" for="concurrency-slider" class="badge bg-blue-lt">2</output></div>
+            <div id="concurrency-label-row" class="d-flex justify-content-between align-items-center mt-3 mb-1"><label for="concurrency-slider" class="form-label mb-0" title="Максимум агентов, работающих одновременно на всех шагах: захват, проверка, медиа и сборка страницы">Параллельность</label><output id="concurrency-value" for="concurrency-slider" class="badge bg-blue-lt">2</output></div>
             <input id="concurrency-slider" type="range" class="form-range" min="1" max="8" step="1" value="2" disabled>
             <div id="settings-error" class="alert alert-danger mt-3 mb-0 d-none" role="alert"></div>
           </div>

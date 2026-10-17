@@ -8,6 +8,7 @@ const { PageBuilderStore } = require('./stages/page-builder/store.cjs');
 const { MediaPicker } = require('./stages/page-builder/media-picker.cjs');
 const { FramePicker } = require('./stages/page-builder/frame-picker.cjs');
 const { DocumentPicker } = require('./stages/page-builder/document-picker.cjs');
+const { BuilderRunner, BUILDER_BRIDGE } = require('./stages/page-builder/agent/runner.cjs');
 const { BegetSync } = require('./stages/beget/sync.cjs');
 
 // Public Queue API remains compatible while the page scheduler owns no stage implementation.
@@ -25,12 +26,23 @@ class Queue extends PageQueue {
     for (const job of this.jobs) { try { this.pageBuilder.migrateLegacy(job.id); } catch { /* surfaced by the page summary; retry also refuses incomplete migration */ } }
     this.stage.media?.deletion.recoverAll();
     if (options.beget !== false) { this.beget = new BegetSync(this, options.beget || {}); this.pageBuilder.sync = this.beget; }
+    // The builder agent reuses the resolved QA launch with its own reasoning
+    // level and bridge. It has no private concurrency: sessions take slots from
+    // the queue's shared pool (active stage 1-2 jobs + running assemblies <= N).
+    const buildLaunch = this.zcode ? { ...this.zcode, reasoning: process.env.ARM_BUILD_REASONING || 'high', bridge: BUILDER_BRIDGE } : null;
+    this.builder = new BuilderRunner(this, { launch: buildLaunch, zcodeError: options.zcodeError,
+      appServerFactory: options.builderAppServerFactory, slots: { available: () => this.hasFreeSlot(), released: () => this.pump() },
+      idleTimeoutMs: options.buildIdleTimeoutMs,
+      saveLimit: options.buildSaveLimit, retryLimit: options.buildRetryLimit, retryDelayMs: options.buildRetryDelayMs });
+    this.builder.restore();
   }
   retry(id) { this.stage.media?.deletion.assertReady(); this.pageBuilder.migrateLegacy(id); return super.retry(id); }
+  retryStage(id, stage) { this.stage.media?.deletion.assertReady(); this.pageBuilder.migrateLegacy(id); return super.retryStage(id, stage); }
   async shutdown() {
     const pickerStopped = this.mediaPicker.shutdown();
     const syncStopped = this.beget?.shutdown();
-    try { await super.shutdown(); } finally { await pickerStopped; await syncStopped; }
+    const builderStopped = this.builder?.shutdown();
+    try { await super.shutdown(); } finally { await pickerStopped; await syncStopped; await builderStopped; }
   }
   snapshot(csrfToken) { const result = super.snapshot(csrfToken); if (this.beget) result.beget = this.beget.snapshot(); return result; }
   get reviewListeners() { return this.listenersFor('qa-review'); }

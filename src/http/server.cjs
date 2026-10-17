@@ -202,9 +202,43 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         }
         const pageBuilder = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})$/);
         if (pageBuilder) {
-          queue.get(pageBuilder[1]);
+          const job = queue.get(pageBuilder[1]);
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(key => !['revision', 'document'].includes(key)) || Object.keys(data).length !== 2) throw new Error('Разрешены только revision и document');
-          return json(res, 200, queue.framePicker.describeDocument(pageBuilder[1], queue.pageBuilder.write(pageBuilder[1], data.revision, data.document, builderAttempt(pageBuilder[1], true))));
+          const number = builderAttempt(pageBuilder[1], true), latest = job.attempts.at(-1);
+          // Ручная правка при живом агенте молча затиралась бы следующим save
+          // агента после CAS-ретрая — пока сборка выполняется, запись блокируется.
+          if (latest.builder?.status === 'running' && number === latest.number) throw conflict('Документ собирает агентом; остановите сборку или дождитесь завершения');
+          return json(res, 200, queue.framePicker.describeDocument(pageBuilder[1], queue.pageBuilder.write(pageBuilder[1], data.revision, data.document, number)));
+        }
+        const assemble = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/assemble$/);
+        if (assemble) {
+          if (data === undefined || data === null || typeof data !== 'object' || Array.isArray(data)
+            || Object.keys(data).some(key => key !== 'force') || (data.force !== undefined && typeof data.force !== 'boolean')) throw new Error('Тело запроса: {} или {"force": true}');
+          queue.get(assemble[1]);
+          return json(res, 200, queue.builder.request(assemble[1], { force: data.force === true }));
+        }
+        const assembleCancel = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/assemble-cancel$/);
+        if (assembleCancel) {
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length) throw new Error('Этот запрос не принимает параметры');
+          queue.get(assembleCancel[1]);
+          return json(res, 200, queue.builder.cancel(assembleCancel[1]));
+        }
+        const assemblePause = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/assemble-pause$/);
+        if (assemblePause) {
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length) throw new Error('Этот запрос не принимает параметры');
+          queue.get(assemblePause[1]);
+          return json(res, 200, queue.builder.pause(assemblePause[1]));
+        }
+        const assembleResume = url.pathname.match(/^\/api\/page-builder\/([a-f0-9-]{36})\/assemble-resume$/);
+        if (assembleResume) {
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length) throw new Error('Этот запрос не принимает параметры');
+          queue.get(assembleResume[1]);
+          return json(res, 200, queue.builder.resume(assembleResume[1]));
+        }
+        const retryStage = url.pathname.match(/^\/api\/jobs\/([a-f0-9-]{36})\/retry-stage$/);
+        if (retryStage) {
+          if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).length !== 1 || data.stage !== 2) throw new Error('Тело запроса: {"stage": 2}');
+          await queue.retryStage(retryStage[1], data.stage); return json(res, 200, { ok: true });
         }
         const action = url.pathname.match(/^\/api\/jobs\/([a-f0-9-]{36})\/(retry|pause|resume|continue-qa)$/);
         if (action) {
@@ -220,7 +254,10 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         const unsubscribe = queue.subscribeReviews(event => {
           if (!res.destroyed && !res.writableEnded) res.write(`event: qa-review\ndata: ${JSON.stringify(event)}\n\n`);
         });
-        const cleanup = () => unsubscribe();
+        const unsubscribeBuilder = queue.subscribe('builder', event => {
+          if (!res.destroyed && !res.writableEnded) res.write(`event: builder\ndata: ${JSON.stringify(event)}\n\n`);
+        });
+        const cleanup = () => { unsubscribe(); unsubscribeBuilder(); };
         req.once('close', cleanup); res.once('close', cleanup);
         return;
       }

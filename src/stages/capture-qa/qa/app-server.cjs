@@ -15,19 +15,26 @@ const RECORD_REVIEW = Object.freeze({ type: 'function', name: 'record_review',
     properties: { name: { type: 'string' }, sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
       status: { type: 'string', enum: ['passed', 'issues'] }, issues: { type: 'array', items: { type: 'string' } } } } });
 
+// A profile names the inline MCP server, its tool surface and the relay kinds
+// each tool call is forwarded under. Tool names feed the session allowlist;
+// the schemas themselves live in the per-profile stdio bridge.
+const QA_PROFILE = Object.freeze({ mcpName: 'reestr35-qa', tools: ['record_review'],
+  relay: Object.freeze({ record_review: 'onReview' }),
+  instructionsPath: path.join(APP_ROOT, 'src', 'qa-instructions.txt') });
+
 const RUNTIME_PREFERENCES = Object.freeze({ nativeSearchEnhancementsEnabled: false, subagentRuntimeConfigEnabled: false,
   memoryEnabled: false, askUserQuestionAutoResolutionEnabled: true, modelContextBudgetStrategy: 'preflight-v1' });
 
 // One process, session and turn for one company's QA pass. Never reuse this
 // object: completion is published only after its OS process has closed. The
 // ZCode app-server speaks bare JSON-RPC lines ({id,method,params}) over stdio;
-// record_review arrives through an inline MCP server whose loopback relay
-// calls back into this process, so every review is validated and checkpointed
+// profile tools arrive through an inline MCP server whose loopback relay
+// calls back into this process, so every call is validated and checkpointed
 // by the backend before the tool call is acknowledged to the model.
 class AppServer {
-  constructor({ launch, env = process.env, root = dataRoot(env), spawnFn = spawn, netModule = net, requestTimeoutMs = 30000, shutdownGraceMs = 2000 } = {}) {
+  constructor({ launch, profile = QA_PROFILE, env = process.env, root = dataRoot(env), spawnFn = spawn, netModule = net, requestTimeoutMs = 30000, shutdownGraceMs = 2000 } = {}) {
     if (!launch) throw new Error('AppServer requires a ZCode launch configuration');
-    Object.assign(this, { launch, env, root, spawnFn, netModule, requestTimeoutMs, shutdownGraceMs });
+    Object.assign(this, { launch, profile, env, root, spawnFn, netModule, requestTimeoutMs, shutdownGraceMs });
     this.pending = new Map(); this.sessions = new Set(); this.threads = new Map(); this.serial = 0;
   }
   async start() {
@@ -81,11 +88,12 @@ class AppServer {
       wire.on('line', line => {
         let message; try { message = JSON.parse(line); } catch { return; }
         if (message.token !== token) { socket.write(JSON.stringify({ id: message.id, error: 'bad relay token' }) + '\n'); return; }
-        if (message.kind !== 'record_review') { socket.write(JSON.stringify({ id: message.id, error: 'unknown relay kind' }) + '\n'); return; }
+        const handler = this.profile.relay[message.kind];
+        if (!handler || typeof session?.[handler] !== 'function') { socket.write(JSON.stringify({ id: message.id, error: 'unknown relay kind' }) + '\n'); return; }
         let answer;
         try {
           if (!session || session.exitCode !== null || session.ending || !session.turnId || this.threads.get(session.sessionId) !== session) throw new Error('Stale relay: unknown session or turn');
-          answer = session.onReview(message.arguments, { generation: session.generation, threadId: session.sessionId, turnId: session.turnId });
+          answer = session[handler](message.arguments, { generation: session.generation, threadId: session.sessionId, turnId: session.turnId });
         } catch (error) { answer = { error: error.message }; }
         socket.write(JSON.stringify({ id: message.id, ...answer }) + '\n');
       });
@@ -136,7 +144,7 @@ class AppServer {
       if (message.method === 'session/requestRuntimePreferences') this.send({ id: message.id, result: RUNTIME_PREFERENCES });
       else if (message.method === 'subagents/readRuntimeConfig') this.send({ id: message.id, result: { kind: 'built-in-fallback' } });
       else if (message.method === 'interaction/requestPermission') this.send({ id: message.id, result: { decision: 'deny', reason: 'ARM QA runs autonomously' } });
-      else this.send({ id: message.id, error: { code: -32601, message: `Only record_review is supported: ${message.method}` } });
+      else this.send({ id: message.id, error: { code: -32601, message: `Only ${this.profile.tools.join(', ')} is supported: ${message.method}` } });
       return;
     }
     if (message.method !== 'session/event') return;
@@ -165,6 +173,19 @@ class AppServer {
     this.used = true;
     const session = new EventEmitter();
     Object.assign(session, { isQa: true, generation, exitCode: null, onIdentity, onReview, onLog });
+    return this.dispatch(session, { cwd, prompt, files });
+  }
+  // Same one process/session/turn contract as review(), but for the page
+  // builder: its tools are save_document and read_file, each relayed to the
+  // session's onSave/onReadFile callbacks for validation before acknowledgement.
+  assemble({ generation, cwd, prompt, files, onIdentity, onSave, onReadFile, onLog }) {
+    if (this.used || this.closed) throw new Error('AppServer supports exactly one assembly pass; create a new instance');
+    this.used = true;
+    const session = new EventEmitter();
+    Object.assign(session, { isBuilder: true, generation, exitCode: null, onIdentity, onSave, onReadFile, onLog });
+    return this.dispatch(session, { cwd, prompt, files });
+  }
+  dispatch(session, { cwd, prompt, files }) {
     this.sessions.add(session);
     session.interrupt = async () => {
       session.cancelRequested = true; session.ending = true; session.resultCode = 1;
@@ -183,25 +204,25 @@ class AppServer {
       const created = await this.request('session/create', {
         workspace: { workspacePath: cwd, workspaceKey: cwd },
         mode: 'yolo', persistence: 'deferred', titleGenerationEnabled: false, model,
-        mcpServers: [{ name: 'reestr35-qa', command: this.launch.node, args: [this.launch.bridge, String(relay.port), relay.token], env: [], isolation: 'session' }],
+        mcpServers: [{ name: this.profile.mcpName, command: this.launch.node, args: [this.launch.bridge, String(relay.port), relay.token], env: [], isolation: 'session' }],
         // MCP tools register under their qualified id; keep the bare name too
         // so a CLI change in either direction cannot widen the tool surface.
-        toolAllowlist: ['mcp__reestr35-qa__record_review', 'record_review'],
+        toolAllowlist: this.profile.tools.flatMap(name => [`mcp__${this.profile.mcpName}__${name}`, name]),
       });
       session.sessionId = created?.session?.sessionId ?? created?.sessionId;
       if (!session.sessionId) throw new Error('session/create returned no session id');
       session.threadId = session.sessionId; this.threads.set(session.threadId, session);
       if (session.exitCode !== null || session.ending) return;
-      onIdentity({ appServerPid: this.child.pid, threadId: session.threadId });
+      session.onIdentity({ appServerPid: this.child.pid, threadId: session.threadId });
       await this.request('session/subscribe', { sessionId: session.sessionId, deliveryKind: 'desktop-continuous' });
       if (session.exitCode !== null || session.ending) return;
-      const instructions = fs.readFileSync(path.join(APP_ROOT, 'src', 'qa-instructions.txt'), 'utf8').replace(/\r\n/g, '\n');
+      const instructions = fs.readFileSync(this.profile.instructionsPath, 'utf8').replace(/\r\n/g, '\n');
       const turn = await this.request('session/send', { sessionId: session.sessionId, modelSelection: model,
         content: `${instructions}\n\n${prompt}`,
         attachments: files.map(file => ({ kind: 'image', filename: file.name, localPath: path.join(cwd, file.name), mimeType: 'image/png' })) });
       if (!turn?.accepted) throw new Error(`session/send not accepted: ${JSON.stringify(turn).slice(0, 200)}`);
       // A turn id normally arrives through the turn.started event before the
-      // first review; bind defensively from the accepted turn as well.
+      // first relay call; bind defensively from the accepted turn as well.
       if (session.exitCode === null && !session.ending && typeof turn.turnId === 'string') this.bindTurn(session, turn.turnId);
     }).catch(error => {
       if (session.exitCode !== null) return;
@@ -240,4 +261,4 @@ class AppServer {
     return this.stopping;
   }
 }
-module.exports = { AppServer, RECORD_REVIEW };
+module.exports = { AppServer, RECORD_REVIEW, QA_PROFILE };

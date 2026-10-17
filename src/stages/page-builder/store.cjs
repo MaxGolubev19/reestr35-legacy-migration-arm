@@ -390,6 +390,12 @@ function emptyDocument(job) {
   return validateDocument({ version: VERSION, source: { hostname, htmlSha256: '0'.repeat(64) },
     common: { id: 'common', title: 'Общая часть', review: { status: 'unreviewed', reason: '' }, blocks: [] }, tabs: [] });
 }
+// A pristine document carries no content and no source.html binding: it is the
+// only state where the builder may attach the page to a step 2 HTML revision.
+function isPristine(document) {
+  return Boolean(document) && document.source?.htmlSha256 === '0'.repeat(64)
+    && document.tabs.length === 0 && document.common?.blocks?.length === 0;
+}
 class PageBuilderStore {
   constructor(root, resolveJob) { this.root = path.join(root, 'page-builder'); fs.mkdirSync(this.root, { recursive: true }); this.resolveJob = resolveJob; }
   legacyFile(jobId) { if (!/^[a-f0-9-]{36}$/.test(jobId)) throw new Error('Некорректный ID задания'); return path.join(this.root, `${jobId}.json`); }
@@ -440,9 +446,19 @@ class PageBuilderStore {
     if (this.sync) result.sync = this.sync.projection(jobId, attempt, result.document);
     return result;
   }
-  write(jobId, expectedRevision, document, attempt) {
+  // A forced rebuild restarts from the default page. The reset must not go
+  // through write(): no syncRequested and no enqueue, so the site keeps the
+  // previous published version until the fresh assembly saves its first tab.
+  reset(jobId, attempt) {
+    attempt = this.attempt(jobId, attempt); this.migrateLegacy(jobId);
+    const file = this.file(jobId, attempt);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    atomicJson(file, { revision: 1, updatedAt: new Date().toISOString(), document: emptyDocument(this.resolveJob(jobId)) });
+    return this.read(jobId, { attempt });
+  }
+  write(jobId, expectedRevision, document, attempt, options = {}) {
     this.assertWritable?.(jobId);
-    const prepared = this.prepareWrite(jobId, expectedRevision, document, attempt);
+    const prepared = this.prepareWrite(jobId, expectedRevision, document, attempt, options);
     atomicJson(this.file(jobId, prepared.attempt), { revision: prepared.revision, updatedAt: prepared.updatedAt, document: prepared.document,
       ...(prepared.syncRequested ? { syncRequested: true } : {}) });
     // The document is the recovery source if a process dies between these two
@@ -451,12 +467,19 @@ class PageBuilderStore {
     this.sync?.wake();
     return this.read(jobId, { attempt: prepared.attempt });
   }
-  prepareWrite(jobId, expectedRevision, document, attempt) {
+  prepareWrite(jobId, expectedRevision, document, attempt, options = {}) {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) throw Object.assign(new Error('Требуется revision'), { statusCode: 409 });
     const current = this.read(jobId, { attempt }); attempt = current.attempt;
     if (current.revision !== expectedRevision) throw Object.assign(new Error('Данные шага 3 уже изменены; обновите страницу'), { statusCode: 409 });
     const validated = validateDocument(document);
-    if (validated.source.hostname !== current.document.source.hostname || validated.source.htmlSha256 !== current.document.source.htmlSha256) throw new Error('Происхождение исходного HTML неизменяемо');
+    if (options.sourceBinding !== undefined) {
+      // Only the builder attaches a page to its step 2 HTML, and only while the
+      // document is still pristine; the submitted htmlSha256 value is ignored.
+      if (!/^[a-f0-9]{64}$/.test(options.sourceBinding) || options.sourceBinding === '0'.repeat(64)) throw new Error('Некорректная привязка source.html');
+      if (!isPristine(current.document)) throw new Error('Привязка source.html доступна только для пустого документа');
+      if (validated.source.hostname !== current.document.source.hostname) throw new Error('Происхождение исходного HTML неизменяемо');
+      validated.source.htmlSha256 = options.sourceBinding;
+    } else if (validated.source.hostname !== current.document.source.hostname || validated.source.htmlSha256 !== current.document.source.htmlSha256) throw new Error('Происхождение исходного HTML неизменяемо');
     // Old drafts may contain empty rich-content blocks. Keep them readable and
     // let unrelated writes pass, but require both fields when that block is edited.
     const existingBlocks = new Map([current.document.common, ...current.document.tabs].flatMap(section => section.blocks.map(block => [block.id, block])));
@@ -464,6 +487,36 @@ class PageBuilderStore {
       if (block.type !== 'rich-content' || JSON.stringify(block) === JSON.stringify(existingBlocks.get(block.id))) continue;
       if (!block.text.trim()) throw new Error('Для HTML-фрагмента заполните HTML');
       if (!block.reason?.trim()) throw new Error('Для HTML-фрагмента заполните обоснование');
+    }
+    // The site renders pooled media only through the wire contract fields, so a
+    // pool without rendering references never reaches the page. Old documents
+    // stay readable and untouched blocks keep saving; an edited (or new) block
+    // must already follow the image mechanics of its type. The builder writes
+    // into a pristine document, so every assembled block is checked. Reviews
+    // and key order are ignored by the comparison: a review-only change of an
+    // old block is not a media edit.
+    const mechanics = value => Array.isArray(value) ? `[${value.map(mechanics).join(',')}]`
+      : value && typeof value === 'object' ? `{${Object.keys(value).filter(key => !['review', 'reviewedRevision'].includes(key)).sort().map(key => `${JSON.stringify(key)}:${mechanics(value[key])}`).join(',')}}`
+        : JSON.stringify(value);
+    for (const block of [validated.common, ...validated.tabs].flatMap(section => section.blocks)) {
+      const existing = existingBlocks.get(block.id);
+      if (!block.media.length || existing && mechanics(block) === mechanics(existing)) continue;
+      if (block.type === 'grid' || block.type === 'table') {
+        const referenced = new Set();
+        if (block.type === 'grid') {
+          for (const item of block.items || []) if (item.image_asset_id) referenced.add(item.image_asset_id);
+        } else {
+          for (const row of block.rows || []) for (const cell of row.cells || []) for (const id of cell.image_asset_ids || (cell.image_asset_id ? [cell.image_asset_id] : [])) referenced.add(id);
+        }
+        const unused = block.media.map(asset => asset.id).filter(id => !referenced.has(id));
+        if (unused.length) throw new Error(block.type === 'grid'
+          ? `Изображения блока ${block.id} без элемента не отображаются: ${unused.join(', ')} (grid рендерит картинки только через item.image_asset_id)`
+          : `Изображения блока ${block.id} без ячейки не отображаются: ${unused.join(', ')} (table рендерит картинки только в ячейках)`);
+      } else if (block.type === 'content' || block.type === 'service') {
+        if (block.media.length > 2) throw new Error(`Блок ${block.id} отображает не более двух изображений (media[0] слева, media[1] справа)`);
+      } else if (block.type === 'big-media') {
+        if (block.media.length > 1) throw new Error(`Блок ${block.id} отображает не более одного изображения (media[0])`);
+      } else if (block.type === 'links' || block.type === 'sections' || block.type === 'embed' || block.type === 'rich-content') throw new Error(`Блок ${block.id} не отображает изображения`);
     }
     this.validateMedia?.(jobId, validated, current.document, attempt);
     const previous = new Map([current.document.common, ...current.document.tabs].flatMap(section => section.blocks.map(block => [block.id, { sectionId: section.id, block }])));
@@ -503,4 +556,4 @@ class PageBuilderStore {
     return assets.find(item => item.id === mediaId) || null;
   }
 }
-module.exports = { PageBuilderStore, validateDocument, statusSummary, derivedReview, BLOCK_TYPES, DATA_TABLE_LIMITS };
+module.exports = { PageBuilderStore, validateDocument, statusSummary, derivedReview, BLOCK_TYPES, DATA_TABLE_LIMITS, isPristine };

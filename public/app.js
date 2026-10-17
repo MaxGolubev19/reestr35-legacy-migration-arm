@@ -17,7 +17,11 @@
     incomplete: "Неполный результат",
     failed: "Ошибка",
     cancelled: "Отменено",
-    interrupted: "Прервано"
+    interrupted: "Прервано",
+    builderQueued: "Сборка в очереди",
+    builderRunning: "Собирается",
+    builderFailed: "Ошибка сборки",
+    builderCancelled: "Сборка остановлена"
   };
 
   const state = {
@@ -137,13 +141,20 @@
   }
 
   function currentAttempt(job) {
-    const attempts = Array.isArray(job.attempts) ? job.attempts : [];
+    const attempts = Array.isArray(job?.attempts) ? job.attempts : [];
     return attempts.length ? attempts[attempts.length - 1] : null;
   }
 
   function effectiveStatus(job) {
     const attempt = currentAttempt(job);
     return String(job.status || (attempt && attempt.status) || "unknown").toLowerCase();
+  }
+
+  // Only a stable step 3 failure counts as an error: an auto-retry (retryAt)
+  // and pending block reviews are waiting states, not failures.
+  function stableBuilderFailure(job) {
+    const builder = currentAttempt(job)?.builder;
+    return effectiveStatus(job) === "complete" && builder?.status === "failed" && builder.retryAt === undefined;
   }
 
   function renderFavicon() {
@@ -154,7 +165,7 @@
     // queued job once, including the unlikely overlap of both signals.
     const active = state.jobs.some((job) => job.isActive === true);
     const workload = state.jobs.filter((job) => job.isActive === true || effectiveStatus(job) === "queued").length;
-    const errors = state.jobs.filter((job) => ERROR_STATUSES.has(effectiveStatus(job))).length;
+    const errors = state.jobs.filter((job) => ERROR_STATUSES.has(effectiveStatus(job)) || stableBuilderFailure(job)).length;
     const pausedOrCancelled = state.jobs.filter((job) => ["paused", "cancelled"].includes(effectiveStatus(job))).length;
     const count = active ? workload : errors || pausedOrCancelled;
     const color = active ? "#206bc4" : errors ? "#d63939" : pausedOrCancelled ? "#626976" : "#2fb344";
@@ -219,10 +230,10 @@
 
   function renderProgress() {
     const total = state.jobs.length;
-    const complete = state.jobs.filter((job) => effectiveStatus(job) === "complete").length;
-    const percent = total ? Math.round((complete / total) * 100) : 0;
-    el["progress-label"].textContent = `${complete} / ${total}`;
-    el["progress-label"].setAttribute("aria-label", `Готово ${complete} из ${total}`);
+    const ready = state.jobs.filter(fullyReady).length;
+    const percent = total ? Math.round((ready / total) * 100) : 0;
+    el["progress-label"].textContent = `${ready} / ${total}`;
+    el["progress-label"].setAttribute("aria-label", `Готово ${ready} из ${total}`);
     el["progress-bar"].style.width = `${percent}%`;
     el["progress-bar"].parentElement.setAttribute("aria-valuenow", String(percent));
   }
@@ -258,9 +269,9 @@
     return svg;
   }
 
-  function actionButton(job, action, label, icon, color, secondary = false) {
-    const status = effectiveStatus(job);
-    const pending = state.pendingActions.get(job.id);
+  function actionButton(job, action, label, icon, color, secondary = false, statusKey = null) {
+    const status = statusKey || effectiveStatus(job);
+    const pending = state.pendingActions.get(job.id) || state.pendingActions.get(`assemble:${job.id}`);
     const pendingAction = Boolean(action && pending?.action === action);
     const button = document.createElement("button");
     button.type = "button";
@@ -279,7 +290,12 @@
     button.append(graphic);
     button.addEventListener("click", event => {
       event.stopPropagation();
-      if (action && !state.pendingActions.has(job.id)) writeAction(job.id, action, button);
+      if (!action) return;
+      if (action.startsWith("assemble")) {
+        if (!state.pendingActions.has(`assemble:${job.id}`)) void writeBuilderAction(job, action, button);
+        return;
+      }
+      if (!state.pendingActions.has(job.id)) writeAction(job.id, action, button);
     });
     button.addEventListener("keydown", event => event.stopPropagation());
     const wrapper = document.createElement("span");
@@ -302,6 +318,44 @@
     new window.tabler.Tooltip(wrapper, { trigger: informational ? "hover focus" : "hover", title, html: false, animation: false });
   }
 
+  // Step 3 statuses of a complete attempt; the first match top-down wins.
+  // assemble-pause cannot pause a scheduled auto-retry (the backend answers
+  // 409), so that substate looks identical but clicks assemble-cancel.
+  function builderQueueControl(job, attempt) {
+    const builder = attempt?.builder;
+    const autoRetry = builder?.status === "failed" && builder.retryAt !== undefined;
+    let action, label, icon, color, statusKey = "complete", problem = "";
+    if (!builder) [action, label, icon, color, statusKey] = ["assemble", "Продолжить", "pause", "secondary", "paused"];
+    else if (builder.status === "queued" || autoRetry) [action, label, icon, color, statusKey] = [autoRetry ? "assemble-cancel" : "assemble-pause", "Приостановить", "clock", "blue", "builderQueued"];
+    else if (builder.status === "running") [action, label, icon, color, statusKey] = ["assemble-pause", "Приостановить", "running", "blue", "builderRunning"];
+    else if (builder.status === "pausing") [action, label, icon, color, statusKey] = [null, "Недоступно", "running", "secondary", "pausing"];
+    else if (builder.status === "paused") [action, label, icon, color, statusKey] = ["assemble-resume", "Продолжить", "pause", "secondary", "paused"];
+    else if (builder.status === "failed") [action, label, icon, color, statusKey] = ["assemble", "Пересобрать", "alert", "red", "builderFailed"];
+    else if (builder.status === "cancelled") [action, label, icon, color, statusKey] = ["assemble", "Собрать страницу", "square", "secondary", "builderCancelled"];
+    else if (attempt?.pageBuilder?.status === "failed") [action, label, icon, color, problem] = [null, "Проверка не пройдена", "alert", "yellow", "Проверка не пройдена"];
+    else if (fullyReady(job)) [action, label, icon, color] = [job.canRecapture ? "retry" : null, "Перезапустить", "check", "green"];
+    else [action, label, icon, color, problem] = [null, "Ждёт проверки", "check", "secondary", "Ждёт проверки"];
+    if (builder?.finalizationError) action = null; // вердикт ещё не записан: ручные действия сборки отвечают 409
+    const control = actionButton(job, action, label, icon, color, false, statusKey);
+    if (problem) {
+      control.dataset.jobWarning = job.id;
+      const button = control.querySelector("button");
+      button.dataset.problem = problem;
+      updateActionTooltip(button);
+    }
+    return control;
+  }
+
+  // A fully finished task is exactly the queue checkmark: the attempt completed
+  // steps 1-2, no assembly is in flight and every block passed review. The
+  // progress bar counts only these, so the bar and the checkmark cannot diverge.
+  function fullyReady(job) {
+    const attempt = currentAttempt(job), builder = attempt?.builder;
+    return effectiveStatus(job) === "complete" && Boolean(builder)
+      && !["queued", "running", "pausing", "paused", "failed", "cancelled"].includes(builder.status)
+      && attempt.pageBuilder?.status === "passed";
+  }
+
   function queueActions(job) {
     const status = effectiveStatus(job);
     const attempt = currentAttempt(job);
@@ -313,6 +367,7 @@
       updateActionTooltip(button);
       return [control];
     }
+    if (status === "complete") return [builderQueueControl(job, attempt)];
     const mapping = {
       paused: [job.canResume ? "resume" : null, "Продолжить", "pause", "secondary"],
       queued: ["pause", "Приостановить", "clock", "blue"],
@@ -320,7 +375,6 @@
       pausing: [null, "Недоступно", "running", "secondary"],
       validating: [job.canPause ? "pause" : null, "Приостановить", "running", "blue"],
       stopping: [null, "Недоступно", "running", "secondary"],
-      complete: [job.canRecapture ? "retry" : null, "Перезапустить", "check", "green"],
       needs_review: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
       incomplete: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
       failed: [job.canRecapture ? "retry" : null, "Перезапустить", "alert", "red"],
@@ -591,6 +645,94 @@
     ]);
   }
 
+  // The header restart button is contextual: step 1 keeps the full retry, step 2
+  // restarts from the captured materials, step 3 assembles the page (a click
+  // during a live assembly stops it and starts a fresh one). Every action
+  // targets the latest attempt whatever attempt the detail view selects.
+  const RESTART_HINTS = { 1: "Перезапустить задачу", 2: "Перезапустить с шага 2", 3: "Пересобрать страницу" };
+
+  function renderRecapture(job, attempt) {
+    const recapture = el["recapture-button"];
+    const hint = RESTART_HINTS[state.activeStage] || RESTART_HINTS[1];
+    recapture.title = hint;
+    recapture.setAttribute("aria-label", hint);
+    const pendingJob = job ? state.pendingActions.get(job.id) : null;
+    const pendingAssemble = job ? state.pendingActions.get(`assemble:${job.id}`) : null;
+    const busy = Boolean(pendingJob) || Boolean(pendingAssemble);
+    let loading = false;
+    if (state.activeStage === 3) {
+      const attempts = Array.isArray(job?.attempts) ? job.attempts : [];
+      const latest = attempts[attempts.length - 1] || null;
+      const historical = Boolean(attempt && latest && String(attempt.number) !== String(latest.number));
+      loading = pendingAssemble?.action === "assemble";
+      recapture.disabled = !job || historical || busy;
+    } else if (state.activeStage === 2) {
+      const target = currentAttempt(job);
+      const eligible = target?.phase === "html-media" && target?.captureStatus === "complete";
+      loading = pendingJob?.action === "retry-stage";
+      recapture.disabled = !job || !eligible || busy;
+    } else {
+      loading = pendingJob?.action === "retry";
+      recapture.disabled = !job || !job.canRecapture || busy;
+    }
+    recapture.classList.toggle("btn-loading", loading);
+    recapture.setAttribute("aria-busy", String(loading));
+  }
+
+  // Assembly failures surface in the shared alert area under the header; every
+  // other builder state stays to the step 3 progress elements.
+  function builderAlert() {
+    const builder = currentAttempt(state.jobs.find(candidate => candidate.id === state.selectedJobId))?.builder;
+    return builder?.status === "failed" && builder.error ? `Ошибка сборки: ${builder.error}` : "";
+  }
+
+  // Every builder action shares the assemble:<id> pending key: one in-flight
+  // request fences the queue button, the header restart button and repeats.
+  async function writeBuilderAction(job, action, button) {
+    if (!job || state.pendingActions.has(`assemble:${job.id}`) || state.pendingActions.has(job.id)) return;
+    const attempts = Array.isArray(job.attempts) ? job.attempts : [];
+    if (!attempts.length) return; // сборка действует только на последнюю попытку
+    const pending = { action, confirmAfterGeneration: Number.POSITIVE_INFINITY };
+    state.pendingActions.set(`assemble:${job.id}`, pending);
+    renderDetail();
+    if (state.selectedJobId === job.id) {
+      const recapture = document.getElementById("recapture-button");
+      if (recapture) { recapture.disabled = true; recapture.classList.toggle("btn-loading", recapture === button); recapture.setAttribute("aria-busy", String(recapture === button)); }
+    }
+    for (const control of el["jobs-body"].querySelectorAll("[data-job-action], [data-job-secondary-action]")) {
+      if ((control.dataset.jobAction || control.dataset.jobSecondaryAction) !== job.id) continue;
+      control.disabled = true;
+      control.setAttribute("aria-disabled", "true");
+      const clicked = control === button;
+      control.setAttribute("aria-busy", String(clicked));
+      updateActionTooltip(control);
+    }
+    showGlobalError("");
+    let accepted = false;
+    try {
+      await api(`/api/page-builder/${encodeURIComponent(job.id)}/${action}`, {
+        method: "POST",
+        body: action === "assemble" ? JSON.stringify({ force: true }) : "{}"
+      });
+      accepted = true;
+      // A state request that began before this POST succeeded may contain the
+      // old action. Keep loading until a later snapshot confirms it.
+      pending.confirmAfterGeneration = state.refreshGeneration + 1;
+      if (!state.refreshPromise) await refreshState();
+    } catch (error) {
+      showGlobalError(error instanceof Error ? error.message : String(error));
+      if (!accepted) {
+        state.pendingActions.delete(`assemble:${job.id}`);
+        renderJobs();
+        renderDetail();
+      }
+    }
+  }
+
+  async function assemblePage(job) {
+    await writeBuilderAction(job, "assemble", el["recapture-button"]);
+  }
+
   function renderStages(job, attempt) {
     const secondAvailable = secondStageAvailable(attempt), thirdAvailable = thirdStageAvailable(attempt);
     const contextKey = job && attempt ? `${job.id}:${attempt.number}` : null;
@@ -632,6 +774,7 @@
     el["media-progress"].classList.toggle("stage-hidden", state.activeStage !== 2);
     el["builder-progress"].classList.toggle("stage-hidden", state.activeStage !== 3);
     window.HtmlMedia.render(job, attempt, { csrfToken: state.csrfToken, refresh: () => refreshState() });
+    renderRecapture(job, attempt);
     if (state.activeStage === 3) window.PageBuilder.render(job, { api, attempt, refresh: () => refreshState() });
   }
 
@@ -646,7 +789,10 @@
 
   function formatDuration(attempt, timestamp = Date.now()) {
     const elapsed = Math.max(0, Number(attempt?.activeDurationMs) || 0);
-    const active = ["running", "validating", "pausing", "stopping"].includes(attempt?.status) && Number.isFinite(attempt?.activeSince);
+    // Same predicate as the backend timer: a step 3 assembly keeps a complete
+    // attempt at work, so its interval is extrapolated like a running one.
+    const timed = ["running", "validating", "pausing", "stopping"].includes(attempt?.status) || ["running", "pausing"].includes(attempt?.builder?.status);
+    const active = timed && Number.isFinite(attempt?.activeSince);
     const seconds = Math.floor((elapsed + (active ? Math.max(0, timestamp - attempt.activeSince) : 0)) / 1000);
     return `${attempt?.durationIncomplete ? "≥" : ""}${[Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60].map(value => String(value).padStart(2, "0")).join(":")}`;
   }
@@ -729,12 +875,6 @@
       el["attempt-select"].append(option);
     });
     el["attempt-select"].disabled = !attempts.length;
-    const recapture = el["recapture-button"];
-    recapture.disabled = !job.canRecapture || state.pendingActions.has(job.id);
-    recapture.classList.toggle("btn-loading", state.pendingActions.get(job.id)?.action === "retry");
-    recapture.setAttribute("aria-busy", String(state.pendingActions.get(job.id)?.action === "retry"));
-    recapture.title = "Перезапустить";
-    recapture.setAttribute("aria-label", "Перезапустить");
     renderDuration();
     renderAttempt(job, attempt);
     renderStages(job, attempt);
@@ -790,7 +930,7 @@
     refreshSelectedLogs(true);
   }
 
-  async function writeAction(id, action, button) {
+  async function writeAction(id, action, button, requestBody = "{}") {
     if (!id || state.pendingActions.has(id)) return;
     const pending = { action, confirmAfterGeneration: Number.POSITIVE_INFINITY };
     state.pendingActions.set(id, pending);
@@ -811,11 +951,11 @@
     try {
       await api(`/api/jobs/${encodeURIComponent(id)}/${action}`, {
         method: "POST",
-        body: "{}"
+        body: requestBody
       });
       accepted = true;
-      if (action === "retry" && state.selectedJobId === id) {
-        state.selectedAttemptNumber = null; state.activeStage = 1; state.stageContextKey = null; state.stageManuallySelected = false;
+      if ((action === "retry" || action === "retry-stage") && state.selectedJobId === id) {
+        state.selectedAttemptNumber = null; state.activeStage = action === "retry" ? 1 : 2; state.stageContextKey = null; state.stageManuallySelected = false;
       }
       // A state request that began before this POST succeeded may contain the
       // old action. Keep loading until a later snapshot confirms it.
@@ -1144,7 +1284,7 @@
         if (!state.shutdownRequested) {
           state.localFailures = 0;
           setConnection("connected");
-          if (!state.shutdownError) showGlobalError("");
+          if (!state.shutdownError) showGlobalError(builderAlert());
         }
         await refreshSelectedLogs();
       } while (state.refreshQueued && !state.stopped);
@@ -1157,6 +1297,9 @@
     state.eventSource = new EventSource("/api/events");
     state.eventSource.addEventListener("qa-review", () => {
       refreshState().catch(() => {}); // Polling remains the visible reconnect/error fallback.
+    });
+    state.eventSource.addEventListener("builder", () => {
+      refreshState().catch(() => {});
     });
   }
 
@@ -1312,7 +1455,13 @@
     renderDetail();
     refreshSelectedLogs(true);
   });
-  el["recapture-button"].addEventListener("click", () => writeAction(state.selectedJobId, "retry", el["recapture-button"]));
+  el["recapture-button"].addEventListener("click", () => {
+    const job = state.jobs.find(candidate => candidate.id === state.selectedJobId);
+    if (!job || el["recapture-button"].disabled) return;
+    if (state.activeStage === 3) { void assemblePage(job); return; }
+    if (state.activeStage === 2) { void writeAction(job.id, "retry-stage", el["recapture-button"], JSON.stringify({ stage: 2 })); return; }
+    void writeAction(job.id, "retry", el["recapture-button"]);
+  });
   el["stage-step-1"].addEventListener("click", event => { event.preventDefault(); selectStage(1, { focus: false }); });
   el["stage-step-2"].addEventListener("click", event => { event.preventDefault(); selectStage(2, { focus: false }); });
   el["stage-step-3"].addEventListener("click", event => { event.preventDefault(); selectStage(3, { focus: false }); });

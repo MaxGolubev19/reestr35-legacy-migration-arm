@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { testTempRoot, testOutput } = require('./support.cjs');
+const { testTempRoot, testOutput, copyTree } = require('./support.cjs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { EventEmitter } = require('node:events');
@@ -283,7 +283,7 @@ test('relocated history preserves manifest hashes and checkpoints and resumes on
   const ctx = start(t, 2), child = qa(ctx); pass(child, 1); child.finish(1);
   const migrated = fs.mkdtempSync(path.join(testTempRoot(), 'migrated-history-'));
   t.after(() => fs.rmSync(migrated, { recursive: true, force: true }));
-  fs.cpSync(ctx.root, migrated, { recursive: true });
+  copyTree(ctx.root, migrated);
   const source = paths(ctx.root, ctx.job, ctx.attempt), target = paths(migrated, ctx.job, ctx.attempt);
   const manifest = fs.readFileSync(source.manifest), progress = fs.readFileSync(source.progress);
   const resumed = setup(t, { root: migrated });

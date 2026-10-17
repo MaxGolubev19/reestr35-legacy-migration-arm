@@ -22,13 +22,17 @@
   };
   const STRUCTURED_TYPES = new Set(['table', 'grid', 'data-table']);
   const PROVIDER = { iframe: 'Виджет (iframe)', map: 'Карта', video: 'Видео', unknown: 'Другой источник' };
+  const ASSEMBLY_HINT = 'Идёт сборка страницы агентом';
   const state = { jobId: null, attempt: null, revision: 0, document: null, activeTab: null, request: 0, api: null, refresh: null,
-    target: null, trigger: null, draft: null, saving: null, pendingJob: null, pendingSaved: null, mutation: null, drag: null, mutationError: '' };
+    target: null, trigger: null, draft: null, saving: null, pendingJob: null, pendingSaved: null, mutation: null, drag: null, mutationError: '', assembling: false };
   const root = document.getElementById('page-builder-content'), loading = document.getElementById('page-builder-loading'), errorBox = document.getElementById('page-builder-error');
   const modalElement = document.getElementById('page-builder-modal'), form = document.getElementById('page-builder-form'), fields = document.getElementById('page-builder-fields');
   const formError = document.getElementById('page-builder-form-error'), save = document.getElementById('page-builder-save');
   const mediaPreviewObservers = new Set();
   let mediaRevisions = new Map();
+  // Каким статусом сборки отрисован текущий DOM: load синхронизирует блокировку
+  // даже когда ревизия не изменилась и ранний выход не вызывает render.
+  let renderedAssemblyLock = false;
   function clearMediaPreviewObservers() { mediaPreviewObservers.forEach(observer => observer.disconnect()); mediaPreviewObservers.clear(); }
   const reviewFooter = document.createElement('div'); reviewFooter.className = 'builder-review-footer'; reviewFooter.hidden = true; modalElement.querySelector('.modal-footer').prepend(reviewFooter);
   const progressCount = document.getElementById('builder-progress-count'), progressBar = document.getElementById('builder-progress-bar');
@@ -40,6 +44,14 @@
   const busy = () => Boolean(state.draft || state.saving || state.mutation);
   const samePage = job => state.jobId === job.id && state.attempt === job.builderAttempt;
   const pageUrl = (jobId, attempt) => `/api/page-builder/${encodeURIComponent(jobId)}?attempt=${attempt}`;
+  function syncAssemblyLock(attempt) {
+    const locked = attempt?.builder?.status === 'running';
+    if (state.assembling === locked) return;
+    state.assembling = locked;
+    if (locked) { save.disabled = true; save.title = ASSEMBLY_HINT; }
+    else { save.title = ''; if (state.draft && !state.saving && !state.picking) save.disabled = false; }
+    if (state.draft) updateReviewAvailability();
+  }
   function focusBlock(id, sectionId) {
     const section = sections().find(item => item.blocks.some(block => block.id === id)) || sections().find(item => item.id === sectionId) || state.document.common;
     if (section.id !== state.document.common.id && state.activeTab !== section.id) { state.activeTab = section.id; render(); }
@@ -87,7 +99,7 @@
     return lineIcon(['M9 5h.01M15 5h.01M9 12h.01M15 12h.01M9 19h.01M15 19h.01'], 'builder-drag-icon');
   }
   async function mutate(next, { id, sectionId, message, focusTabId = null }) {
-    if (busy()) return;
+    if (busy() || state.assembling) return;
     const operation = { jobId: state.jobId, attempt: state.attempt, revision: state.revision, originSectionId: sections().find(section => section.blocks.some(block => block.id === id))?.id || sectionId }; state.mutation = operation; ++state.request;
     state.mutationError = ''; root.inert = true; root.setAttribute('aria-busy', 'true'); renderMutationError(); live.textContent = 'Сохранение…';
     try {
@@ -114,7 +126,7 @@
     }
   }
   function moveBlock(id, sectionId, beforeId = null) {
-    if (busy()) return;
+    if (busy() || state.assembling) return;
     const next = structuredClone(state.document), from = sections(next).find(section => section.blocks.some(block => block.id === id)), to = sections(next).find(section => section.id === sectionId);
     if (!from || !to || beforeId === id) return;
     if (from !== to && to.blocks.length >= 40) { live.textContent = 'В разделе уже 40 блоков.'; return; }
@@ -126,7 +138,7 @@
     void mutate(next, { id, sectionId, message: `Блок «${block.title}» перемещён: ${to.title}, позиция ${index + 1}.` });
   }
   function moveTab(id, targetId, after = false) {
-    if (busy() || id === targetId) return;
+    if (busy() || state.assembling || id === targetId) return;
     const next = structuredClone(state.document), from = next.tabs.findIndex(tab => tab.id === id);
     if (from < 0) return;
     const [tab] = next.tabs.splice(from, 1), target = next.tabs.findIndex(item => item.id === targetId);
@@ -141,14 +153,14 @@
   function dropTarget(element, sectionId, blockId = null) {
     const position = event => blockId && event.clientY < element.getBoundingClientRect().top + element.getBoundingClientRect().height / 2 ? 'before' : 'after';
     element.addEventListener('dragover', event => {
-      if (state.drag?.kind !== 'block' || busy()) return;
+      if (state.drag?.kind !== 'block' || busy() || state.assembling) return;
       event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move';
       root.querySelectorAll('.builder-drop-before, .builder-drop-after, .builder-drop-active').forEach(item => item.classList.remove('builder-drop-before', 'builder-drop-after', 'builder-drop-active'));
       element.classList.add(blockId ? `builder-drop-${position(event)}` : 'builder-drop-active');
     });
     element.addEventListener('dragleave', event => { if (!element.contains(event.relatedTarget)) element.classList.remove('builder-drop-before', 'builder-drop-after', 'builder-drop-active'); });
     element.addEventListener('drop', event => {
-      if (state.drag?.kind !== 'block' || busy()) return;
+      if (state.drag?.kind !== 'block' || busy() || state.assembling) return;
       event.preventDefault(); event.stopPropagation();
       const id = state.drag.id, section = sections().find(item => item.id === sectionId);
       const beforeId = blockId && position(event) === 'before' ? blockId : blockId ? section.blocks[section.blocks.findIndex(block => block.id === blockId) + 1]?.id || null : null;
@@ -156,9 +168,9 @@
     });
   }
   function sectionControls(section, container) {
-    const add = action('', () => createBlock(section.id, add), 'builder-add builder-section-drop'); add.dataset.addSection = section.id; add.disabled = section.blocks.length >= 40;
+    const add = action('', () => createBlock(section.id, add), 'builder-add builder-section-drop'); add.dataset.addSection = section.id; add.disabled = section.blocks.length >= 40 || Boolean(state.assembling);
     add.setAttribute('aria-label', `Добавить блок: ${section.title}`);
-    add.title = `Добавить блок: ${section.title}`;
+    add.title = state.assembling ? ASSEMBLY_HINT : `Добавить блок: ${section.title}`;
     const plus = node('span', 'builder-add-plus', '+'); plus.setAttribute('aria-hidden', 'true');
     add.append(plus);
     add.dataset.dropSection = section.id; dropTarget(add, section.id); container.append(add);
@@ -287,8 +299,8 @@
     // otherwise replace this node before the browser emits native dragstart.
     // Fence polling before the browser's drag threshold: detaching the pressed
     // node between pointerdown and dragstart silently cancels native dragging.
-    handle.addEventListener('pointerdown', event => { if (event.button === 0 && !busy()) { state.drag = { kind: 'block', id: block.id, started: false }; ++state.request; } });
-    handle.addEventListener('dragstart', event => { if (busy()) { event.preventDefault(); return; } closeActionPanels(); state.drag = { kind: 'block', id: block.id, started: true }; ++state.request; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', block.id); column.classList.add('builder-drag-source'); root.classList.add('builder-dragging'); live.textContent = `Перемещение: ${block.title}. Отпустите над блоком, вкладкой или зоной раздела.`; });
+    handle.addEventListener('pointerdown', event => { if (event.button === 0 && !busy() && !state.assembling) { state.drag = { kind: 'block', id: block.id, started: false }; ++state.request; } });
+    handle.addEventListener('dragstart', event => { if (busy() || state.assembling) { event.preventDefault(); return; } closeActionPanels(); state.drag = { kind: 'block', id: block.id, started: true }; ++state.request; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', block.id); column.classList.add('builder-drag-source'); root.classList.add('builder-dragging'); live.textContent = `Перемещение: ${block.title}. Отпустите над блоком, вкладкой или зоной раздела.`; });
     handle.addEventListener('dragend', () => { clearDrag(); const pending = state.pendingJob; if (pending && !busy()) { state.pendingJob = null; void fetchAndRender(pending, Number(pending.pageBuilder?.revision || 0)); } });
     const section = sections().find(item => item.id === sectionId), index = section.blocks.findIndex(item => item.id === block.id);
     const up = action('↑ Выше', () => moveBlock(block.id, sectionId, section.blocks[index - 1]?.id)); up.disabled = index === 0; up.setAttribute('aria-label', `Выше: ${block.title}`);
@@ -302,7 +314,8 @@
     handle.addEventListener('keydown', event => { if (panel.hidden || !['ArrowUp', 'ArrowDown'].includes(event.key)) return; event.preventDefault(); if (event.key === 'ArrowUp' && !up.disabled) up.click(); if (event.key === 'ArrowDown' && !down.disabled) down.click(); });
     disclosure.addEventListener('keydown', event => { if (event.key === 'Escape' && !panel.hidden) { event.preventDefault(); event.stopPropagation(); panel.hidden = true; handle.setAttribute('aria-expanded', 'false'); handle.focus(); } });
     panel.append(up, down, destination); disclosure.append(handle, panel);
-    const remove = action('', () => open(block, 'block', sectionId, remove, 'delete'), 'builder-delete'); remove.setAttribute('aria-label', `Удалить блок: ${block.title}`); remove.title = 'Удалить блок';
+    const remove = action('', () => open(block, 'block', sectionId, remove, 'delete'), 'builder-delete'); remove.setAttribute('aria-label', `Удалить блок: ${block.title}`); remove.title = state.assembling ? ASSEMBLY_HINT : 'Удалить блок';
+    remove.disabled = Boolean(state.assembling);
     remove.append(trashIcon());
     controls.append(disclosure, remove); card.append(controls);
   }
@@ -327,6 +340,7 @@
     const panel = node('div', 'builder-tab-menu-panel'); panel.id = `builder-tab-menu-${tab.id}`; panel.setAttribute('role', 'group'); panel.setAttribute('aria-label', `Действия вкладки «${tab.title}»`);
     const rename = action('Переименовать', () => { closeTabMenu(); open(tab, 'tab', tab.id, trigger); }, 'builder-tab-menu-action');
     const remove = action('Удалить', () => { closeTabMenu(); open(tab, 'tab', tab.id, trigger, 'delete'); }, 'builder-tab-menu-action text-danger');
+    remove.disabled = Boolean(state.assembling); remove.title = state.assembling ? ASSEMBLY_HINT : '';
     rename.dataset.tabMenuAction = 'rename'; remove.dataset.tabMenuAction = 'remove';
     panel.append(rename, remove); container.append(panel); trigger.setAttribute('aria-expanded', 'true'); trigger.setAttribute('aria-controls', panel.id);
     const box = trigger.getBoundingClientRect(), parent = container.getBoundingClientRect();
@@ -381,18 +395,18 @@
       });
       const handle = action('', () => { live.textContent = 'Перетащите вкладку или используйте стрелки влево и вправо для изменения порядка.'; }, 'builder-tab-handle'); handle.append(dragIcon()); handle.draggable = true; handle.dataset.tabHandleId = tab.id;
       handle.setAttribute('aria-label', `Перетащить вкладку: ${tab.title}`); handle.title = 'Перетащить вкладку; стрелки меняют порядок';
-      handle.addEventListener('pointerdown', event => { if (event.button === 0 && !busy()) { state.drag = { kind: 'tab', id: tab.id, started: false }; ++state.request; } });
-      handle.addEventListener('dragstart', event => { if (busy()) { event.preventDefault(); return; } closeTabMenu(); state.drag = { kind: 'tab', id: tab.id, started: true }; ++state.request; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', tab.id); item.classList.add('builder-drag-source'); live.textContent = `Перемещение вкладки «${tab.title}».`; });
+      handle.addEventListener('pointerdown', event => { if (event.button === 0 && !busy() && !state.assembling) { state.drag = { kind: 'tab', id: tab.id, started: false }; ++state.request; } });
+      handle.addEventListener('dragstart', event => { if (busy() || state.assembling) { event.preventDefault(); return; } closeTabMenu(); state.drag = { kind: 'tab', id: tab.id, started: true }; ++state.request; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', tab.id); item.classList.add('builder-drag-source'); live.textContent = `Перемещение вкладки «${tab.title}».`; });
       handle.addEventListener('dragend', () => { clearDrag(); const pending = state.pendingJob; if (pending && !busy()) { state.pendingJob = null; void fetchAndRender(pending, Number(pending.pageBuilder?.revision || 0)); } });
       handle.addEventListener('keydown', event => { if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return; event.preventDefault(); const target = doc.tabs[tabIndex + (event.key === 'ArrowLeft' ? -1 : 1)]; if (target) moveTab(tab.id, target.id, event.key === 'ArrowRight'); });
-      item.addEventListener('dragover', event => { if (state.drag?.kind !== 'tab' || busy()) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; nav.querySelectorAll('.builder-tab-drop-before,.builder-tab-drop-after').forEach(node => node.classList.remove('builder-tab-drop-before', 'builder-tab-drop-after')); item.classList.add(event.clientX < item.getBoundingClientRect().left + item.getBoundingClientRect().width / 2 ? 'builder-tab-drop-before' : 'builder-tab-drop-after'); });
-      item.addEventListener('drop', event => { if (state.drag?.kind !== 'tab' || busy()) return; event.preventDefault(); event.stopPropagation(); const id = state.drag.id, after = event.clientX >= item.getBoundingClientRect().left + item.getBoundingClientRect().width / 2; clearDrag(); moveTab(id, tab.id, after); });
+      item.addEventListener('dragover', event => { if (state.drag?.kind !== 'tab' || busy() || state.assembling) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'move'; nav.querySelectorAll('.builder-tab-drop-before,.builder-tab-drop-after').forEach(node => node.classList.remove('builder-tab-drop-before', 'builder-tab-drop-after')); item.classList.add(event.clientX < item.getBoundingClientRect().left + item.getBoundingClientRect().width / 2 ? 'builder-tab-drop-before' : 'builder-tab-drop-after'); });
+      item.addEventListener('drop', event => { if (state.drag?.kind !== 'tab' || busy() || state.assembling) return; event.preventDefault(); event.stopPropagation(); const id = state.drag.id, after = event.clientX >= item.getBoundingClientRect().left + item.getBoundingClientRect().width / 2; clearDrag(); moveTab(id, tab.id, after); });
       const menu = action('⋯', () => tabMenu(tab, menu, tabs), 'builder-tab-menu-button'); menu.dataset.tabMenuId = tab.id; menu.setAttribute('aria-label', `Действия вкладки: ${tab.title}`); menu.setAttribute('aria-expanded', 'false');
       item.append(handle, button, menu); nav.append(item);
     });
     const addTab = action('', () => createTab(addTab), doc.tabs.length ? 'builder-tab-add' : 'builder-add builder-tab-empty-add');
     const plus = node('span', doc.tabs.length ? '' : 'builder-add-plus', '+'); plus.setAttribute('aria-hidden', 'true'); addTab.append(plus);
-    addTab.dataset.tabAdd = 'true'; addTab.setAttribute('aria-label', 'Добавить вкладку'); addTab.title = 'Добавить вкладку'; addTab.disabled = doc.tabs.length >= 12;
+    addTab.dataset.tabAdd = 'true'; addTab.setAttribute('aria-label', 'Добавить вкладку'); addTab.title = state.assembling ? ASSEMBLY_HINT : 'Добавить вкладку'; addTab.disabled = doc.tabs.length >= 12 || Boolean(state.assembling);
     if (doc.tabs.length) { row.append(nav, addTab); tabs.prepend(row); }
     else tabs.prepend(addTab);
     for (const panel of tabs.querySelectorAll(':scope > .builder-tab-panel')) if (!doc.tabs.some(tab => panel.id === `builder-panel-${tab.id}`)) panel.remove();
@@ -412,6 +426,7 @@
       const selector = focusedTab.kind === 'add' ? '[data-tab-add]' : `[data-${focusedTab.kind === 'handle' ? 'tab-handle-id' : focusedTab.kind === 'menu' ? 'tab-menu-id' : 'tab-id'}="${CSS.escape(focusedTab.id || '')}"]`;
       root.querySelector(selector)?.focus({ preventScroll: true });
     }
+    renderedAssemblyLock = Boolean(state.assembling);
   }
   const field = (label, control) => { const group = node('div', 'mb-3'), caption = node('label', 'form-label', label); caption.htmlFor = control.id; group.append(caption, control); return group; };
   const input = (id, value) => { const control = node('input', 'form-control'); Object.assign(control, { id, value: value || '', type: 'text' }); return control; };
@@ -432,9 +447,9 @@
   function updateReviewAvailability() {
     const status = document.getElementById('builder-review-status'), draft = state.draft;
     if (!status || !draft || state.saving || state.pendingSaved) return;
-    const pending = state.sync?.blocks?.[draft.target.id]?.status !== 'synced' || draft.contentChanged || draft.revision !== state.revision;
+    const pending = state.assembling || state.sync?.blocks?.[draft.target.id]?.status !== 'synced' || draft.contentChanged || draft.revision !== state.revision;
     status.disabled = Boolean(pending);
-    status.title = pending ? 'Проверка доступна после отправки текущей версии в Beget' : '';
+    status.title = state.assembling ? ASSEMBLY_HINT : pending ? 'Проверка доступна после отправки текущей версии в Beget' : '';
     status.options[0].textContent = pending ? STATUS.pending.label : STATUS.unreviewed.label;
     if (pending) { status.value = 'unreviewed'; draft.reviewConfirmed = false; }
     const reason = document.getElementById('builder-review-reason');
@@ -542,7 +557,11 @@
       state.blockTypes.flatMap(item => item.fields).forEach(spec => { if (!allowed.has(spec.name)) delete entity[spec.name]; });
       delete entity.meta; delete entity.sourceFrame; delete entity.items; delete entity.rows; delete entity.columns;
       const restored = typeDrafts.get(entity.type);
-      entity.media = restored ? structuredClone(restored.media) : ['table', 'data-table'].includes(previousType) || ['sections', 'table', 'data-table'].includes(entity.type) ? [] : entity.type === 'big-media' ? entity.media.slice(0, 1) : entity.media;
+      // The site renders pooled media only through the fields of its wire
+      // contract, so a type switch never carries media the target type cannot
+      // display: links/sections/embed drop the pool, content/service keep the
+      // two renderable slots, and grid adopts leftovers as items in gridFields.
+      entity.media = restored ? structuredClone(restored.media) : ['table', 'data-table'].includes(previousType) || ['sections', 'table', 'data-table', 'links', 'embed'].includes(entity.type) ? [] : entity.type === 'big-media' ? entity.media.slice(0, 1) : ['content', 'service'].includes(entity.type) ? entity.media.slice(0, 2) : entity.media;
       if (restored) { const { media, previews, ...fields } = restored; state.draft.previews = structuredClone(previews); Object.assign(entity, fields); }
       if (entity.type === 'links' && !restored) { entity.items = []; entity.meta = { columns: 2, compact: false }; }
       if (entity.type === 'sections' && !restored) { entity.items = []; entity.meta = {}; }
@@ -659,7 +678,7 @@
     container.append(advanced);
   }
   async function openFrameCatalog(draft, entity, trigger, updatePreview) {
-    if (state.picking || state.saving || state.draft !== draft) return;
+    if (state.picking || state.saving || state.assembling || state.draft !== draft) return;
     await drainAutosave(draft); if (state.picking || state.saving || state.draft !== draft) return;
     const controller = new AbortController(); state.picking = controller; save.disabled = true;
     const clearFrame = fields.querySelector('#builder-frame-clear'); if (clearFrame) clearFrame.disabled = true;
@@ -671,7 +690,7 @@
     const close = (restoreFocus = true) => {
       controller.abort(); layer.remove();
       if (state.picking === controller) state.picking = null;
-      if (state.draft === draft) { save.disabled = false; if (clearFrame?.isConnected) clearFrame.disabled = false; }
+      if (state.draft === draft) { save.disabled = Boolean(state.assembling); if (clearFrame?.isConnected) clearFrame.disabled = false; }
       if (state.draft === draft && draft.autosave.savedGeneration < draft.autosave.generation) void drainAutosave(draft);
       if (restoreFocus && trigger.isConnected) trigger.focus({ preventScroll: true });
     };
@@ -742,7 +761,7 @@
     } catch (error) { if (!controller.signal.aborted) { message.textContent = error.message; message.setAttribute('role', 'alert'); } }
   }
   async function openMediaCatalog(draft, entity, asset, kind, key, trigger, renderMedia) {
-    if (state.picking || state.saving || state.draft !== draft) return;
+    if (state.picking || state.saving || state.assembling || state.draft !== draft) return;
     await drainAutosave(draft); if (state.picking || state.saving || state.draft !== draft) return;
     const controller = new AbortController(); state.picking = controller; save.disabled = true;
     const layer = node('div', 'builder-catalog-layer'); layer.setAttribute('role', 'dialog'); layer.setAttribute('aria-modal', 'true'); layer.setAttribute('aria-labelledby', 'builder-catalog-title');
@@ -753,7 +772,7 @@
     const close = (restoreFocus = true) => {
       controller.abort(); layer.remove();
       if (state.picking === controller) state.picking = null;
-      if (state.draft === draft) save.disabled = false;
+      if (state.draft === draft) save.disabled = Boolean(state.assembling);
       if (state.draft === draft && draft.autosave.savedGeneration < draft.autosave.generation) void drainAutosave(draft);
       if (restoreFocus) document.getElementById(trigger.id)?.focus({ preventScroll: true });
     };
@@ -837,7 +856,7 @@
     return { category, icon: lineIcon(paths[category]) };
   }
   async function openDocumentCatalog(draft, entity, item, trigger, renderItems) {
-    if (state.picking || state.saving || state.draft !== draft) return;
+    if (state.picking || state.saving || state.assembling || state.draft !== draft) return;
     await drainAutosave(draft); if (state.picking || state.saving || state.draft !== draft) return;
     const controller = new AbortController(); state.picking = controller; save.disabled = true;
     const layer = node('div', 'builder-catalog-layer builder-document-catalog'); layer.setAttribute('role', 'dialog'); layer.setAttribute('aria-modal', 'true'); layer.setAttribute('aria-labelledby', 'builder-document-catalog-title');
@@ -848,7 +867,7 @@
     const close = (restoreFocus = true) => {
       controller.abort(); layer.remove();
       if (state.picking === controller) state.picking = null;
-      if (state.draft === draft) save.disabled = false;
+      if (state.draft === draft) save.disabled = Boolean(state.assembling);
       if (state.draft === draft && draft.autosave.savedGeneration < draft.autosave.generation) void drainAutosave(draft);
       if (restoreFocus) document.getElementById(trigger.id)?.focus({ preventScroll: true });
     };
@@ -1389,6 +1408,15 @@
   }
   function gridFields(entity, container) {
     entity.items ||= []; entity.meta ||= {};
+    // The site renders grid images only through item references. Adopt every
+    // pooled asset no item points to (legacy galleries, blocks converted from
+    // other types) as its own element, or the image would silently disappear.
+    const adopted = new Set(entity.items.map(item => item.image_asset_id).filter(Boolean));
+    for (const asset of entity.media) {
+      if (adopted.has(asset.id)) continue;
+      adopted.add(asset.id);
+      entity.items.push({ id: `item-${crypto.randomUUID()}`, title: '', text: '', link: '', link_text: '', image_asset_id: asset.id, badge: '', date: '', meta: {} });
+    }
     const section = node('section', 'builder-images-section builder-links-section builder-gallery-section');
     const heading = node('h4', '', 'Элементы'), list = node('div', 'builder-link-items');
     const add = action('', () => {
@@ -1623,12 +1651,12 @@
     }; renderMedia(); return section;
   }
   function createBlock(sectionId, trigger) {
-    if (busy() || sections().find(section => section.id === sectionId).blocks.length >= 40) return;
+    if (busy() || state.assembling || sections().find(section => section.id === sectionId).blocks.length >= 40) return;
     const entity = { id: `block-${crypto.randomUUID()}`, type: 'content', view: 'default', title: '', text: '', content: '', settings: '', media: [], review: { status: 'unreviewed', reason: '' } };
     open(entity, 'block', sectionId, trigger, 'create');
   }
   function createTab(trigger) {
-    if (busy() || state.document.tabs.length >= 12) return;
+    if (busy() || state.assembling || state.document.tabs.length >= 12) return;
     const entity = { id: `tab-${crypto.randomUUID()}`, title: 'Новая вкладка', review: { status: 'unreviewed', reason: '' }, blocks: [] };
     open(entity, 'tab', entity.id, trigger, 'create');
   }
@@ -1644,6 +1672,7 @@
     const draftEntity = locate(draft.target, draft.document); if (!draftEntity) return;
     state.target = target; state.trigger = trigger; state.draft = draft; state.modalShown = false;
     clearMediaPreviewObservers(); clear(fields); clear(reviewFooter); reviewFooter.hidden = true; formError.classList.add('d-none'); save.textContent = mode === 'delete' ? `Удалить ${kind === 'tab' ? 'вкладку' : 'блок'}` : 'Сохранить'; save.classList.toggle('btn-danger', mode === 'delete');
+    save.disabled = Boolean(state.assembling); save.title = state.assembling ? ASSEMBLY_HINT : '';
     document.getElementById('page-builder-modal-title').textContent = mode === 'create' ? `Добавить ${kind === 'tab' ? 'вкладку' : 'блок'}` : `Редактировать ${kind === 'tab' ? 'вкладку' : 'блок'}`; document.getElementById('page-builder-modal-kind').textContent = kind === 'tab' ? 'Вкладка страницы' : 'Блок страницы';
     if (mode === 'delete') {
       document.getElementById('page-builder-modal-title').textContent = `Удалить ${kind === 'tab' ? 'вкладку' : 'блок'}?`;
@@ -1684,12 +1713,14 @@
       fields.removeAttribute('aria-disabled'); reviewFooter.removeAttribute('aria-disabled');
       save.textContent = savingLabel;
     }
-    save.disabled = busy; save.classList.toggle('btn-loading', busy); modalElement.toggleAttribute('aria-busy', busy);
+    save.disabled = busy || Boolean(state.assembling); save.classList.toggle('btn-loading', busy); modalElement.toggleAttribute('aria-busy', busy);
     modalElement.querySelectorAll('[data-bs-dismiss="modal"]').forEach(control => { control.disabled = busy; control.setAttribute('aria-disabled', String(busy)); });
   }
   function scheduleAutosave(contentChanged) {
     const draft = state.draft;
     if (!draft?.autosave || draft.mode === 'delete') return;
+    // Во время сборки черновик не копит несохранённые правки: закрытие остаётся чистым.
+    if (state.assembling) return;
     const autosave = draft.autosave; autosave.generation++;
     if (contentChanged) { draft.contentChanged = true; autosave.contentGeneration = autosave.generation; }
     window.clearTimeout(autosave.timer); autosave.timer = null;
@@ -1752,6 +1783,9 @@
       if (edited.type === 'service' || edited.type === 'content') edited.media = edited.media.slice(0, 2);
       if (edited.type === 'table') { const referenced = tableReferencedMedia(edited); edited.media = edited.media.filter(asset => referenced.has(asset.id)); }
       if (edited.type === 'rich-content' || edited.type === 'data-table') edited.media = [];
+      // Links, sections and embeds render no images at all, so their legacy
+      // pools (invisible in the editor) are dropped instead of failing the save.
+      if (edited.type === 'links' || edited.type === 'sections' || edited.type === 'embed') edited.media = [];
       if (draft.reviewConfirmed && reviewStatus !== 'unreviewed') edited.reviewedRevision = draft.revision;
     }
     if (!replaceDraftTarget(next, draft, edited)) return invalidDraft('Раздел редактируемого объекта больше не существует.', null, showErrors);
@@ -1783,6 +1817,7 @@
   async function drainAutosave(draft, showErrors = false) {
     if (state.draft !== draft || !draft.autosave) return false;
     if (state.picking) return false;
+    if (state.assembling) return false;
     const autosave = draft.autosave; window.clearTimeout(autosave.timer); autosave.timer = null;
     if (autosave.conflict) {
       formError.textContent = saveErrorMessage(new Error(autosave.conflict), 'Не удалось сохранить локальные изменения'); formError.classList.remove('d-none'); live.textContent = formError.textContent;
@@ -1837,6 +1872,8 @@
   }
   modalElement.addEventListener('hide.bs.modal', event => {
     if (state.saving || state.picking) { event.preventDefault(); return; }
+    // При работающей сборке закрытие разрешено: локальные правки молча отбрасываются.
+    if (state.assembling) return;
     const draft = state.draft, autosave = draft?.autosave;
     if (!autosave || autosave.allowClose) { if (autosave) autosave.allowClose = false; return; }
     if (autosave.savedGeneration < autosave.generation || autosave.inFlight) { event.preventDefault(); void closeAfterAutosave(draft, true); }
@@ -1847,7 +1884,7 @@
     if (state.pendingSaved || state.draft?.closeWhenShown) { if (state.draft) state.draft.closeWhenShown = false; window.tabler.Modal.getInstance(modalElement).hide(); }
   });
   form.addEventListener('submit', async event => {
-    event.preventDefault(); if (state.saving || state.pendingSaved || state.picking) return;
+    event.preventDefault(); if (state.saving || state.pendingSaved || state.picking || state.assembling) return;
     formError.classList.add('d-none'); const draft = state.draft, target = draft && locate(draft.target, draft.document); if (!target) return;
     const advertised = state.pendingJob, currentJobId = advertised?.id || state.jobId;
     if (draft.jobId !== currentJobId || draft.attempt !== (advertised?.builderAttempt ?? state.attempt)) { formError.textContent = 'Страница обновилась: открыта другая попытка. Локальные правки оставлены в редакторе.'; formError.classList.remove('d-none'); return; }
@@ -1907,6 +1944,7 @@
     state.target = null; state.trigger = null; state.draft = null; state.saving = null; state.pendingSaved = null; state.pendingJob = null; savingUi(false); window.ArmEditors.destroy('builder-content'); clear(fields); clear(reviewFooter); reviewFooter.hidden = true;
     if (trigger?.isConnected) trigger.focus({ preventScroll: true });
     window.setTimeout(async () => {
+      if (state.document && renderedAssemblyLock !== Boolean(state.assembling)) render();
       if (pendingJob && !samePage(pendingJob)) { await fetchAndRender(pendingJob, Number(pendingJob.pageBuilder?.revision || 0)); await state.refresh?.(); return; }
       if (saved) {
         acceptDocument(saved, target?.kind === 'block' ? target.id : null);
@@ -1921,7 +1959,10 @@
   async function load(job, options) {
     const attempt = options.attempt || job.attempts.at(-1);
     job = { ...job, builderAttempt: attempt.number, pageBuilder: attempt.pageBuilder, mediaContext: { attempt: attempt.number, htmlRevision: attempt.htmlMedia?.revision || 0 } };
-    state.api = options.api; state.refresh = options.refresh; const revision = Number(job.pageBuilder?.revision || 0);
+    state.api = options.api; state.refresh = options.refresh;
+    syncAssemblyLock(attempt);
+    if (state.document && !busy() && !state.drag && renderedAssemblyLock !== Boolean(state.assembling)) render();
+    const revision = Number(job.pageBuilder?.revision || 0);
     const syncChanged = job.pageBuilder?.syncVersion !== state.sync?.version;
     if (samePage(job) && state.document && syncChanged && state.draft && !state.saving && !state.syncRequest) {
       const current = state.draft, generation = state.request; state.syncRequest = current;

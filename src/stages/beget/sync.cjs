@@ -5,6 +5,7 @@ const domains = require('../../resources/domains.json');
 const { loadConfig } = require('./config.cjs');
 const { createSshTransport } = require('./ssh.cjs');
 const { readChecked, checkedPath } = require('../../infrastructure/media.cjs');
+const { computeSorts, sectionKey } = require('./sorts.cjs');
 const digest = value => crypto.createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 const conflict = message => Object.assign(new Error(message), { statusCode: 409 });
 function destinationIdentity(config) {
@@ -20,12 +21,20 @@ function legacyId(value, mapping = domains) {
   if (matches.length !== 1 || !/^[1-9]\d*$/.test(matches[0][0])) throw new Error(`Для ${host} требуется единственное соответствие старому ID компании`);
   const id = Number(matches[0][0]); if (!Number.isSafeInteger(id)) throw new Error('Старый ID компании некорректен'); return id;
 }
-function desired(document) {
+// The desired hash follows the sticky sort, not the list index: untouched
+// objects keep their hash through any move of their neighbours. Without sorts
+// (an external call or a journal from before sticky sorts) the computation
+// degrades to the fixed migration order (index + 1) * 10.
+function desired(document, sorts) {
+  const sticky = sorts || computeSorts(null, document);
   const tabs = {}, blocks = {};
-  document.tabs.forEach((tab, index) => { tabs[tab.id] = digest({ title: tab.title, sort: index }); });
-  [document.common, ...document.tabs].forEach(section => section.blocks.forEach((block, index) => {
-    blocks[block.id] = digest({ section: section === document.common ? null : section.id, sort: index, block: withoutReview(block) });
-  }));
+  document.tabs.forEach(tab => { tabs[tab.id] = digest({ title: tab.title, sort: sticky.tabs[tab.id] }); });
+  [document.common, ...document.tabs].forEach(section => {
+    const key = sectionKey(document, section);
+    section.blocks.forEach(block => {
+      blocks[block.id] = digest({ section: section === document.common ? null : section.id, sort: sticky.sections[key][block.id], block: withoutReview(block) });
+    });
+  });
   return { hash: digest({ tabs, blocks }), tabs, blocks };
 }
 function snapshotAssets(snapshot) {
@@ -124,7 +133,8 @@ class BegetSync {
     return this.destinationError(record) ? null : record.company?.id || null;
   }
   projection(jobId, attempt, document) {
-    const target = desired(document), record = this.record(jobId, attempt);
+    const record = this.record(jobId, attempt);
+    const target = desired(document, computeSorts(record.sorts || null, document));
     const destinationError = this.destinationError(record);
     const currentAttempt = this.queue.get(jobId).attempts.at(-1).number;
     const acknowledged = !destinationError && record.acknowledged?.attempt === attempt && currentAttempt === attempt ? record.acknowledged : null;
@@ -141,7 +151,12 @@ class BegetSync {
     return result;
   }
   enforceReview(jobId, attempt, current, next) {
-    const before = desired(current), after = desired(next), record = this.record(jobId, attempt);
+    const record = this.record(jobId, attempt);
+    // Both snapshots derive from the same stored sorts: a hash changes only for
+    // objects that really moved (or changed), never for the blocks that merely
+    // shifted positions between the old and the new index of a neighbour.
+    const before = desired(current, computeSorts(record.sorts || null, current));
+    const after = desired(next, computeSorts(record.sorts || null, next));
     const ack = !this.destinationError(record) && record.acknowledged?.attempt === attempt && this.queue.get(jobId).attempts.at(-1).number === attempt ? record.acknowledged : null;
     const previous = new Map([current.common, ...current.tabs].flatMap(section => section.blocks.map(block => [block.id, block])));
     for (const section of [next.common, ...next.tabs]) for (const block of section.blocks) {

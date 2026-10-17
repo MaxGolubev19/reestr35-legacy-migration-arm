@@ -1,0 +1,22 @@
+{
+  "version": "1.0",
+  "storage": {
+    "tabs_iblock": 14,
+    "blocks_iblock": 15,
+    "content_iblock": 16,
+    "media_iblock": 17,
+    "canonical_html_field": "text"
+  },
+  "types": [
+    {"name":"big-media","id":1,"component":"company.block.big-media","default_view":"default","views":["default","hero","compact"],"payload_fields":["title","text","link","link_text","image_asset_id","view","meta"],"meta_keys":["ratio","fit","media_mode","media_width","media_align"],"item_fields":[],"item_meta_keys":[]},
+    {"name":"table","id":2,"component":"company.block.table","default_view":"default","views":["default"],"payload_fields":["title","text","show_border","view","meta","rows"],"meta_keys":[],"item_fields":["title","text","link","image_asset_id","image_asset_ids","colspan","rowspan","is_header","align","media_mode","media_width","media_align","meta"],"item_meta_keys":["colspan","rowspan","is_header","align","image_asset_ids","media_mode","media_width","media_align"],"legacy_table":{"row_fields":["cells"],"cell_fields":["title","text","link","image_asset_id","image_asset_ids","colspan","rowspan","is_header","align","media_mode","media_width","media_align","meta"],"cell_meta_keys":["colspan","rowspan","is_header","align","image_asset_ids","media_mode","media_width","media_align"]}},
+    {"name":"service","id":3,"component":"company.block.service","default_view":"default","views":["default","media-left","media-right","plain"],"payload_fields":["title","text","link","link_text","badge","left_image_asset_id","right_image_asset_id","view","meta"],"meta_keys":["image_ratio","image_fit","action_style","media_mode","media_width","media_align"],"item_fields":[],"item_meta_keys":[]},
+    {"name":"content","id":4,"component":"company.block.content","default_view":"default","views":["default","narrow","note"],"payload_fields":["title","text","link","link_text","left_image_asset_id","right_image_asset_id","view","meta"],"meta_keys":["image_position","image_layout","image_ratio","image_fit","media_mode","media_width","media_align"],"item_fields":[],"item_meta_keys":[]},
+    {"name":"grid","id":5,"component":"company.block.grid","default_view":"default","views":["default","gallery","catalog","compact","promo","news","services","list"],"payload_fields":["title","text","view","meta","items"],"meta_keys":["columns","image_ratio","image_fit","show_border","item_max_width","items_align","media_mode","media_width","media_align"],"item_fields":["title","text","link","link_text","badge","date","image_asset_id","meta"],"item_meta_keys":["badge","date","date_iso","action_style","media_mode","media_width","media_align"]},
+    {"name":"data-table","id":6,"component":"company.block.data-table","default_view":"default","views":["default","compact"],"payload_fields":["title","text","view","meta","columns","rows","caption"],"meta_keys":["caption","columns","striped","bordered","sticky_header","min_width"],"item_fields":[],"item_meta_keys":[],"data_table":{"column_fields":["key","title","align","width","nowrap"],"group_row_fields":["group"],"row_fields":["cells"],"cell_fields":["value","key","align","colspan","rowspan","is_header","nowrap"]}},
+    {"name":"links","id":7,"component":"company.block.links","default_view":"links","views":["links","documents"],"payload_fields":["title","text","view","meta","items"],"meta_keys":["columns","compact"],"item_fields":["title","text","link","link_text","meta"],"item_meta_keys":["kind","target","file_id","file_type","size","download"]},
+    {"name":"sections","id":8,"component":"company.block.sections","default_view":"list","views":["list","columns","contacts"],"payload_fields":["title","text","view","meta","items"],"meta_keys":["columns","compact","show_icons"],"item_fields":["title","text","link","link_text","meta","children"],"item_meta_keys":["kind","target"]},
+    {"name":"embed","id":9,"component":"company.block.embed","default_view":"default","views":["default","wide","map"],"payload_fields":["title","text","link","source_url","provider","ratio","view","meta"],"meta_keys":["map_height"],"item_fields":[],"item_meta_keys":[]},
+    {"name":"rich-content","id":10,"component":"company.block.rich-content","default_view":"default","views":["default","wide","compact"],"payload_fields":["title","text","reason","view","meta"],"meta_keys":[],"item_fields":[],"item_meta_keys":[]}
+  ]
+}

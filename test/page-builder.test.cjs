@@ -257,6 +257,13 @@ test('portable type catalog has fixed IDs, views and defaults; scalar and media 
   }
 });
 
+test('portable block catalog matches the bundled Beget contract snapshot', () => {
+  const snapshot = JSON.parse(fs.readFileSync(path.join(__dirname, '../src/resources/company-block-contract.v1.json'), 'utf8'));
+  assert.equal(snapshot.version, '1.0');
+  const fields = ({ name, id, views, default_view }) => ({ name, id, views, default_view });
+  assert.deepEqual(BLOCK_TYPES.map(fields), snapshot.types.map(fields));
+});
+
 test('data-table round trips columns, group rows and literal HTML cells with stable IDs and CAS', async t => {
   const { queue, job, base, headers } = await fixture(t), initial = queue.pageBuilder.read(job.id), document = structuredClone(initial.document);
   const block = document.common.blocks[0]; Object.assign(block, { type: 'data-table', view: 'compact', media: [], review: { status: 'unreviewed', reason: '' }, caption: '  Подпись  ', meta: { striped: false, bordered: true, sticky_header: true, min_width: 640 },
@@ -465,7 +472,7 @@ test('content meta round trips through API, supports unset placement, and reject
 test('embed map height round trips through API and older embed remains valid', async t => {
   const { queue, job, base, headers } = await fixture(t), initial = queue.pageBuilder.read(job.id);
   const document = structuredClone(initial.document), block = document.common.blocks[0];
-  Object.assign(block, { type: 'embed', view: 'map', source_url: 'https://example.org/map', link: '/map', provider: 'map', ratio: '4:3', text: 'Старый текст' });
+  Object.assign(block, { type: 'embed', view: 'map', media: [], source_url: 'https://example.org/map', link: '/map', provider: 'map', ratio: '4:3', text: 'Старый текст' });
   assert.equal(Object.hasOwn(validateDocument(document).common.blocks[0], 'meta'), false);
   fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ ...initial, document })); // A pre-existing URL remains editable.
   block.meta = { map_height: 560 };
@@ -504,12 +511,15 @@ test('ordinary block fields are optional, empty media is safe, and failed review
     const document = structuredClone(stored.document);
     document.common.blocks = [{ id: 'empty-block', type: type.name, view, title: '', text: '', content: '', settings: '', media: [{ id: 'empty-image', originalUrl: '', bigUrl: '', href: '', alt: '', caption: '' }], review: { status: 'unreviewed', reason: '' }, ...Object.fromEntries(type.fields.map(field => [field.name, ''])) }];
     if (type.name === 'rich-content') Object.assign(document.common.blocks[0], { text: '<p>Текст</p>', reason: 'Сохранить порядок разметки' });
-    if (type.name === 'data-table') document.common.blocks[0].media = [];
+    // The wire contract renders images only through type-specific references;
+    // types without a rendering field keep no pool, grid binds its pool to an item.
+    if (['data-table', 'table', 'links', 'sections', 'embed', 'rich-content'].includes(type.name)) document.common.blocks[0].media = [];
+    if (type.name === 'grid') document.common.blocks[0].items = [{ id: 'empty-item', title: '', text: '', link: '', link_text: '', image_asset_id: 'empty-image', badge: '', date: '', meta: {} }];
     stored = queue.pageBuilder.write(job.id, stored.revision, document);
     assert.equal(stored.document.common.blocks[0].title, ''); assert.equal(stored.document.common.blocks[0].text, type.name === 'rich-content' ? '<p>Текст</p>' : '');
+    if (document.common.blocks[0].media.length) assert.equal((await fetch(`${base}/api/page-builder/${job.id}/media/empty-image`)).status, 200, 'an empty saved image has a local placeholder');
   }
   const url = `${base}/api/page-builder/${job.id}`;
-  assert.equal((await fetch(`${url}/media/empty-image`)).status, 200, 'an empty saved image has a local placeholder');
   const invalid = structuredClone(stored.document); invalid.common.blocks[0].review = { status: 'failed', reason: '   ' };
   assert.equal((await fetch(url, { method: 'POST', headers, body: JSON.stringify({ revision: stored.revision, document: invalid }) })).status, 400);
   assert.equal(queue.pageBuilder.read(job.id).revision, stored.revision);
@@ -540,7 +550,7 @@ test('empty image variants accept a valid href and reject an invalid href', asyn
 test('rich-content requires HTML and justification on write while old empty blocks remain readable', async t => {
   const { queue, job, base, headers } = await fixture(t), initial = queue.pageBuilder.read(job.id), endpoint = `${base}/api/page-builder/${job.id}`;
   const request = document => fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ revision: queue.pageBuilder.read(job.id).revision, document }) });
-  const changed = structuredClone(initial.document), block = changed.common.blocks[0]; block.type = 'rich-content'; block.view = 'default'; block.text = ''; block.reason = '';
+  const changed = structuredClone(initial.document), block = changed.common.blocks[0]; block.type = 'rich-content'; block.view = 'default'; block.text = ''; block.reason = ''; block.media = []; // a type switch never carries media into a type that renders none
   assert.equal((await request(changed)).status, 400, 'new rich block needs HTML');
   block.text = '<p>Текст</p>'; assert.equal((await request(changed)).status, 400, 'new rich block needs justification');
   block.reason = 'Сохранить семантику'; const accepted = await request(changed); assert.equal(accepted.status, 200, await accepted.clone().text());
@@ -548,10 +558,44 @@ test('rich-content requires HTML and justification on write while old empty bloc
   const legacy = structuredClone(queue.pageBuilder.read(job.id).document); legacy.common.blocks[0].text = ''; legacy.common.blocks[0].reason = '';
   const before = queue.pageBuilder.read(job.id), file = queue.pageBuilder.file(job.id); fs.writeFileSync(file, JSON.stringify({ revision: before.revision, updatedAt: before.updatedAt, document: legacy }));
   const bytes = fs.readFileSync(file), read = queue.pageBuilder.read(job.id); assert.equal(read.document.common.blocks[0].text, ''); assert.deepEqual(fs.readFileSync(file), bytes, 'read leaves old JSON untouched');
-  const unrelated = structuredClone(read.document); unrelated.common.blocks[1].title = 'Другое название';
+  const unrelated = structuredClone(read.document); unrelated.common.title = 'Другое название';
   assert.equal((await request(unrelated)).status, 200, 'unrelated changes can preserve an old empty rich block');
   const edited = structuredClone(queue.pageBuilder.read(job.id).document); edited.common.blocks[0].title = 'Изменённый HTML';
   assert.equal((await request(edited)).status, 400, 'editing old rich block requires filling both fields');
+});
+
+test('wire image mechanics reject edited blocks while old documents stay readable and savable', async t => {
+  const { queue, job, base, headers } = await fixture(t), initial = queue.pageBuilder.read(job.id), endpoint = `${base}/api/page-builder/${job.id}`;
+  const request = document => fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ revision: queue.pageBuilder.read(job.id).revision, document }) });
+  const asset = id => ({ id, originalUrl: `https://mori-cinema.reestr35.ru/${id}.jpg`, bigUrl: '', href: '', alt: '', caption: '' });
+  const document = structuredClone(initial.document);
+  document.common.blocks = [
+    { id: 'legacy-grid', type: 'grid', view: 'gallery', title: 'Галерея', text: '', content: '', settings: '', media: [asset('orphan-photo'), asset('card-photo')], items: [{ id: 'legacy-item', title: 'Кадр', text: '', link: '', link_text: '', image_asset_id: 'card-photo', badge: '', date: '', meta: {} }], review: { status: 'unreviewed', reason: '' }, meta: {} },
+    { id: 'legacy-content', type: 'content', view: 'default', title: 'Текст', text: '', content: '', settings: '', media: [asset('left'), asset('right'), asset('invisible')], review: { status: 'unreviewed', reason: '' } },
+    { id: 'legacy-links', type: 'links', view: 'links', title: 'Ссылки', text: '', content: '', settings: '', media: [asset('logo')], items: [], review: { status: 'unreviewed', reason: '' }, meta: {} },
+    { id: 'legacy-rich', type: 'rich-content', view: 'default', title: 'Фрагмент', text: '<p>Старый HTML</p>', reason: 'Порядок разметки', content: '', settings: '', media: [asset('rich-photo')], review: { status: 'unreviewed', reason: '' } }
+  ];
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ revision: initial.revision, updatedAt: initial.updatedAt, document }));
+  const bytes = fs.readFileSync(queue.pageBuilder.file(job.id));
+  const read = queue.pageBuilder.read(job.id);
+  assert.equal(read.document.common.blocks.length, 4);
+  assert.deepEqual(fs.readFileSync(queue.pageBuilder.file(job.id)), bytes, 'reading old documents with orphaned media never rewrites them');
+  const unrelated = structuredClone(read.document); unrelated.common.title = 'Другая общая часть';
+  assert.equal((await request(unrelated)).status, 200, 'untouched legacy blocks keep saving alongside unrelated edits');
+  const reject = async edit => { const response = await request(edit()); assert.equal(response.status, 400); return (await response.json()).error; };
+  const gridEdit = structuredClone(queue.pageBuilder.read(job.id).document); gridEdit.common.blocks[0].title = 'Изменённая галерея';
+  assert.match(await reject(() => gridEdit), /блока legacy-grid[\s\S]*orphan-photo[\s\S]*item\.image_asset_id/);
+  const contentEdit = structuredClone(queue.pageBuilder.read(job.id).document); contentEdit.common.blocks[1].text = 'Новый текст';
+  assert.match(await reject(() => contentEdit), /Блок legacy-content отображает не более двух изображений/);
+  const linksEdit = structuredClone(queue.pageBuilder.read(job.id).document); linksEdit.common.blocks[2].title = 'Изменённые ссылки';
+  assert.match(await reject(() => linksEdit), /Блок legacy-links не отображает изображения/);
+  const richEdit = structuredClone(queue.pageBuilder.read(job.id).document); richEdit.common.blocks[3].title = 'Изменённый фрагмент';
+  assert.match(await reject(() => richEdit), /Блок legacy-rich не отображает изображения/);
+  const fixed = structuredClone(queue.pageBuilder.read(job.id).document);
+  fixed.common.blocks[0].items.push({ id: 'adopted-item', title: 'Фото', text: '', link: '', link_text: '', image_asset_id: 'orphan-photo', badge: '', date: '', meta: {} });
+  fixed.common.blocks[1].media.pop(); fixed.common.blocks[2].media = []; fixed.common.blocks[3].media = [];
+  const repaired = await request(fixed); assert.equal(repaired.status, 200, await repaired.clone().text());
+  assert.equal(queue.pageBuilder.read(job.id).document.common.blocks[0].items.length, 2);
 });
 
 test('content, type, view and media edits reset review unless explicitly reconfirmed at the submitted revision', async t => {
@@ -788,7 +832,7 @@ test('frame catalog preserves occurrences, separates selectable URLs from previe
   assert.equal(chosenResponse.status, 200); const chosen = await chosenResponse.json();
   assert.deepEqual(chosen.sourceFrame, { attempt: 1, revision: 1, resourceId: 2, sourceSha256: manifest.source.sha256 });
   const stored = queue.pageBuilder.read(job.id), document = structuredClone(stored.document), block = document.common.blocks[0];
-  Object.assign(block, { type: 'embed', view: 'default', source_url: chosen.source_url, sourceFrame: chosen.sourceFrame });
+  Object.assign(block, { type: 'embed', view: 'default', media: [], source_url: chosen.source_url, sourceFrame: chosen.sourceFrame });
   const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify({ revision: stored.revision, document }) });
   assert.equal(response.status, 200, await response.clone().text()); const saved = await response.json();
   assert.deepEqual(saved.document.common.blocks[0].sourceFrame, chosen.sourceFrame); assert.equal(saved.frames[block.id].resourceId, 2);
@@ -811,7 +855,7 @@ test('frame API rejects stale context, foreign resources, unsafe entries and req
 test('frame writes reject URL and provenance forgery, HTML corruption and stale selection without changing durable document', async t => {
   const { queue, job } = await fixture(t), { request, attempt, manifest } = seedFrames(queue, job), chosen = queue.framePicker.choose(job.id, request, 1);
   const stored = queue.pageBuilder.read(job.id), document = structuredClone(stored.document), block = document.common.blocks[0];
-  Object.assign(block, { type: 'embed', view: 'default', source_url: chosen.source_url, sourceFrame: chosen.sourceFrame });
+  Object.assign(block, { type: 'embed', view: 'default', media: [], source_url: chosen.source_url, sourceFrame: chosen.sourceFrame });
   const before = fs.readFileSync(queue.pageBuilder.file(job.id));
   for (const change of [{ source_url: 'https://rutube.ru/forged' }, { sourceFrame: { ...chosen.sourceFrame, resourceId: 3 } }, { sourceFrame: { ...chosen.sourceFrame, sourceSha256: '0'.repeat(64) } }, { sourceFrame: { ...chosen.sourceFrame, attempt: 2 } }]) {
     const forged = structuredClone(document); Object.assign(forged.common.blocks[0], change);
@@ -827,7 +871,7 @@ test('frame writes reject URL and provenance forgery, HTML corruption and stale 
 });
 test('empty, missing and unsupported frame inventories are explicit; legacy and unchanged historic sources remain editable', async t => {
   const { queue, job, base } = await fixture(t), stored = queue.pageBuilder.read(job.id), document = structuredClone(stored.document), block = document.common.blocks[0];
-  Object.assign(block, { type: 'embed', view: 'map', source_url: 'https://rutube.ru/legacy-without-manifest' });
+  Object.assign(block, { type: 'embed', view: 'map', media: [], source_url: 'https://rutube.ru/legacy-without-manifest' });
   fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify({ ...stored, document }));
   let read = await (await fetch(`${base}/api/page-builder/${job.id}`)).json(); assert.match(read.frames[block.id].reason, /не найден/); assert.equal(read.frames[block.id].resolvedUrl, undefined);
   block.title = 'Legacy edit'; let saved = queue.pageBuilder.write(job.id, stored.revision, document); assert.equal(saved.document.common.blocks[0].source_url, block.source_url);
