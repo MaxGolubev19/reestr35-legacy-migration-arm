@@ -4620,7 +4620,8 @@ test('header restart is contextual: full retry, step 2 restart, agent assembly a
   const assembleBody = page.waitForRequest(request => request.url().endsWith(`/api/page-builder/${second.id}/assemble`) && request.postData() === '{"force":true}');
   await recapture.click();
   await assembleBody;
-  await page.waitForFunction(() => !document.querySelector('#global-alert').classList.contains('d-none') && /Ошибка сборки: /.test(document.querySelector('#global-alert').textContent));
+  await page.waitForFunction(() => !document.querySelector('#builder-error').classList.contains('d-none') && /Ошибка сборки: /.test(document.querySelector('#builder-error').textContent));
+  assert.equal(await page.locator('#global-alert').isVisible(), false, 'assembly failures stay inside the step 3 panel');
   assert.deepEqual(dialogs, [], 'assembly from the header never asks for confirmation');
   assert.equal(await page.locator('#builder-agent-panel, #builder-assemble, #builder-assemble-cancel, #builder-agent-status').count(), 0, 'the assembly panel is gone');
   assert.equal(second.attempts[0].builder.status, 'failed');
@@ -4632,7 +4633,7 @@ test('header restart is contextual: full retry, step 2 restart, agent assembly a
   const growing = await readSeconds();
   await page.waitForFunction(from => { const value = document.querySelector('#attempt-duration').textContent.split(':').reduce((sum, part) => sum * 60 + Number(part), 0); return value > from; }, growing, { timeout: 8000 });
   built.builder.status = 'complete'; queue.save();
-  await page.waitForFunction(() => document.querySelector('#global-alert').classList.contains('d-none'), null, { timeout: 8000 });
+  await page.waitForFunction(() => document.querySelector('#builder-error').classList.contains('d-none'), null, { timeout: 8000 });
   const frozen = await readSeconds();
   await page.waitForTimeout(2200);
   assert.equal(await readSeconds(), frozen, 'the timer stops when the assembly finishes');

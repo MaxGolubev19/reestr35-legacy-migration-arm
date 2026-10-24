@@ -59,7 +59,8 @@
     submitting: false,
     pendingActions: new Map(),
     jobDragId: null,
-    jobReorderPending: false
+    jobReorderPending: false,
+    builderActionError: null
   };
 
   const el = Object.fromEntries([
@@ -69,7 +70,7 @@
     "job-detail", "detail-url", "company-id", "result-steps", "attempt-duration", "detail-id",
     "detail-created", "attempt-select", "attempt-meta", "files-list", "recapture-button",
     "stage-step-1", "stage-step-2", "stage-step-3", "gallery-body",
-    "metadata-panel", "summary-panel", "stage-two-panel", "stage-three-panel", "attempt-header",
+    "metadata-panel", "summary-panel", "stage-two-panel", "stage-three-panel", "builder-error", "attempt-header",
     "technical-area", "media-source-panel", "media-source-meta", "media-outcome-panel", "media-outcome-status", "media-outcome-meta",
     "summary-output", "issues-output", "logs-card", "stdout-output",
     "stderr-output", "stdout-truncated", "stderr-truncated", "png-gallery",
@@ -679,11 +680,15 @@
     recapture.setAttribute("aria-busy", String(loading));
   }
 
-  // Assembly failures surface in the shared alert area under the header; every
-  // other builder state stays to the step 3 progress elements.
-  function builderAlert() {
-    const builder = currentAttempt(state.jobs.find(candidate => candidate.id === state.selectedJobId))?.builder;
-    return builder?.status === "failed" && builder.error ? `Ошибка сборки: ${builder.error}` : "";
+  // Assembly failures belong to the step 3 panel of the selected attempt, like
+  // step 1-2 errors stay inside their stage; the global alert stays app-level.
+  function renderBuilderError(job, attempt) {
+    const builder = attempt?.builder;
+    const failure = builder?.status === "failed" && builder.error ? `Ошибка сборки: ${builder.error}` : "";
+    const actionError = state.builderActionError && state.builderActionError.jobId === job?.id ? state.builderActionError.message : "";
+    const message = failure || actionError;
+    el["builder-error"].textContent = message;
+    el["builder-error"].classList.toggle("d-none", !message);
   }
 
   // Every builder action shares the assemble:<id> pending key: one in-flight
@@ -694,6 +699,7 @@
     if (!attempts.length) return; // сборка действует только на последнюю попытку
     const pending = { action, confirmAfterGeneration: Number.POSITIVE_INFINITY };
     state.pendingActions.set(`assemble:${job.id}`, pending);
+    state.builderActionError = null;
     renderDetail();
     if (state.selectedJobId === job.id) {
       const recapture = document.getElementById("recapture-button");
@@ -707,7 +713,6 @@
       control.setAttribute("aria-busy", String(clicked));
       updateActionTooltip(control);
     }
-    showGlobalError("");
     let accepted = false;
     try {
       await api(`/api/page-builder/${encodeURIComponent(job.id)}/${action}`, {
@@ -720,7 +725,7 @@
       pending.confirmAfterGeneration = state.refreshGeneration + 1;
       if (!state.refreshPromise) await refreshState();
     } catch (error) {
-      showGlobalError(error instanceof Error ? error.message : String(error));
+      state.builderActionError = { jobId: job.id, message: error instanceof Error ? error.message : String(error) };
       if (!accepted) {
         state.pendingActions.delete(`assemble:${job.id}`);
         renderJobs();
@@ -773,6 +778,7 @@
     el["qa-progress"].classList.toggle("stage-hidden", !firstStage);
     el["media-progress"].classList.toggle("stage-hidden", state.activeStage !== 2);
     el["builder-progress"].classList.toggle("stage-hidden", state.activeStage !== 3);
+    renderBuilderError(job, attempt);
     window.HtmlMedia.render(job, attempt, { csrfToken: state.csrfToken, refresh: () => refreshState() });
     renderRecapture(job, attempt);
     if (state.activeStage === 3) window.PageBuilder.render(job, { api, attempt, refresh: () => refreshState() });
@@ -1284,7 +1290,7 @@
         if (!state.shutdownRequested) {
           state.localFailures = 0;
           setConnection("connected");
-          if (!state.shutdownError) showGlobalError(builderAlert());
+          if (!state.shutdownError) showGlobalError("");
         }
         await refreshSelectedLogs();
       } while (state.refreshQueued && !state.stopped);
