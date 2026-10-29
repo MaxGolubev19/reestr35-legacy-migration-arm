@@ -66,7 +66,7 @@ test('URL policy and canonical dedupe', t => {
   assert.ok(layout('root', { id: 'job', url: 'https://con.reestr35.ru' }, { number: 1 }).hostDir.endsWith('_con.reestr35.ru'));
 });
 
-test('FIFO concurrency 2, fixed arguments, stdin, and new retry attempt', async t => {
+test('FIFO concurrency 2, fixed arguments, stdin, and retry replaces the attempt', async t => {
   const { queue, children, calls, root } = setup(t);
   queue.add('https://a.reestr35.ru\nhttps://b.reestr35.ru\nhttps://c.reestr35.ru');
   queue.pump();
@@ -77,8 +77,10 @@ test('FIFO concurrency 2, fixed arguments, stdin, and new retry attempt', async 
   assert.equal(children.length, 3); assert.equal(queue.jobs[0].attempts[0].status, 'incomplete', 'an unfinished report cannot complete the capture');
   children[1].finish(1); children[2].finish(1);
   queue.retry(queue.jobs[0].id);
-  assert.equal(queue.jobs[0].attempts.length, 2); assert.ok(fs.existsSync(layout(root, queue.jobs[0], queue.jobs[0].attempts[0]).report));
-  assert.ok(!fs.existsSync(layout(root, queue.jobs[0], queue.jobs[0].attempts[1]).report));
+  assert.equal(queue.jobs[0].attempts.length, 1, 'retry keeps exactly one attempt');
+  assert.equal(queue.jobs[0].attempts[0].number, 2, 'numbering stays monotonic so the folder name never repeats');
+  assert.equal(fs.existsSync(layout(root, queue.jobs[0], { number: 1 }).dir), false, 'the replaced attempt folder is deleted');
+  assert.ok(!fs.existsSync(layout(root, queue.jobs[0], queue.jobs[0].attempts[0]).report));
 });
 
 test('complete requires report, PNG signature, exact visual inventory and zero CLI exit', t => {
@@ -120,15 +122,49 @@ test('finalUrl is required, HTTPS and must preserve the source origin', t => {
   }
 });
 
-test('retry preserves orphaned attempt reservation after crash before state save', t => {
+test('startup sweeps unreferenced attempt reservations left by a crash before state save', t => {
   const { root, queue } = setup(t); queue.add('https://a.reestr35.ru');
   const job = queue.jobs[0]; job.attempts[0].status = 'failed'; queue.save();
   const orphan = queue.newAttempt(job); const orphanDir = layout(root, job, orphan).dir;
-  fs.writeFileSync(path.join(orphanDir, 'evidence.txt'), 'preserve me');
-  // Reload the durable state, which never recorded attempt 2.
+  fs.writeFileSync(path.join(orphanDir, 'evidence.txt'), 'stale reservation');
+  // Reload the durable state, which never recorded attempt 2: the single-attempt
+  // model treats the unreferenced reservation as stale material and reuses the
+  // number for the retry instead of keeping the folder reserved forever.
   const recovered = new Queue({ root, autoStart: false }); recovered.retry(job.id);
-  assert.equal(recovered.jobs[0].attempts.at(-1).number, 3);
-  assert.equal(fs.readFileSync(path.join(orphanDir, 'evidence.txt'), 'utf8'), 'preserve me');
+  assert.equal(recovered.jobs[0].attempts.length, 1);
+  assert.equal(recovered.jobs[0].attempts.at(-1).number, 2, 'the swept number is free again');
+  assert.equal(fs.readFileSync(path.join(orphanDir, 'job.json'), 'utf8').includes('"attempt": 2'), true, 'the retry reserved the same folder');
+  assert.equal(fs.existsSync(path.join(orphanDir, 'evidence.txt')), false, 'startup removed the orphan reservation evidence');
+});
+
+test('startup keeps only the last attempt and sweeps every other material', t => {
+  const { root, queue } = setup(t); queue.add('https://a.reestr35.ru');
+  const job = queue.jobs[0];
+  job.attempts[0].status = 'failed'; queue.save();
+  queue.retry(job.id);
+  // Rebuild a legacy multi-attempt shape on disk: a stale attempt in state.json,
+  // its folders, an unreferenced orphan folder and stray page-builder documents.
+  const stale = structuredClone(queue.jobs[0].attempts[0]);
+  stale.number = 1; stale.status = 'complete';
+  job.attempts.unshift(stale); queue.save();
+  fs.mkdirSync(layout(root, job, { number: 1 }).hostDir, { recursive: true });
+  fs.writeFileSync(path.join(layout(root, job, { number: 1 }).hostDir, '00_страница.png'), 'png');
+  fs.mkdirSync(layout(root, job, { number: 5 }).dir);
+  const builderStore = path.join(root, 'page-builder', job.id);
+  fs.mkdirSync(builderStore, { recursive: true }); fs.mkdirSync(path.join(builderStore, 'builder'), { recursive: true });
+  fs.writeFileSync(path.join(builderStore, 'builder', 'run-1-prompt.txt'), 'old prompt');
+  fs.writeFileSync(path.join(builderStore, 'attempt-001.json'), '{}');
+  fs.writeFileSync(path.join(builderStore, 'attempt-004.json'), '{}');
+  const recovered = new Queue({ root, autoStart: false });
+  const restored = recovered.jobs[0];
+  assert.equal(restored.attempts.length, 1); assert.equal(restored.attempts[0].number, 2);
+  assert.equal(fs.existsSync(layout(root, job, { number: 1 }).dir), false, 'the replaced attempt folder is gone');
+  assert.equal(fs.existsSync(layout(root, job, { number: 5 }).dir), false, 'an unreferenced orphan folder is gone');
+  assert.equal(fs.existsSync(path.join(builderStore, 'attempt-001.json')), false);
+  assert.equal(fs.existsSync(path.join(builderStore, 'attempt-004.json')), false);
+  assert.equal(fs.existsSync(path.join(builderStore, 'builder')), false, 'diagnostics of a pruned job are cut');
+  assert.equal(fs.existsSync(layout(root, job, { number: 2 }).dir), true, 'the kept attempt keeps its materials');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'state.json'))).jobs[0].attempts.length, 1);
 });
 
 test('add preparation/save failure rolls back the entire batch and queue order while preserving reserved directories', t => {
@@ -170,11 +206,14 @@ test('retry save failure retains old attempt and reserves the rejected attempt n
   assert.deepEqual(job.attempts, [previous]); assert.deepEqual(fs.readFileSync(queue.stateFile), durable);
   const orphanDir = layout(root, job, { number: 2 }).dir;
   assert.ok(fs.existsSync(path.join(orphanDir, 'job.json')));
-  fs.writeFileSync(path.join(orphanDir, 'evidence.txt'), 'preserve rejected reservation');
+  fs.writeFileSync(path.join(orphanDir, 'evidence.txt'), 'sweep rejected reservation');
   queue.pump(); assert.equal(children.length, 0);
   queue.retry(job.id);
-  assert.equal(job.attempts.at(-1).number, 3);
-  assert.equal(fs.readFileSync(path.join(orphanDir, 'evidence.txt'), 'utf8'), 'preserve rejected reservation');
+  assert.equal(job.attempts.length, 1);
+  assert.equal(job.attempts.at(-1).number, 3, 'the in-session orphan still reserves number 2');
+  assert.equal(fs.existsSync(path.join(orphanDir, 'evidence.txt')), false, 'a successful retry sweeps the rejected reservation');
+  assert.equal(fs.existsSync(layout(root, job, previous).dir), false, 'the replaced attempt folder is deleted');
+  assert.equal(fs.existsSync(layout(root, job, job.attempts.at(-1)).dir), true);
 });
 
 test('add saves once per batch and snapshots share the latest attempt summary', t => {
@@ -189,7 +228,7 @@ test('add saves once per batch and snapshots share the latest attempt summary', 
   const calls = [];
   queue.pageBuilder = { summary(id, attempt) { calls.push([id, attempt]); return { status: 'unreviewed', revision: attempt }; } };
   const snapshot = queue.snapshot('token');
-  assert.deepEqual(calls, [[job.id, 1], [job.id, 2], [queue.jobs[1].id, 1]]);
+  assert.deepEqual(calls, [[job.id, 2], [queue.jobs[1].id, 1]]);
   for (const projected of snapshot.jobs) assert.deepEqual(projected.pageBuilder, projected.attempts.at(-1).pageBuilder);
   assert.equal(snapshot.csrfToken, 'token'); assert.equal(snapshot.concurrency, 2);
 });
@@ -304,9 +343,18 @@ test('API origin/CSRF protection, allowlisted files, logs and forbidden fields',
   assert.equal((await fetch(base + pngUrl)).headers.get('content-type'), 'image/png');
   assert.equal((await fetch(base + `/api/files/${job.id}/1/prompt.txt`)).status, 404);
   assert.equal((await fetch(base + `/api/files/${job.id}/1/..%5C..%5Cstate.json`)).status, 404);
-  assert.equal((await fetch(base + `/api/logs/${job.id}/1?stream=other`)).status, 400);
-  fs.writeFileSync(path.join(layout(root, job, attempt).dir, 'stderr.log'), 'x'.repeat(140 * 1024));
-  const log = await (await fetch(base + `/api/logs/${job.id}/1?stream=stderr`)).json(); assert.equal(log.truncated, true); assert.equal(log.text.length, 128 * 1024);
+  assert.equal((await fetch(base + `/api/logs/${job.id}/1?stream=stderr`)).status, 404, 'the raw log streams are gone');
+  assert.equal((await fetch(base + `/api/reasoning/${job.id}/9`)).status, 404);
+  assert.equal((await (await fetch(base + `/api/reasoning/${job.id}/1`)).json()).text, '', 'missing reasoning yields empty text');
+  fs.writeFileSync(path.join(layout(root, job, attempt).dir, 'reasoning.log'), 'x'.repeat(140 * 1024));
+  const reasoning = await (await fetch(base + `/api/reasoning/${job.id}/1`)).json(); assert.equal(reasoning.truncated, true); assert.equal(reasoning.text.length, 128 * 1024);
+  assert.equal((await fetch(base + `/api/reasoning/${job.id}/1?stage=2`)).status, 400, 'step 2 has no reasoning journal');
+  assert.equal((await fetch(base + `/api/reasoning/${job.id}/1?stage=4`)).status, 400);
+  assert.equal((await (await fetch(base + `/api/reasoning/${job.id}/1?stage=3`)).json()).text, '', 'a missing builder journal yields empty text');
+  assert.equal((await (await fetch(base + `/api/reasoning/${job.id}/1?stage=1`)).json()).truncated, true, 'stage 1 reads the QA journal');
+  fs.writeFileSync(path.join(layout(root, job, attempt).dir, 'builder-reasoning.log'), 'размышления сборщика');
+  const builderJournal = await (await fetch(base + `/api/reasoning/${job.id}/1?stage=3`)).json();
+  assert.equal(builderJournal.text, 'размышления сборщика'); assert.equal(builderJournal.truncated, false);
 });
 
 test('shutdown API is exact, protected, one-shot, and flushes success before teardown callback', async t => {
@@ -581,13 +629,13 @@ test('Windows taskkill actually stops a Node parent and its child', { skip: proc
   assert.throws(() => process.kill(descendant, 0), { code: 'ESRCH' });
 });
 
-test('real child process receives stdin and writes JSONL/stderr files', async t => {
+test('real child process receives stdin and keeps only the stderr diagnostic file', async t => {
   const root = temp(t);
   const queue = new Queue({ root, autoStart: false, spawnFn: (_command, _args, options) => spawn(process.execPath, ['-e', "process.stdin.resume();process.stdin.on('end',()=>{console.log(JSON.stringify({type:'fixture'}));console.error('diagnostic');process.exitCode=1;});"], options) });
   queue.add('https://a.reestr35.ru'); queue.pump();
   await new Promise(resolve => queue.active.values().next().value.once('close', resolve));
   const locations = layout(root, queue.jobs[0], queue.jobs[0].attempts[0]);
-  assert.match(fs.readFileSync(path.join(locations.dir, 'events.jsonl'), 'utf8'), /fixture/);
+  assert.equal(fs.existsSync(path.join(locations.dir, 'events.jsonl')), false, 'worker stdout is no longer archived');
   assert.match(fs.readFileSync(path.join(locations.dir, 'stderr.log'), 'utf8'), /diagnostic/);
   assert.equal(queue.jobs[0].attempts[0].status, 'failed');
   assert.deepEqual(buildArgs('W'), ['app-server']); // stdio transport is implied

@@ -109,9 +109,10 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
       if (req.headers['sec-fetch-site'] === 'cross-site') return json(res, 403, { error: 'Cross-site запрос запрещён' });
       const url = new URL(req.url, `http://${host}`);
       if (queue.stage.media?.deletion.failed && !['/api/health', '/api/shutdown'].includes(url.pathname)) throw Object.assign(new Error('Удаление медиа требует восстановления при запуске'), { statusCode: 503 });
-      const builderAttempt = (jobId, writing = false) => {
-        const job = queue.get(jobId), value = url.searchParams.get('attempt');
-        if (value === null && writing && job.attempts.length > 1) throw conflict('Требуется номер попытки шага 3');
+      // Clients still send ?attempt=; with the single-attempt model it always
+      // names the job's one current attempt, so it is only validated.
+      const builderAttempt = jobId => {
+        const value = url.searchParams.get('attempt');
         if (value !== null && !/^[1-9][0-9]*$/.test(value)) throw conflict('Некорректный номер попытки шага 3');
         return queue.pageBuilder.attempt(jobId, value === null ? undefined : Number(value));
       };
@@ -204,7 +205,7 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         if (pageBuilder) {
           const job = queue.get(pageBuilder[1]);
           if (!data || typeof data !== 'object' || Array.isArray(data) || Object.keys(data).some(key => !['revision', 'document'].includes(key)) || Object.keys(data).length !== 2) throw new Error('Разрешены только revision и document');
-          const number = builderAttempt(pageBuilder[1], true), latest = job.attempts.at(-1);
+          const number = builderAttempt(pageBuilder[1]), latest = job.attempts.at(-1);
           // Ручная правка при живом агенте молча затиралась бы следующим save
           // агента после CAS-ретрая — пока сборка выполняется, запись блокируется.
           if (latest.builder?.status === 'running' && number === latest.number) throw conflict('Документ собирает агентом; остановите сборку или дождитесь завершения');
@@ -341,14 +342,16 @@ function createServer(queue, { onShutdown = async () => {} } = {}) {
         if (local) { res.end(local.bytes); return; }
         const stream = fs.createReadStream(file); stream.on('error', () => res.destroy()); stream.pipe(res); return;
       }
-      const logs = url.pathname.match(/^\/api\/logs\/([a-f0-9-]{36})\/([1-9][0-9]*)$/);
-      if (logs) {
-        const job = queue.get(logs[1]), attempt = job.attempts.find(a => a.number === Number(logs[2]));
+      const reasoning = url.pathname.match(/^\/api\/reasoning\/([a-f0-9-]{36})\/([1-9][0-9]*)$/);
+      if (reasoning) {
+        const job = queue.get(reasoning[1]), attempt = job.attempts.find(a => a.number === Number(reasoning[2]));
         if (!attempt) return json(res, 404, { error: 'Попытка не найдена' });
-        const stream = url.searchParams.get('stream');
-        if (!['stdout', 'stderr'].includes(stream)) throw new Error('Неизвестный поток');
+        // Stage selects the journal: 1 — the QA agent of step 1, 3 — the page
+        // builder of step 3; step 2 has no agent and no journal.
+        const stage = url.searchParams.get('stage');
+        if (stage !== null && !['1', '3'].includes(stage)) throw Object.assign(new Error('stage должен быть 1 или 3'), { statusCode: 400 });
         const dir = attemptDir(queue.root, job, attempt);
-        const file = path.join(dir, stream === 'stdout' ? 'events.jsonl' : 'stderr.log');
+        const file = path.join(dir, stage === '3' ? 'builder-reasoning.log' : 'reasoning.log');
         if (!fs.existsSync(file)) return json(res, 200, { text: '', truncated: false });
         const allowed = safeFile(queue.root, safeFile(dir, file));
         const fd = fs.openSync(allowed, 'r');

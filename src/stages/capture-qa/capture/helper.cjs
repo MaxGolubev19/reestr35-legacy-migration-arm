@@ -222,7 +222,9 @@ async function settle(page,spec,timeout) {
           for(const e of document.querySelectorAll('*')){const r=e.getBoundingClientRect();if(r.width<150||r.height<70||!seen(e))continue;const match=getComputedStyle(e).backgroundImage.match(/^url\(["']?(.*?)["']?\)$/);if(match)posters.push(match[1]);}
           const posterReady=(await Promise.all([...new Set(posters)].slice(0,8).map(src=>Promise.race([new Promise(resolve=>{const img=new Image();img.onload=()=>resolve(img.naturalWidth>0);img.onerror=()=>resolve(false);img.src=src;}),new Promise(resolve=>setTimeout(()=>resolve(false),500))])))).some(Boolean);
           const blank=!body||location.href==='about:blank'||!body.getBoundingClientRect().height;
-          return {ok:!blank&&!error&&!loading&&(media||posterReady&&controls),url:location.href,reason:blank?'blank document':error?'error message':loading?'visible loading indicator':media?'rendered media':posterReady&&controls?'loaded poster with player controls':'no verifiable player/media',posterReady,loading,requiresVisualReview:true,text:text.slice(0,180)};
+          // A terminal provider error (loaded document, no loader) is the source site's own state, not a capture failure.
+          const terminal=error&&!loading&&!blank;
+          return {ok:terminal||!blank&&!error&&!loading&&(media||posterReady&&controls),url:location.href,reason:terminal?'service terminal unavailability':blank?'blank document':error?'error message':loading?'visible loading indicator':media?'rendered media':posterReady&&controls?'loaded poster with player controls':'no verifiable player/media',posterReady,loading,unavailable:terminal,requiresVisualReview:true,text:text.slice(0,180)};
         })};
       }catch(e){check.reason=String(e.message).slice(0,200);}
       frameChecks.push(check);

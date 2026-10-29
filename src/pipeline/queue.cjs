@@ -35,6 +35,9 @@ class PageQueue {
     this.stateFile = path.join(root, 'state.json');
     this.active = new Map();
     this.pendingFinalizations = new Map();
+    // Live reasoning tails are session-scoped projections: never persisted, an
+    // empty map after a restart just leaves the panel line blank until new text.
+    this.reasoningTails = new Map();
     this.closing = false;
     if (typeof stageFactory !== 'function') throw new Error('PageQueue requires a stageFactory');
     this.stage = stageFactory(this, stageOptions);
@@ -49,8 +52,23 @@ class PageQueue {
     this.nextQueueOrder = this.jobs.flatMap(job => job.attempts).reduce((max, attempt) => Math.max(max, attempt.queueOrder || 0), 0);
     for (const job of this.jobs) {
       if (!/^[a-f0-9-]{36}$/.test(job.id) || normalizeUrl(job.url) !== job.url || !Array.isArray(job.attempts) || !job.attempts.length) throw new Error('Некорректное задание в state.json');
+      for (const attempt of job.attempts) if (!Number.isInteger(attempt.number) || attempt.number < 1) throw new Error('Некорректная попытка');
+    }
+    // One attempt per job: on start keep only the latest attempt of each job and
+    // sweep every other attempt's materials plus unreferenced leftovers. The
+    // pruned state is saved before anything is deleted, so a crash cannot leave
+    // state.json pointing at removed evidence.
+    const multiAttempt = this.jobs.filter(job => job.attempts.length > 1);
+    for (const job of multiAttempt) job.attempts.splice(0, job.attempts.length - 1);
+    if (multiAttempt.length) this.save();
+    for (const job of this.jobs) {
+      const swept = this.sweepJobMaterials(job, last(job).number);
+      // The builder diagnostics folder is attempt-agnostic: cut it whenever this
+      // job lost any material to the startup prune.
+      if (swept) this.removeBuilderDiagnostics(job.id);
+    }
+    for (const job of this.jobs) {
       for (const attempt of job.attempts) {
-        if (!Number.isInteger(attempt.number) || attempt.number < 1) throw new Error('Некорректная попытка');
         restoreDuration(attempt);
         this.stage.restoreAttempt(job, attempt);
         if (attempt.finalizationError) attempt.status = 'interrupted';
@@ -167,12 +185,65 @@ class PageQueue {
     return attempt;
   }
   get(id) { const job = this.jobs.find(item => item.id === id); if (!job) throw Object.assign(new Error('Задание не найдено'), { statusCode: 404 }); return job; }
+  // Single-attempt model: called only after the new attempt is durably saved.
+  // Removes every older attempt from the state, saves that projection, and only
+  // then deletes the removed attempts' materials. Deletion failures are logged:
+  // orphan folders without a state.json reference are inert.
+  pruneAttempts(job) {
+    if (job.attempts.length < 2) { this.sweepJobMaterials(job, last(job).number); this.removeBuilderDiagnostics(job.id); return; }
+    const removed = job.attempts.splice(0, job.attempts.length - 1);
+    try { this.save(); }
+    catch (error) {
+      job.attempts.unshift(...removed);
+      console.error(`Attempt prune (${job.id}) не сохранён; материалы сохранены: ${error.message}`);
+      return;
+    }
+    for (const attempt of removed) {
+      this.reasoningTails?.delete(`${job.id}:${attempt.number}`);
+      // The stage owns its per-attempt registries (QA state, recovery, completions).
+      this.stage.forgetAttempt?.(job, attempt);
+    }
+    this.sweepJobMaterials(job, last(job).number);
+    this.removeBuilderDiagnostics(job.id);
+  }
+  // Deletes every attempt material except the kept attempt's: runs/<jobId>/attempt-NNN
+  // folders and page-builder/<jobId>/attempt-NNN.json files, including orphans no
+  // state.json ever referenced. A stale legacy binding marker is reset so the next
+  // read re-binds the preserved job-level legacy document to the current attempt.
+  // Returns true when anything was deleted.
+  sweepJobMaterials(job, keepNumber) {
+    let swept = false;
+    const runsDir = path.join(this.root, 'runs', job.id);
+    const builderDir = path.join(this.root, 'page-builder', job.id);
+    for (const dir of [runsDir, builderDir]) {
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const entry of entries) {
+        const match = dir === runsDir ? entry.name.match(/^attempt-(\d{3,})$/) : entry.name.match(/^attempt-(\d{3,})\.json$/);
+        if (!match || Number(match[1]) === keepNumber) continue;
+        try { fs.rmSync(path.join(dir, entry.name), { recursive: true, force: true }); swept = true; }
+        catch (error) { console.error(`Удаление материалов попытки (${job.id}/${entry.name}): ${error.message}`); }
+      }
+    }
+    try {
+      const marker = path.join(builderDir, 'legacy-binding.json');
+      if (fs.existsSync(marker) && JSON.parse(fs.readFileSync(marker, 'utf8')).attempt !== keepNumber) { fs.rmSync(marker, { force: true }); swept = true; }
+    } catch (error) { console.error(`Сброс привязки legacy-документа (${job.id}): ${error.message}`); }
+    return swept;
+  }
+  removeBuilderDiagnostics(jobId) {
+    // Builder run files are named by generation, not attempt number; a fresh
+    // attempt restarts generations at 1, so the whole diagnostics folder goes.
+    try { fs.rmSync(path.join(this.root, 'page-builder', jobId, 'builder'), { recursive: true, force: true }); }
+    catch (error) { console.error(`Удаление диагностики сборщика (${jobId}): ${error.message}`); }
+  }
   retry(id) {
     const job = this.get(id);
     if (this.pendingFinalizations.has(id)) throw conflict('Завершение попытки ещё не сохранено; запись будет повторена.');
     if (!(TERMINAL.has(last(job).status) || last(job).status === 'paused') || this.active.has(id) || !this.stage.launchFinished(job, last(job))) throw conflict('Повтор доступен после доказанного завершения текущей попытки');
     this.newAttempt(job);
     try { this.save(); } catch (error) { job.attempts.pop(); throw error; }
+    this.pruneAttempts(job);
     if (this.autoStart) this.pump();
   }
   // Restart a finished attempt from a later step: the new attempt reuses the
@@ -188,8 +259,16 @@ class PageQueue {
     const previous = last(job);
     if (!(TERMINAL.has(previous.status) || previous.status === 'paused') || this.active.has(id) || !this.stage.launchFinished(job, previous)) throw conflict('Перезапуск доступен после доказанного завершения текущей попытки');
     const attempt = this.newAttempt(job);
+    // A step restart continues the same task, so the timer carries over the
+    // previous attempt's accumulated work (checkpointing first closes any live
+    // interval, e.g. a still-running assembly). Only a full step 1 retry
+    // starts the timer from zero.
+    checkpointDuration(previous, this.clock());
+    attempt.activeDurationMs = Math.max(0, previous.activeDurationMs || 0);
+    if (previous.durationIncomplete) attempt.durationIncomplete = true;
     try { this.stage.retryFrom(job, attempt, previous); this.save(); }
     catch (error) { job.attempts.pop(); throw error; }
+    this.pruneAttempts(job);
     if (this.autoStart) this.pump();
   }
   pause(id) {
@@ -282,8 +361,11 @@ class PageQueue {
     this.stage.refreshSnapshot();
     return { csrfToken, concurrency: this.concurrency, jobs: this.jobs.map(job => {
       const projection = this.stage.jobProjection(job);
-      const attempts = job.attempts.map(attempt => ({ ...attempt, ...(this.pageBuilder ? { pageBuilder: this.pageBuilder.summary(job.id, attempt.number) } : {}), files: (attempt.files || []).map(file => ({ ...file,
-        url: `/api/files/${job.id}/${attempt.number}/${encodeURIComponent(file.name)}` })) }));
+      const attempts = job.attempts.map(attempt => {
+        const reasoningLine = this.reasoningTails.get(`${job.id}:${attempt.number}`);
+        return { ...attempt, ...(reasoningLine ? { reasoningLine } : {}), ...(this.pageBuilder ? { pageBuilder: this.pageBuilder.summary(job.id, attempt.number) } : {}), files: (attempt.files || []).map(file => ({ ...file,
+          url: `/api/files/${job.id}/${attempt.number}/${encodeURIComponent(file.name)}` })) };
+      });
       return { ...job, status: last(job).status, ...projection,
         ...(this.pendingFinalizations.has(job.id) ? { canContinueQa: false, canResume: false, canPause: false, canRecapture: false } : {}),
         ...(this.pageBuilder ? { pageBuilder: attempts.at(-1).pageBuilder } : {}),

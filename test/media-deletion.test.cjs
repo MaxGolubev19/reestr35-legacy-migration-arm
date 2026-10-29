@@ -102,15 +102,16 @@ test('deletion removes referenced image, document and iframe from the owning pag
   await restarted.shutdown();
 });
 
-test('unreferenced deletion does not create a page and a newer attempt cannot delete an older attempt resource', async t => {
+test('unreferenced deletion does not create a page and a replaced attempt cannot delete anymore', async t => {
   const ctx = await fixture(t, { builder: false }), { queue, job, attempt } = ctx, { images } = resources(ctx);
   const file = queue.pageBuilder.file(job.id, 1); assert.equal(fs.existsSync(file), false);
   const request = { ...context(ctx), resourceId: images[0].id }; assert.equal(request.revision, 0);
   assert.deepEqual(await (await fetch(endpoint(ctx, `delete-impact?${new URLSearchParams({ checkpoint: request.checkpoint, resourceId: request.resourceId, revision: 0 })}`))).json(), { used: false, kind: 'image' });
   assert.equal((await postDelete(ctx, request)).status, 200); assert.equal(fs.existsSync(file), false);
   attempt.status = 'paused'; queue.retry(job.id);
-  assert.equal((await postDelete(ctx, { ...context(ctx), resourceId: images[1].id })).status, 409);
-  assert.equal(queue.stage.media.read(job, attempt).resources.find(item => item.id === images[1].id).status, 'downloaded');
+  assert.equal(job.attempts.length, 1); assert.equal(job.attempts[0].number, 2);
+  assert.equal(fs.existsSync(queue.stage.media.directory(job, attempt)), false, 'the replaced attempt media is swept');
+  assert.equal((await postDelete(ctx, { ...context(ctx), resourceId: images[1].id })).status, 409, 'the replaced attempt no longer owns deletable resources');
 });
 
 test('a failed manifest write leaves a journal and restart rolls the builder-first transaction forward', async t => {

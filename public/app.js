@@ -34,8 +34,8 @@
     jsonTrigger: null,
     jobs: [],
     selectedJobId: null,
-    selectedAttemptNumber: null,
-    logsKey: null,
+    reasoningKey: null,
+    reasoningFollow: true,
     pollTimer: null,
     stopped: false,
     jobsFingerprint: null,
@@ -68,14 +68,13 @@
     "batch-form", "url-input", "clear-url", "url-feedback", "submit-button", "batch-result", "progress-label",
     "progress-bar", "jobs-body", "empty-detail", "concurrency-slider", "settings-error",
     "job-detail", "detail-url", "company-id", "result-steps", "attempt-duration", "detail-id",
-    "detail-created", "attempt-select", "attempt-meta", "files-list", "recapture-button",
+    "detail-created", "attempt-meta", "files-list", "recapture-button",
     "stage-step-1", "stage-step-2", "stage-step-3", "gallery-body",
-    "metadata-panel", "summary-panel", "stage-two-panel", "stage-three-panel", "builder-error", "attempt-header",
-    "technical-area", "media-source-panel", "media-source-meta", "media-outcome-panel", "media-outcome-status", "media-outcome-meta",
-    "summary-output", "issues-output", "logs-card", "stdout-output",
-    "stderr-output", "stdout-truncated", "stderr-truncated", "png-gallery",
+    "metadata-panel", "stage-two-panel", "stage-three-panel", "builder-error", "attempt-header",
+    "technical-area", "attempt-panel", "media-source-panel", "media-source-meta", "media-outcome-panel", "media-outcome-status", "media-outcome-meta",
+    "reasoning-output", "reasoning-truncated", "png-gallery",
     "qa-progress", "qa-progress-count", "qa-progress-bar", "media-progress", "media-progress-count", "media-progress-bar", "builder-progress", "builder-progress-count", "builder-progress-bar",
-    "png-modal", "png-modal-title", "png-counter",
+    "png-modal", "png-modal-title", "png-counter", "png-remark",
     "png-full", "png-error", "png-prev", "png-next",
     "json-modal", "json-modal-title", "json-output", "json-error"
   ].map((id) => [id, document.getElementById(id)]));
@@ -129,16 +128,6 @@
     if (!value) return "—";
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("ru-RU");
-  }
-
-  function formatValue(value, empty = "Нет данных") {
-    if (value === null || value === undefined || value === "") return empty;
-    if (typeof value === "string") return value;
-    try {
-      return JSON.stringify(value, null, 2);
-    } catch (_error) {
-      return String(value);
-    }
   }
 
   function currentAttempt(job) {
@@ -457,6 +446,14 @@
         retry.textContent = `Автоповтор проверки ${attempt.qaAutoRetries}/3`;
         urlCell.append(retry);
       }
+      // The live thought line runs under the title while the task is at work.
+      if (attempt?.reasoningLine && ACTIVE_STATUSES.has(effectiveStatus(job))) {
+        const thought = document.createElement("div");
+        thought.className = "small text-secondary job-reasoning-line";
+        thought.textContent = attempt.reasoningLine;
+        thought.title = attempt.reasoningLine;
+        urlCell.append(thought);
+      }
 
       const statusCell = document.createElement("td");
       const actions = document.createElement("div");
@@ -532,10 +529,7 @@
     clear(el["attempt-meta"]);
     clear(el["files-list"]);
     if (!attempt) {
-      el["attempt-meta"].textContent = "Попытки ещё нет.";
-      el["summary-output"].textContent = "Нет данных";
-      el["issues-output"].textContent = "Нет данных";
-      el["logs-card"].classList.add("d-none");
+      el["attempt-meta"].textContent = "Данных ещё нет.";
       renderQaProgress(null);
       return;
     }
@@ -543,11 +537,11 @@
     const list = document.createElement("dl");
     list.className = "row mb-0";
     [
-      ["Начало попытки", formatDate(attempt.startedAt)],
+      ["Начало", formatDate(attempt.startedAt)],
       ["Текущая фаза", attempt.phase || "—"],
-      ["Завершение в данных попытки", formatDate(attempt.finishedAt)],
-      ["Код выхода в данных попытки", attempt.exitCode === null || attempt.exitCode === undefined ? "—" : String(attempt.exitCode)],
-      ["Ошибка попытки", attempt.error || "—"]
+      ["Завершение", formatDate(attempt.finishedAt)],
+      ["Код выхода", attempt.exitCode === null || attempt.exitCode === undefined ? "—" : String(attempt.exitCode)],
+      ["Ошибка", attempt.error || "—"]
     ].forEach(([label, value]) => {
       const dt = document.createElement("dt");
       dt.className = "col-4";
@@ -558,19 +552,6 @@
       list.append(dt, dd);
     });
     el["attempt-meta"].append(list);
-    const capture = attempt.captureSummary, qa = attempt.qa;
-    const captureStatus = attempt.captureStatus || (attempt.phase !== "html-media" ? attempt.status : null);
-    const issueCount = value => Array.isArray(value) ? value.length : value ? 1 : 0;
-    const hasIssues = issueCount(attempt.issues) + issueCount(capture?.issues) + (Number(qa?.issues) || 0) > 0;
-    const outcome = captureStatus === "complete" && hasIssues ? "Завершено с замечаниями" : STATUS_LABELS[captureStatus] || captureStatus || "Итог шага ещё не зафиксирован";
-    el["summary-output"].textContent = formatValue({
-      "Итог скриншотов и QA": outcome,
-      "Статус шага": captureStatus || "—",
-      ...(capture ? { "Съёмка": capture } : attempt.summary ? { "Сводка прежней версии": attempt.summary } : {}),
-      ...(qa ? { "Проверка PNG": { "Всего": qa.total, "Проверено": qa.reviewed, "Принято": qa.passed, "С замечаниями": qa.issues, "Не проверено": qa.unreviewed ?? qa.pending } } : {}),
-      "Замечания попытки": issueCount(attempt.issues)
-    });
-    el["issues-output"].textContent = formatValue(attempt.issues, "Замечаний нет");
 
     const files = (Array.isArray(attempt.files) ? attempt.files : []).filter(file => file.kind !== "png");
     if (!files.length) {
@@ -609,7 +590,6 @@
       });
     }
 
-    el["logs-card"].classList.toggle("d-none", state.activeStage !== 1);
     renderGallery(job, attempt);
   }
 
@@ -662,11 +642,8 @@
     const busy = Boolean(pendingJob) || Boolean(pendingAssemble);
     let loading = false;
     if (state.activeStage === 3) {
-      const attempts = Array.isArray(job?.attempts) ? job.attempts : [];
-      const latest = attempts[attempts.length - 1] || null;
-      const historical = Boolean(attempt && latest && String(attempt.number) !== String(latest.number));
       loading = pendingAssemble?.action === "assemble";
-      recapture.disabled = !job || historical || busy;
+      recapture.disabled = !job || busy;
     } else if (state.activeStage === 2) {
       const target = currentAttempt(job);
       const eligible = target?.phase === "html-media" && target?.captureStatus === "complete";
@@ -771,8 +748,9 @@
     renderMediaTechnical(attempt);
     el["gallery-body"].classList.toggle("d-none", !firstStage);
     el["metadata-panel"].classList.toggle("d-none", !firstStage);
-    el["summary-panel"].classList.toggle("d-none", !firstStage);
-    el["logs-card"].classList.toggle("d-none", !firstStage || !attempt);
+    // The reasoning journal belongs to the step's agent: visible on steps 1
+    // (QA) and 3 (builder); step 2 has no agent and hides the card.
+    el["attempt-panel"].classList.toggle("d-none", state.activeStage === 2);
     el["stage-two-panel"].classList.toggle("d-none", state.activeStage !== 2);
     el["stage-three-panel"].classList.toggle("d-none", state.activeStage !== 3);
     el["qa-progress"].classList.toggle("stage-hidden", !firstStage);
@@ -785,11 +763,12 @@
   }
 
   function selectStage(stage, { focus = false } = {}) {
-    const job = state.jobs.find(candidate => candidate.id === state.selectedJobId), attempt = job && selectedAttempt(job);
+    const job = state.jobs.find(candidate => candidate.id === state.selectedJobId), attempt = job && currentAttempt(job);
     if (!stageAvailable(stage, attempt)) return;
     state.activeStage = stage;
     state.stageManuallySelected = true;
     renderStages(job, attempt);
+    refreshSelectedReasoning(true);
     if (focus) el[`stage-step-${stage}`].focus({ preventScroll: true });
   }
 
@@ -805,25 +784,18 @@
 
   function renderDuration() {
     const job = state.jobs.find(candidate => candidate.id === state.selectedJobId);
-    const attempt = job && selectedAttempt(job);
+    const attempt = job && currentAttempt(job);
     el["attempt-duration"].textContent = formatDuration(attempt);
     el["attempt-duration"].title = "Активное время работы";
-  }
-
-  function selectedAttempt(job) {
-    const attempts = Array.isArray(job.attempts) ? job.attempts : [];
-    return attempts.find((attempt) => String(attempt.number) === String(state.selectedAttemptNumber)) || attempts[attempts.length - 1] || null;
   }
 
   function renderDetail() {
     const job = state.jobs.find((candidate) => candidate.id === state.selectedJobId);
     if (!job) {
       state.selectedJobId = null;
-      state.selectedAttemptNumber = null;
-      state.logsKey = null;
+      state.reasoningKey = null;
       el["empty-detail"].classList.remove("d-none");
       el["job-detail"].classList.add("d-none");
-      el["logs-card"].classList.add("d-none");
       return;
     }
 
@@ -840,7 +812,7 @@
       detailUrl.removeAttribute("target");
       detailUrl.removeAttribute("rel");
     }
-    const attempt = selectedAttempt(job);
+    const attempt = currentAttempt(job);
     const companyId = Number(attempt?.pageBuilder?.companyId);
     const companyIdAvailable = Number.isSafeInteger(companyId) && companyId > 0;
     const companyIdControl = el["company-id"];
@@ -865,22 +837,6 @@
     el["detail-id"].textContent = String(job.id || "—");
     el["detail-created"].textContent = formatDate(job.createdAt);
 
-    const attempts = Array.isArray(job.attempts) ? job.attempts : [];
-    if (attempts.length && !attempts.some((attempt) => String(attempt.number) === String(state.selectedAttemptNumber))) {
-      state.selectedAttemptNumber = attempts[attempts.length - 1].number;
-      state.stageContextKey = null;
-      state.stageManuallySelected = false;
-      state.logsKey = null;
-    }
-    clear(el["attempt-select"]);
-    attempts.slice().reverse().forEach((attempt) => {
-      const option = document.createElement("option");
-      option.value = String(attempt.number);
-      option.textContent = `Попытка ${attempt.number}`;
-      option.selected = String(attempt.number) === String(state.selectedAttemptNumber);
-      el["attempt-select"].append(option);
-    });
-    el["attempt-select"].disabled = !attempts.length;
     renderDuration();
     renderAttempt(job, attempt);
     renderStages(job, attempt);
@@ -925,15 +881,12 @@
 
   function selectJob(id) {
     state.selectedJobId = id;
-    const job = state.jobs.find((candidate) => candidate.id === id);
-    const attempt = job && currentAttempt(job);
-    state.selectedAttemptNumber = attempt ? attempt.number : null;
     state.stageContextKey = null;
     state.stageManuallySelected = false;
-    state.logsKey = null;
+    state.reasoningKey = null;
     renderJobs();
     renderDetail();
-    refreshSelectedLogs(true);
+    refreshSelectedReasoning(true);
   }
 
   async function writeAction(id, action, button, requestBody = "{}") {
@@ -961,7 +914,7 @@
       });
       accepted = true;
       if ((action === "retry" || action === "retry-stage") && state.selectedJobId === id) {
-        state.selectedAttemptNumber = null; state.activeStage = action === "retry" ? 1 : 2; state.stageContextKey = null; state.stageManuallySelected = false;
+        state.activeStage = action === "retry" ? 1 : 2; state.stageContextKey = null; state.stageManuallySelected = false;
       }
       // A state request that began before this POST succeeded may contain the
       // old action. Keep loading until a later snapshot confirms it.
@@ -1111,20 +1064,30 @@
     }
   }
 
+  // A review remark belongs to its image: it replaces the generic "Есть
+  // замечания" label wherever the badge is shown, cut with an ellipsis when
+  // too long for a tooltip or the frame modal footer.
+  function imageRemark(file, limit = 300) {
+    if (file?.qaStatus !== "issues") return "";
+    const text = (Array.isArray(file.qaIssues) ? file.qaIssues.filter(item => typeof item === "string" && item.trim()) : []).join("; ").trim();
+    return text.length > limit ? `${text.slice(0, limit).trimEnd()}…` : text;
+  }
+
   function imageStatusBadge(file) {
     const qaStatus = ["unreviewed", "passed", "issues"].includes(file.qaStatus) ? file.qaStatus : "unreviewed";
     const status = file.loadError ? "load_error" : qaStatus;
     const labels = { unreviewed: "Не проверено", passed: "Проверено", issues: "Есть замечания", load_error: "PNG не загружен" };
     const classes = { unreviewed: "bg-secondary", passed: "bg-green", issues: "bg-yellow", load_error: "bg-red" };
+    const label = status === "issues" ? imageRemark(file) || labels.issues : labels[status];
     const span = document.createElement("span");
     span.className = `image-status ${classes[status]}`;
     span.dataset.imageStatus = status;
-    span.tabIndex = 0; span.setAttribute('role', 'img'); span.setAttribute('aria-label', labels[status]); span.title = labels[status];
+    span.tabIndex = 0; span.setAttribute('role', 'img'); span.setAttribute('aria-label', label); span.title = label;
     span.append(actionIcon(status === 'passed' ? 'imageCheck' : status === 'unreviewed' ? 'imageClock' : 'imageAlert'));
     span.addEventListener('click', event => event.stopPropagation());
     // Polling can replace a focused status immediately after blur; avoid a
     // pending hide transition calling into a disposed Tabler tooltip.
-    new window.tabler.Tooltip(span, { title: labels[status], trigger: 'hover focus', html: false, animation: false });
+    new window.tabler.Tooltip(span, { title: label, trigger: 'hover focus', html: false, animation: false });
     return span;
   }
   function replaceImageStatus(container, file) { container.querySelectorAll('.image-status').forEach(item => window.tabler.Tooltip.getInstance(item)?.dispose()); container.replaceChildren(imageStatusBadge(file)); }
@@ -1175,11 +1138,15 @@
     el["png-counter"].textContent = `${index + 1} / ${state.gallery.length}`;
     el["png-prev"].disabled = index === 0;
     el["png-next"].disabled = index === state.gallery.length - 1;
+    const remark = imageRemark(file, 1000);
+    el["png-remark"].textContent = remark ? `Замечание: ${remark}` : "";
+    el["png-remark"].title = remark;
+    el["png-remark"].classList.toggle("d-none", !remark);
     if (el["png-modal"].classList.contains("show") && (document.activeElement.disabled || !el["png-modal"].contains(document.activeElement))) el["png-modal"].focus({ preventScroll: true });
     window.ModalActions.set('png-modal', { url: file.href, name: file.name, image: true });
     if (el["png-full"].getAttribute("src") !== file.href) {
       el["png-error"].classList.add("d-none");
-      el["png-full"].alt = `Снимок сегмента ${file.name}, попытка ${state.selectedAttemptNumber}`;
+      el["png-full"].alt = `Снимок сегмента ${file.name}`;
       el["png-full"].src = file.href;
       el["png-full"].parentElement.scrollTo(0, 0);
     }
@@ -1243,37 +1210,45 @@
     drawGallery();
   }
 
-  async function fetchLog(jobId, attemptNumber, stream) {
-    const query = new URLSearchParams({ stream });
-    return api(`/api/logs/${encodeURIComponent(jobId)}/${encodeURIComponent(attemptNumber)}?${query.toString()}`);
+  async function fetchReasoning(jobId, attemptNumber, stage) {
+    return api(`/api/reasoning/${encodeURIComponent(jobId)}/${encodeURIComponent(attemptNumber)}?stage=${stage}`);
   }
 
-  async function refreshSelectedLogs(force = false) {
+  // The journal shows the full reasoning stream of the current step's agent:
+  // step 1 reads the QA reasoning.log, step 3 the builder's builder-reasoning.log;
+  // step 2 has no agent, its hidden card is never fetched.
+  async function refreshSelectedReasoning(force = false) {
     const job = state.jobs.find((candidate) => candidate.id === state.selectedJobId);
-    const attempt = job && selectedAttempt(job);
-    if (!job || !attempt) return;
-    const key = `${job.id}:${attempt.number}`;
-    if (force || state.logsKey !== key) {
-      el["stdout-output"].textContent = "Загрузка…";
-      el["stderr-output"].textContent = "Загрузка…";
+    const attempt = job && currentAttempt(job);
+    const output = el["reasoning-output"];
+    if (!job || !attempt || state.activeStage === 2) {
+      if (!job || !attempt) {
+        output.textContent = "Нет данных";
+        el["reasoning-truncated"].classList.add("d-none");
+      }
+      return;
     }
-    state.logsKey = key;
+    const stage = state.activeStage === 3 ? 3 : 1;
+    const key = `${job.id}:${attempt.number}:${stage}`;
+    if (force || state.reasoningKey !== key) {
+      state.reasoningKey = key;
+      state.reasoningFollow = true;
+      output.textContent = "Загрузка…";
+      output.scrollTop = 0;
+    }
+    let data;
     try {
-      const [stdout, stderr] = await Promise.all([
-        fetchLog(job.id, attempt.number, "stdout"),
-        fetchLog(job.id, attempt.number, "stderr")
-      ]);
-      if (state.logsKey !== key) return;
-      el["stdout-output"].textContent = stdout && stdout.text ? stdout.text : "Журнал пуст";
-      el["stderr-output"].textContent = stderr && stderr.text ? stderr.text : "Журнал пуст";
-      el["stdout-truncated"].classList.toggle("d-none", !(stdout && stdout.truncated));
-      el["stderr-truncated"].classList.toggle("d-none", !(stderr && stderr.truncated));
+      data = await fetchReasoning(job.id, attempt.number, stage);
     } catch (error) {
-      if (state.logsKey !== key) return;
-      const message = `Не удалось загрузить журнал: ${error instanceof Error ? error.message : String(error)}`;
-      el["stdout-output"].textContent = message;
-      el["stderr-output"].textContent = message;
+      if (state.reasoningKey !== key) return;
+      output.textContent = `Не удалось загрузить журнал: ${error instanceof Error ? error.message : String(error)}`;
+      el["reasoning-truncated"].classList.add("d-none");
+      return;
     }
+    if (state.reasoningKey !== key) return;
+    output.textContent = data && data.text ? data.text : "Журнал пуст";
+    el["reasoning-truncated"].classList.toggle("d-none", !(data && data.truncated));
+    if (state.reasoningFollow) output.scrollTop = output.scrollHeight;
   }
 
   async function refreshState() {
@@ -1292,7 +1267,7 @@
           setConnection("connected");
           if (!state.shutdownError) showGlobalError("");
         }
-        await refreshSelectedLogs();
+        await refreshSelectedReasoning();
       } while (state.refreshQueued && !state.stopped);
     })();
     try { await state.refreshPromise; }
@@ -1436,6 +1411,10 @@
   });
   el["png-prev"].addEventListener("click", () => showPng(state.galleryIndex - 1));
   el["png-next"].addEventListener("click", () => showPng(state.galleryIndex + 1));
+  el["reasoning-output"].addEventListener("scroll", () => {
+    const box = el["reasoning-output"];
+    state.reasoningFollow = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  });
   el["png-full"].addEventListener("error", () => el["png-error"].classList.remove("d-none"));
   el["png-modal"].addEventListener("hidden.bs.modal", () => {
     const trigger = state.galleryTrigger;
@@ -1452,14 +1431,6 @@
       event.preventDefault();
       showPng(state.galleryIndex + (event.key === "ArrowLeft" ? -1 : 1));
     }
-  });
-  el["attempt-select"].addEventListener("change", () => {
-    state.selectedAttemptNumber = el["attempt-select"].value;
-    state.stageContextKey = null;
-    state.stageManuallySelected = false;
-    state.logsKey = null;
-    renderDetail();
-    refreshSelectedLogs(true);
   });
   el["recapture-button"].addEventListener("click", () => {
     const job = state.jobs.find(candidate => candidate.id === state.selectedJobId);

@@ -150,6 +150,15 @@ class CaptureQaStage {
   qaState(job, attempt) {
     return this.queue.qaStates.get(`${job.id}:${attempt.number}`);
   }
+  // Single-attempt model: forget every in-memory registry entry a removed
+  // attempt still owns. Completions are keyed by launch token, so the attempt's
+  // durable launch descriptor supplies the token before its folder is swept.
+  forgetAttempt(job, attempt) {
+    const queue = this.queue, key = `${job.id}:${attempt.number}`;
+    queue.qaStates.delete(key);
+    queue.recoveredQa.delete(key);
+    try { queue.qaCompletions.delete(readLaunch(layout(queue.root, job, attempt).dir)?.token); } catch { /* evidence may already be gone */ }
+  }
   launchFinished(job, attempt) {
     const queue = this.queue;
     const dir = layout(queue.root, job, attempt).dir;
@@ -238,7 +247,13 @@ class CaptureQaStage {
     }
     if (!artifacts.report) return artifacts;
     const accepted = qa ? reviews(qa.progress) : new Map();
-    attempt.files = artifacts.files.map(file => ({ ...file, ...(file.kind === 'png' ? { qaStatus: accepted.get(file.name)?.sha256 === file.sha256 ? accepted.get(file.name).status : 'unreviewed' } : {}) }));
+    attempt.files = artifacts.files.map(file => {
+      if (file.kind !== 'png') return { ...file };
+      const review = accepted.get(file.name);
+      const current = review && review.sha256 === file.sha256 ? review : null;
+      // Per-image remarks power the gallery tooltip and the frame modal.
+      return { ...file, qaStatus: current ? current.status : 'unreviewed', ...(current && current.status === 'issues' && current.issues.length ? { qaIssues: current.issues } : {}) };
+    });
     if (!qa) attempt.qa = { total: attempt.files.filter(f => f.kind === 'png').length, reviewed: 0, passed: 0, issues: 0, unreviewed: attempt.files.filter(f => f.kind === 'png').length };
     return artifacts;
   }

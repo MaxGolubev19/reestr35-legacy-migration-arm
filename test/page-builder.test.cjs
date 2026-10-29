@@ -31,23 +31,24 @@ test('new step 3 pages are empty and existing documents remain intact', async t 
   assert.deepEqual(fresh.document, stored.document); assert.deepEqual(fs.readFileSync(file), before, 'reading an existing page never replaces its JSON');
 });
 
-test('retry isolates documents, revisions, progress and media while historical attempts remain editable', async t => {
+test('retry replaces the step 3 document, revision and media with a fresh single attempt', async t => {
   const { queue, job, base, headers } = await fixture(t);
   const first = queue.pageBuilder.read(job.id), asset = first.document.common.blocks[0].media[0];
+  const firstFile = queue.pageBuilder.file(job.id);
   job.attempts[0].status = 'paused'; queue.retry(job.id);
+  assert.equal(job.attempts.length, 1); assert.equal(job.attempts[0].number, 2);
+  assert.equal(fs.existsSync(firstFile), false, 'the replaced attempt document is deleted');
   const endpoint = `${base}/api/page-builder/${job.id}`;
   const fresh = await (await fetch(`${endpoint}?attempt=2`)).json();
   assert.equal(fresh.attempt, 2); assert.equal(fresh.revision, 1); assert.deepEqual(fresh.document.common.blocks, []); assert.deepEqual(fresh.document.tabs, []);
-  assert.equal((await fetch(`${endpoint}/media/${asset.id}?attempt=2`)).status, 404);
-  assert.equal((await fetch(`${endpoint}/media/${asset.id}?attempt=1`)).status, 200);
+  assert.equal((await fetch(`${endpoint}/media/${asset.id}?attempt=2`)).status, 404, 'step 2 media of the new attempt starts empty');
+  assert.equal((await fetch(`${endpoint}/media/${asset.id}?attempt=1`)).status, 409, 'the replaced attempt is no longer addressable');
   const post = (suffix, document, revision = 1) => fetch(endpoint + suffix, { method: 'POST', headers, body: JSON.stringify({ revision, document }) });
-  assert.equal((await post('', first.document)).status, 409, 'an old unscoped client cannot copy stale blocks to a new attempt');
-  first.document.common.title = 'Историческая общая часть';
-  assert.equal((await post('?attempt=1', first.document)).status, 200);
-  assert.equal((await post('?attempt=1', first.document)).status, 409);
-  assert.equal(queue.pageBuilder.read(job.id, { attempt: 2 }).revision, 1);
+  assert.equal((await post('', first.document)).status, 400, 'a stale client cannot copy replaced blocks into the fresh attempt');
+  assert.deepEqual(queue.pageBuilder.read(job.id).document.common.blocks, []);
+  assert.equal(queue.pageBuilder.read(job.id).revision, 1);
   const snapshot = queue.snapshot('token').jobs[0];
-  assert.equal(snapshot.pageBuilder.total, 0); assert.equal(snapshot.attempts[0].pageBuilder.total, 10); assert.equal(snapshot.attempts[1].pageBuilder.total, 0);
+  assert.equal(snapshot.pageBuilder.total, 0); assert.equal(snapshot.attempts[0].pageBuilder.total, 0);
   assert.equal((await fetch(`${endpoint}?attempt=999`)).status, 409);
 });
 
@@ -67,20 +68,24 @@ test('known company ID survives retry before the new attempt has a page-builder 
   assert.equal(broken.status, 'system_error'); assert.equal(broken.companyId, 203370, 'document read errors do not hide the known company ID');
 });
 
-test('legacy migration binds to the last existing attempt before retry and preserves original bytes', async t => {
+test('legacy migration re-binds to the current attempt after retry and preserves original bytes', async t => {
   const { queue, job } = await fixture(t, { existing: false });
   job.attempts[0].status = 'paused'; queue.retry(job.id);
   const legacy = queue.pageBuilder.legacyFile(job.id), payload = { revision: 7, updatedAt: new Date().toISOString(), document: require('./page-builder-fixture.cjs').sourceData() };
   fs.writeFileSync(legacy, JSON.stringify(payload)); const bytes = fs.readFileSync(legacy);
-  job.attempts[1].status = 'paused'; queue.retry(job.id);
-  assert.equal(queue.pageBuilder.read(job.id, { attempt: 2 }).revision, 7);
-  assert.equal(queue.pageBuilder.read(job.id, { attempt: 2 }).document.common.blocks.length, 2);
-  assert.equal(queue.pageBuilder.read(job.id, { attempt: 1 }).document.common.blocks.length, 0);
-  assert.equal(queue.pageBuilder.read(job.id, { attempt: 3 }).document.common.blocks.length, 0);
+  // Queue.retry migrates the legacy page into the binding attempt before the
+  // restart; the post-retry prune removes that document with the attempt and
+  // resets the marker, so the preserved job-level legacy file re-binds.
+  job.attempts[0].status = 'paused'; queue.retry(job.id);
+  assert.equal(job.attempts.length, 1); assert.equal(job.attempts[0].number, 3);
+  assert.equal(queue.pageBuilder.read(job.id, { attempt: 3 }).revision, 7, 'the legacy document follows the latest attempt');
+  assert.equal(queue.pageBuilder.read(job.id, { attempt: 3 }).document.common.blocks.length, 2);
+  assert.equal(fs.existsSync(path.join(queue.pageBuilder.root, job.id, 'attempt-002.json')), false, 'the bound document of the replaced attempt is swept');
   assert.deepEqual(fs.readFileSync(legacy), bytes);
   const reopened = new PageBuilderStore(queue.root, () => job);
-  reopened.write(job.id, 7, payload.document, 2); reopened.migrateLegacy(job.id);
-  assert.equal(reopened.read(job.id, { attempt: 2 }).revision, 8, 'repeated migration never overwrites subsequent edits');
+  const stored = reopened.read(job.id, { attempt: 3 });
+  reopened.write(job.id, stored.revision, stored.document, 3); reopened.migrateLegacy(job.id);
+  assert.equal(reopened.read(job.id, { attempt: 3 }).revision, stored.revision + 1, 'repeated migration never overwrites subsequent edits');
   assert.deepEqual(fs.readFileSync(legacy), bytes);
 });
 
@@ -104,17 +109,17 @@ test('interrupted legacy publication recovers its fixed owner without overwritin
   assert.deepEqual(fs.readFileSync(target), before); assert.equal(JSON.parse(fs.readFileSync(legacy)).revision, 4);
 });
 
-test('historical media selection uses its own page CAS and rejects media from another attempt', async t => {
+test('media selection keeps its own page CAS and rejects provenance of a replaced attempt', async t => {
   const { queue, job } = await fixture(t), { attempt, buffers } = seedPickerImages(queue, job);
   const request = { revision: 1, attempt: 1, htmlRevision: attempt.htmlMedia.revision };
   const name = filename(queue.stage.media.read(job, attempt).resources[0]);
-  attempt.status = 'paused'; queue.retry(job.id);
   const selected = queue.mediaPicker.choose(job.id, request, name);
   assert.deepEqual(queue.mediaPicker.preview(job.id, selected.preview.split('/').at(-1)).bytes, buffers[0]);
-  const fresh = queue.pageBuilder.read(job.id), block = queue.pageBuilder.read(job.id, { attempt: 1 }).document.common.blocks[0];
-  block.media = [{ id: 'cross-attempt-image', originalUrl: selected.url, originalMedia: selected.media, bigUrl: '', href: '', alt: '', caption: '' }];
-  fresh.document.common.blocks.push(block);
-  assert.throws(() => queue.pageBuilder.write(job.id, fresh.revision, fresh.document, 2), /устаревшей попытке/);
+  attempt.status = 'paused'; queue.retry(job.id);
+  const fresh = queue.pageBuilder.read(job.id);
+  fresh.document.common.blocks.push({ id: 'cross-attempt-image', type: 'big-media', view: 'default', title: 'Снимок', text: '', content: '', settings: '',
+    media: [{ id: 'cross-attempt-image-asset', originalUrl: selected.url, originalMedia: selected.media, bigUrl: '', href: '', alt: '', caption: '' }], review: { status: 'unreviewed', reason: '' } });
+  assert.throws(() => queue.pageBuilder.write(job.id, fresh.revision, fresh.document), /Попытка медиа не найдена/);
   assert.equal(queue.pageBuilder.read(job.id).document.common.blocks.length, 0);
 });
 
@@ -1054,10 +1059,10 @@ test('unchanged historic document items survive retired sources while changed or
   assert.throws(() => queue.pageBuilder.write(job.id, fresh.revision, fresh.document, 2), /устаревшей/);
   const legacy = structuredClone(saved); delete legacy.document.common.blocks[0].items[0].sourceDocument;
   legacy.document.common.blocks[0].items[0].meta.file_id = 123;
-  fs.writeFileSync(queue.pageBuilder.file(job.id, 1), JSON.stringify(legacy));
-  const beforeRead = fs.readFileSync(queue.pageBuilder.file(job.id, 1)), read = queue.pageBuilder.read(job.id, { attempt: 1 });
-  assert.deepEqual(fs.readFileSync(queue.pageBuilder.file(job.id, 1)), beforeRead);
+  fs.writeFileSync(queue.pageBuilder.file(job.id), JSON.stringify(legacy));
+  const beforeRead = fs.readFileSync(queue.pageBuilder.file(job.id)), read = queue.pageBuilder.read(job.id);
+  assert.deepEqual(fs.readFileSync(queue.pageBuilder.file(job.id)), beforeRead);
   read.document.common.blocks[0].title = 'Legacy block title';
-  const preserved = queue.pageBuilder.write(job.id, read.revision, read.document, 1);
+  const preserved = queue.pageBuilder.write(job.id, read.revision, read.document);
   assert.deepEqual(preserved.document.common.blocks[0].items[0], legacy.document.common.blocks[0].items[0]);
 });

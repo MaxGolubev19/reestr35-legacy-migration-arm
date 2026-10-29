@@ -9,6 +9,7 @@ const { checkManifest } = require('../capture/manifest.cjs');
 const { stageBatch } = require('./staging.cjs');
 const { reviews, nextReview, validateReview } = require('./progress.cjs');
 const { buildQaPrompt, isCurrentPolicy } = require('./policy.cjs');
+const { createReasoningJournal } = require('./reasoning.cjs');
 const now = () => new Date().toISOString();
 const last = job => job.attempts.at(-1);
 
@@ -87,6 +88,8 @@ function launchQa(queue, job, attempt) {
       queue.save();
       const prompt = buildQaPrompt(qa.manifest, session, evidence);
       fs.writeFileSync(path.join(p.dir, `qa-${session.generation}-prompt.txt`), prompt);
+      const reasoningJournal = createReasoningJournal({ file: path.join(p.dir, 'reasoning.log'),
+        onTail: line => queue.reasoningTails?.set(`${job.id}:${attempt.number}`, line) });
       let identity = {}, child;
       appServer = queue.appServerFactory(); queue.qaServers.add(appServer);
       child = appServer.review({ ...session, cwd: qaDir, prompt,
@@ -115,6 +118,7 @@ function launchQa(queue, job, attempt) {
           return { accepted: review.name, ...attempt.qa };
         },
         onLog: text => fs.appendFileSync(path.join(p.dir, 'stderr.log'), text),
+        onReasoning: text => reasoningJournal.append(text),
       });
       child.armLaunch = launch; child.armInterrupt = () => child.interrupt(); queue.active.set(job.id, child);
       const monitor = queue.setTimer(() => queue.tick(job, attempt, child).catch(error => {

@@ -171,6 +171,11 @@ test('step 2 completion assembles the page through the ordinary write path', asy
   assert.ok(prompt.includes(job.url)); assert.ok(prompt.includes('media-catalog.json'));
   session.config.onLog('turn started\n');
   assert.equal(fs.readFileSync(path.join(builderDir, 'run-1-log.txt'), 'utf8'), 'turn started\n', 'session log lines are appended to the run log');
+  session.config.onReasoning('Собираю шапку страницы\n');
+  const reasoningLog = path.join(layout(queue.root, job, attempt).dir, 'builder-reasoning.log');
+  assert.equal(fs.readFileSync(reasoningLog, 'utf8'), 'Собираю шапку страницы\n', 'builder reasoning streams into its own attempt journal');
+  assert.equal(queue.reasoningTails.get(`${job.id}:${attempt.number}`), 'Собираю шапку страницы', 'the shared tail key carries the builder thought');
+  assert.equal(fs.existsSync(path.join(layout(queue.root, job, attempt).dir, 'reasoning.log')), false, 'the QA journal stays separate from the builder one');
   assert.equal(fs.existsSync(run.stagingDir), false, 'staging is removed after the session closes');
 });
 
@@ -529,12 +534,18 @@ test('a job runs one assembly at a time and stale attempt entries resolve as ski
   secondSession.finish(0);
   assert.equal(second.builder.status, 'complete');
   advance(200); queue.builder.pump();
-  assert.equal(attempt.builder.status, 'failed', 'the stale auto-retry of the older attempt never restarts it');
-  assert.equal(attempt.builder.retryAt, undefined, 'the dead retry plan does not linger in state');
+  assert.equal(attempt.builder.status, 'failed', 'the stale auto-retry of the replaced attempt never restarts it');
+  assert.equal(fake.sessions.length, 2, 'no third session opens for the replaced attempt');
   assert.equal(queue.builder.queueList.length, 0);
+  // The replaced attempt is detached from state.json, so its inert retry plan
+  // cannot linger there; the surviving attempt owns no builder plan at all.
+  const stored = JSON.parse(fs.readFileSync(queue.stateFile, 'utf8'));
+  assert.equal(stored.jobs[0].attempts.length, 1);
+  assert.equal(stored.jobs[0].attempts[0].number, 2);
+  assert.equal(stored.jobs[0].attempts[0].builder.retryAt, undefined, 'no dead retry plan lingers in state');
 });
 
-test('a queued assembly of a superseded attempt is skipped, not dangling', async t => {
+test('a queued assembly of a replaced attempt never starts and leaves no dangling plan', async t => {
   const { queue, job, attempt, fake } = setup(t, { queue: { concurrency: 1 } });
   queue.add(`https://other.${HOST}/`);
   const otherJob = queue.jobs[1];
@@ -545,14 +556,18 @@ test('a queued assembly of a superseded attempt is skipped, not dangling', async
 
   queue.builder.consider(job, attempt);                          // queued: ждёт освобождения слота
   assert.equal(attempt.builder.status, 'queued');
-  attempt.status = 'paused'; queue.retry(job.id);                // попытка перестала быть последней
-  assert.equal(job.attempts.at(-1).number, 2);
+  attempt.status = 'paused'; queue.retry(job.id);                // попытка заменена и удалена из state
+  assert.equal(job.attempts.length, 1); assert.equal(job.attempts.at(-1).number, 2);
+  assert.equal(job.attempts.at(-1).builder, undefined, 'the fresh attempt owns no builder plan');
 
   fake.sessions[0].finish(0);                                    // слот освободился
   await flush();
-  assert.equal(attempt.builder.status, 'skipped');
-  assert.equal(attempt.builder.error, 'Попытка больше не последняя');
-  assert.equal(queue.builder.queueList.length, 0);
+  assert.equal(attempt.builder.status, 'queued', 'the replaced attempt never starts assembling');
+  assert.equal(fake.sessions.length, 1, 'no session opens for the replaced attempt');
+  assert.equal(queue.builder.queueList.length, 0, 'the queue entry drains without dangling');
+  const stored = JSON.parse(fs.readFileSync(queue.stateFile, 'utf8'));
+  assert.equal(stored.jobs[0].attempts.length, 1);
+  assert.equal(stored.jobs[0].attempts[0].builder, undefined, 'state keeps no queued plan of the replaced attempt');
 });
 
 test('the shared pool bounds assemblies and stage jobs together across completion paths', async t => {

@@ -50,7 +50,7 @@ test('capture checkpoint rejects corrupt identity, plan, prefix, missing, extra,
   assert.throws(() => readCheckpoint(directory, identity), /неучтённые/);
 });
 
-test('running capture pauses only after checkpoint and close; restart resumes same attempt and retry preserves history', async t => {
+test('running capture pauses only after checkpoint and close; restart resumes same attempt and retry replaces it', async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'capture-resume-queue-')), children = [], calls = []; let stops = 0;
   const config = { root, autoStart: false, setTimer: () => 1, clearTimer() {}, spawnFn(command, args, options) {
     const child = new EventEmitter(); child.pid = 990000 + children.length; child.exitCode = null;
@@ -79,7 +79,8 @@ test('running capture pauses only after checkpoint and close; restart resumes sa
   assert.equal(restored.snapshot('').jobs[0].canResume, true);
   fs.appendFileSync(path.join(p.hostDir, '00_страница.png'), 'changed');
   assert.equal(restored.snapshot('').jobs[0].canResume, false); assert.throws(() => restored.resume(job.id), /PNG подменён/);
-  restored.retry(job.id); assert.equal(recoveredJob.attempts.length, 2); assert.ok(fs.existsSync(checkpointPath(p.hostDir)));
+  restored.retry(job.id); assert.equal(recoveredJob.attempts.length, 1); assert.equal(recoveredJob.attempts[0].number, 2);
+  assert.equal(fs.existsSync(checkpointPath(p.hostDir)), false, 'the replaced attempt evidence is swept');
 });
 
 test('real browser capture resumes only remaining segments and refuses changed live structure without rewriting evidence', { timeout: 60000 }, async t => {

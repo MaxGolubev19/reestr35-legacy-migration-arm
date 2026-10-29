@@ -4,6 +4,7 @@ const path = require('node:path');
 const { APP_ROOT } = require('../../../data-dir.cjs');
 const { safeFile } = require('../../../infrastructure/files.cjs');
 const { AppServer } = require('../../capture-qa/qa/app-server.cjs');
+const { createReasoningJournal } = require('../../capture-qa/qa/reasoning.cjs');
 const { loadQa } = require('../../capture-qa/qa/progress.cjs');
 const { checkManifest } = require('../../capture-qa/capture/manifest.cjs');
 const { layout } = require('../../capture-qa/paths.cjs');
@@ -300,6 +301,11 @@ class BuilderRunner {
       run.logFile = path.join(builderDir, `run-${builder.generation}-log.txt`);
       fs.writeFileSync(run.logFile, '');
       const appServer = this.appServerFactory();
+      // The builder's reasoning journal mirrors the QA one: same attempt folder,
+      // its own file, and the same tail key — at most one agent per job is live,
+      // so step 1 and step 3 journals can never collide.
+      const reasoningJournal = createReasoningJournal({ file: path.join(layout(this.queue.root, job, attempt).dir, 'builder-reasoning.log'),
+        onTail: line => this.queue.reasoningTails?.set(`${job.id}:${attempt.number}`, line) });
       const session = appServer.assemble({ generation: builder.generation, cwd: stagingDir, prompt, files,
         onIdentity: fields => {
           Object.assign(run.identity, fields);
@@ -312,7 +318,8 @@ class BuilderRunner {
         onLog: text => {
           builder.lastMeaningfulAt = this.clock();
           try { fs.appendFileSync(run.logFile, text); } catch { /* the log is diagnostic */ }
-        } });
+        },
+        onReasoning: text => reasoningJournal.append(text) });
       run.appServer = appServer; run.session = session;
       this.running.set(job.id, run);
       session.once('close', () => this.finishRun(run));

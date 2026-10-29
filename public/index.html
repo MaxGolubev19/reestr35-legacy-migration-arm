@@ -47,7 +47,7 @@
                   <a id="detail-url" class="btn btn-outline-primary result-url"></a>
                   <a id="company-id" class="btn btn-outline-primary company-id disabled" aria-disabled="true" tabindex="-1">ID: —</a>
                   <div id="attempt-controls" class="attempt-controls d-flex flex-wrap align-items-center gap-2">
-                    <output id="attempt-duration" class="form-control w-auto attempt-duration" aria-label="Активное время попытки">00:00:00</output>
+                    <output id="attempt-duration" class="form-control w-auto attempt-duration" aria-label="Активное время работы">00:00:00</output>
                     <button id="recapture-button" type="button" class="btn btn-outline-primary btn-icon flex-shrink-0" aria-label="Перезапустить" title="Перезапустить"><svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/></svg></button>
                   </div>
                 </div>
@@ -79,20 +79,18 @@
             </div>
             </div></div>
             <section class="col-12" id="technical-area" aria-label="Техническая информация"><div class="row row-cards">
-              <div class="col-12"><div class="card"><div class="card-body d-flex flex-wrap align-items-center gap-2">
-                <label for="attempt-select" class="form-label mb-0">Попытка</label>
-                <select id="attempt-select" class="form-select w-auto" aria-label="Попытка"></select>
-              </div></div></div>
-              <div class="col-12 col-xxl-6" id="metadata-panel"><div class="card h-100">
-                <div class="card-header"><h3 class="card-title">Детали попытки</h3></div>
+              <div class="col-12" id="attempt-panel"><div class="card h-100">
+                <div class="card-header"><h3 class="card-title">Размышления</h3><span id="reasoning-truncated" class="badge bg-yellow-lt ms-auto d-none">Обрезан</span></div>
+                <div class="card-body">
+                  <pre id="reasoning-output" class="bg-body-secondary text-body rounded p-3 mb-0 reasoning-output" aria-label="Журнал размышлений агента" tabindex="0">Загрузка…</pre>
+                </div>
+              </div></div>
+              <div class="col-12" id="metadata-panel"><div class="card h-100">
+                <div class="card-header"><h3 class="card-title">Детали обработки</h3></div>
                 <div class="card-body">
                   <dl class="row mb-3"><dt class="col-4">ID</dt><dd id="detail-id" class="col-8 font-monospace text-break"></dd><dt class="col-4">Создано</dt><dd id="detail-created" class="col-8"></dd></dl>
                   <div id="attempt-meta"></div><div id="files-list" class="mt-3"></div>
                 </div>
-              </div></div>
-              <div class="col-12 col-xxl-6" id="summary-panel"><div class="card h-100">
-                <div class="card-header"><h3 class="card-title">Сводка и замечания</h3></div>
-                <div class="card-body"><h4>Сводка</h4><pre id="summary-output" class="bg-body-secondary text-body rounded p-3 raw-output"></pre><h4 class="mt-3">Замечания</h4><pre id="issues-output" class="bg-body-secondary text-body rounded p-3 raw-output"></pre></div>
               </div></div>
               <div class="col-12 col-xxl-6 d-none" id="media-source-panel"><div class="card h-100">
                 <div class="card-header"><h3 class="card-title">Источник HTML</h3></div>
@@ -101,13 +99,6 @@
               <div class="col-12 col-xxl-6 d-none" id="media-outcome-panel"><div class="card h-100">
                 <div class="card-header"><h3 class="card-title">Итог HTML и медиа</h3></div>
                 <div class="card-body"><p id="media-outcome-status" class="fw-medium"></p><dl id="media-outcome-meta" class="row mb-0"></dl></div>
-              </div></div>
-              <div id="logs-card" class="col-12 d-none"><div class="card">
-                <div class="card-header"><h3 class="card-title">Журналы</h3></div>
-                <div class="card-body"><div class="row g-3">
-                  <div class="col-12 col-md-6"><div class="d-flex align-items-center mb-2"><h4 class="mb-0">stdout · JSONL</h4><span id="stdout-truncated" class="badge bg-yellow-lt ms-auto d-none">Обрезан</span></div><pre id="stdout-output" class="bg-dark text-light rounded p-3 raw-log mb-0">Загрузка…</pre></div>
-                  <div class="col-12 col-md-6"><div class="d-flex align-items-center mb-2"><h4 class="mb-0">stderr</h4><span id="stderr-truncated" class="badge bg-yellow-lt ms-auto d-none">Обрезан</span></div><pre id="stderr-output" class="bg-dark text-light rounded p-3 raw-log mb-0">Загрузка…</pre></div>
-                </div></div>
               </div></div>
             </div></section>
           </div>
@@ -119,7 +110,7 @@
 <div class="modal fade" id="png-modal" tabindex="-1" aria-labelledby="png-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
   <div class="modal-header"><div class="detail-heading modal-image-heading"><h3 class="modal-title" id="png-modal-title">Снимок</h3><span id="png-counter" class="text-secondary image-counter"></span></div><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button></div>
   <div class="modal-body gallery-viewport"><div id="png-error" class="alert alert-warning d-none" role="alert">Не удалось загрузить PNG.</div><img id="png-full" class="gallery-full-image" alt=""></div>
-  <div class="modal-footer justify-content-between gap-2"><div class="btn-list"><button id="png-prev" type="button" class="btn btn-outline-secondary">Предыдущий</button><button id="png-next" type="button" class="btn btn-outline-secondary">Следующий</button></div></div>
+  <div class="modal-footer justify-content-between gap-2"><div id="png-remark" class="alert alert-warning py-2 px-3 mb-0 w-100 png-remark d-none" role="note"></div><div class="btn-list"><button id="png-prev" type="button" class="btn btn-outline-secondary">Предыдущий</button><button id="png-next" type="button" class="btn btn-outline-secondary">Следующий</button></div></div>
 </div></div></div>
 <div class="modal fade" id="json-modal" tabindex="-1" aria-labelledby="json-modal-title" aria-hidden="true"><div class="modal-dialog modal-xl modal-dialog-centered"><div class="modal-content">
   <div class="modal-header"><h3 class="modal-title text-break" id="json-modal-title">capture-report.json</h3><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть JSON"></button></div>

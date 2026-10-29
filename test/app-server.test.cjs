@@ -117,6 +117,22 @@ test('review before turn identity is stale; late turn.started binds identity', a
   await flush();
   assert.equal(session.turnId, 'turn-late');
 });
+test('reasoning deltas stream to onReasoning; text and empty deltas stay out', async t => {
+  const seen = [];
+  const ctx = fixture(t);
+  const session = ctx.app.review({ generation: 1, cwd: __dirname, prompt: 'think', files: [], onIdentity() {}, onReview() {}, onReasoning: text => seen.push(text) });
+  await session.ready;
+  const child = ctx.children[0], id = session.threadId;
+  child.send({ method: 'session/event', params: { sessionId: id, type: 'model.streaming', payload: { kind: 'reasoning_delta', delta: 'Думаю' } } });
+  child.send({ method: 'session/event', params: { events: [
+    { sessionId: id, type: 'model.streaming', payload: { kind: 'reasoning_delta', delta: ' пошагово' } },
+    { sessionId: id, type: 'model.streaming', payload: { kind: 'text_delta', delta: 'ответ' } },
+    { sessionId: id, type: 'model.streaming', payload: { kind: 'reasoning_delta', delta: '' } }
+  ] } });
+  await flush();
+  assert.deepEqual(seen.join(''), 'Думаю пошагово');
+  child.send({ method: 'session/event', params: { sessionId: id, type: 'turn.completed', turnId: session.turnId, payload: {} } });
+});
 test('stop closes dedicated process without waiting for turn acknowledgement', async t => {
   const ctx = fixture(t), session = review(ctx); await session.ready;
   const stopped = session.interrupt(); assert.equal(session.exitCode, null);

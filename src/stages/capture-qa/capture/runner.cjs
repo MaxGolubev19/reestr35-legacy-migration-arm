@@ -35,21 +35,22 @@ function launchCapture(queue, job, attempt) {
     attempt.launch = launch; delete attempt.pid; delete attempt.orphanPid;
     attempt.status = 'running'; attempt.startedAt ||= now(); delete attempt.finishedAt; queue.save();
     let child;
-    const stdout = fs.openSync(path.join(locations.dir, 'events.jsonl'), 'a');
+    // Worker stdout carries segment progress lines for standalone CLI runs;
+    // the UI dropped its log panel, so the backend no longer archives it.
     const stderr = fs.openSync(path.join(locations.dir, 'stderr.log'), 'a');
     try {
       child = queue.spawnFn(command, args, {
         cwd: queue.workspace, shell: false, windowsHide: true, detached: process.platform !== 'win32',
-        stdio: ['pipe', stdout, stderr], env: queue.runtime.env,
+        stdio: ['pipe', 'ignore', stderr], env: queue.runtime.env,
         armLaunch: { ...launch, dir: locations.dir, descriptor },
       });
     } catch (error) {
-      fs.closeSync(stdout); fs.closeSync(stderr);
+      fs.closeSync(stderr);
       publishLease(locations.dir, launch, { status: 'finished', proof: 'spawn-threw-before-child', finishedAt: now() });
       attempt.status = attempt.captureSealed ? queue.stage.outcome(job, attempt) : 'failed'; attempt.error = error.message; attempt.finishedAt = now(); queue.save();
       return;
     }
-    fs.closeSync(stdout); fs.closeSync(stderr);
+    fs.closeSync(stderr);
     child.armLaunch = launch;
     child.armInterrupt = () => queue.stopFn(child);
     queue.active.set(job.id, child); attempt.pid = child.pid; queue.save();

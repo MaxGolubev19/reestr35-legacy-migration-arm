@@ -703,7 +703,7 @@
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     });
     closeButton.focus();
-    if (!draft.mediaContext.htmlRevision) { message.textContent = 'В этой попытке ещё нет HTML шага 2.'; return; }
+    if (!draft.mediaContext.htmlRevision) { message.textContent = 'Пока ещё нет HTML шага 2.'; return; }
     const context = { revision: draft.revision, ...draft.mediaContext };
     try {
       const catalog = await state.api(`/api/page-builder/${encodeURIComponent(draft.jobId)}/frame-catalog?${new URLSearchParams(context)}`, { signal: controller.signal });
@@ -880,7 +880,7 @@
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     });
     closeButton.focus();
-    if (!draft.mediaContext.htmlRevision) { message.textContent = 'В этой попытке ещё нет HTML шага 2.'; return; }
+    if (!draft.mediaContext.htmlRevision) { message.textContent = 'Пока ещё нет HTML шага 2.'; return; }
     const context = { revision: draft.revision, ...draft.mediaContext };
     try {
       const catalog = await state.api(`/api/page-builder/${encodeURIComponent(draft.jobId)}/document-catalog?${new URLSearchParams(context)}`, { signal: controller.signal });
@@ -1887,7 +1887,7 @@
     event.preventDefault(); if (state.saving || state.pendingSaved || state.picking || state.assembling) return;
     formError.classList.add('d-none'); const draft = state.draft, target = draft && locate(draft.target, draft.document); if (!target) return;
     const advertised = state.pendingJob, currentJobId = advertised?.id || state.jobId;
-    if (draft.jobId !== currentJobId || draft.attempt !== (advertised?.builderAttempt ?? state.attempt)) { formError.textContent = 'Страница обновилась: открыта другая попытка. Локальные правки оставлены в редакторе.'; formError.classList.remove('d-none'); return; }
+    if (draft.jobId !== currentJobId || draft.attempt !== (advertised?.builderAttempt ?? state.attempt)) { formError.textContent = 'Страница обновилась: обработка перезапущена. Локальные правки оставлены в редакторе.'; formError.classList.remove('d-none'); return; }
     if (draft.mode === 'delete') {
       const next = structuredClone(draft.document);
       if (draft.target.kind === 'tab') next.tabs = next.tabs.filter(tab => tab.id !== draft.target.id);

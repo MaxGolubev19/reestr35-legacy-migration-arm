@@ -62,6 +62,22 @@ function start(t, count = 11, options = {}) { const ctx = setup(t, options); ctx
 function qa(ctx) { ctx.children[0].finish(0); const child = ctx.sessions.at(-1); child.bind(); return child; }
 function pass(child, count = child.config.files.length) { for (const file of child.config.files.slice(0, count)) child.record(file); }
 
+test('QA reasoning streams into reasoning.log and the snapshot tail line', t => {
+  const ctx = start(t, 2), child = qa(ctx);
+  child.config.onReasoning('Первый шаг\n');
+  child.config.onReasoning('Второй шаг размышления');
+  assert.equal(fs.readFileSync(path.join(ctx.p.dir, 'reasoning.log'), 'utf8'), 'Первый шаг\nВторой шаг размышления');
+  assert.equal(ctx.queue.snapshot('').jobs[0].attempts[0].reasoningLine, 'Второй шаг размышления');
+  child.config.onReasoning(`\n${'длинная строка '.repeat(40)}`);
+  const tail = ctx.queue.snapshot('').jobs[0].attempts[0].reasoningLine;
+  assert.ok(tail.endsWith('…'), 'the panel line is cut with an ellipsis');
+  assert.ok(tail.length <= 202, 'the tail stays within the panel limit');
+  assert.equal(JSON.stringify(ctx.queue.snapshot('')).includes('reasoningLine'), true);
+  pass(child); child.finish();
+  assert.equal(ctx.attempt.status, 'complete');
+  assert.equal(ctx.queue.snapshot('').jobs[0].attempts[0].reasoningLine, tail, 'the journal survives the attempt finish');
+});
+
 test('composed workflow pauses for missing HTML only after final QA process close and preserves capture result', t => {
   const ctx = start(t, 1, { stageFactory: require('../src/pipeline/registry.cjs').createStage });
   const child = qa(ctx); pass(child);
@@ -867,7 +883,7 @@ test('current policy prompt accepts source emptiness and image text quality with
   report.segments[1].empty = false; report.segments[1].resources = { images: [], frames: [], fonts: 'loaded' };
   report.segments[1].issues = []; atomicJson(ctx.p.report, report);
   const child = qa(ctx), prompt = child.config.prompt, instructions = fs.readFileSync(path.join(__dirname, '../src/qa-instructions.txt'), 'utf8');
-  assert.equal(QA_POLICY.version, 5); assert.equal(ctx.queue.qaState(ctx.job, ctx.attempt).manifest.inventory.segments[1].empty, false);
+  assert.equal(QA_POLICY.version, 6); assert.equal(ctx.queue.qaState(ctx.job, ctx.attempt).manifest.inventory.segments[1].empty, false);
   for (const text of [
     'оценивай только доказуемые дефекты захвата, не дизайн/UX/доступность', 'Пустая или визуально пустая вкладка',
     'segment.status=ok', 'корректном coverage', 'diagnostics unloaded/loader/failed iframe',
@@ -876,13 +892,15 @@ test('current policy prompt accepts source emptiness and image text quality with
     'Маленький масштаб просмотра сам по себе не запрещает passed', 'именно для оценки целостности и дефектов захвата',
     'missing/crop/placeholder/loading/corruption/seam/overlay/wrong boundary',
     'Технические ошибки ресурсов, iframe или coverage не списывай', 'Событие load и техническое ok не доказывают отрисовку',
+    'недоступный фрейм — терминальное сообщение', 'терминальная недоступность сервиса внутри загруженного iframe',
   ]) assert.ok(prompt.includes(text), text);
   assert.ok(!prompt.includes('PNG: читаемость,'), 'no standalone source-legibility criterion');
   assert.match(instructions, /Reading or transcribing text embedded in source content images, scans,\s+certificates or banners is not required/);
   assert.match(instructions, /Read visible tab\s+labels, loading\/error messages and other UI cues when needed to verify capture/);
   assert.ok(!instructions.includes('Do not read or transcribe text inside images'));
   assert.match(instructions, /explicit empty flag is not required/);
-  assert.match(instructions, /Never excuse placeholders, failed resources, blank\/error\/loading iframes/);
+  assert.match(instructions, /Never excuse placeholders, failed resources, blank or loading iframes/);
+  assert.match(instructions, /Terminal unavailability reported by the embedded service itself is not a loading\s+failure/);
   pass(child); child.finish(); assert.equal(ctx.attempt.status, 'complete');
 });
 
@@ -901,7 +919,7 @@ test('v2 false visual issues remain history while current policy reviews all imm
   assert.equal(attempt.status, 'needs_review'); assert.equal(attempt.qa.issues, 0); assert.equal(attempt.qa.passed, 0);
   assert.equal(attempt.qa.historicalReviews, 2); assert.equal(attempt.qa.unreviewed, 2);
   restarted.queue['continue-qa'](job.id); restarted.queue.pump(); const next = restarted.sessions[0]; next.bind();
-  assert.equal(next.config.files.length, 2); assert.equal(next.config.policy.version, 5);
+  assert.equal(next.config.files.length, 2); assert.equal(next.config.policy.version, 6);
   pass(next); next.finish(); assert.equal(attempt.status, 'complete');
   const updated = loadQa(ctx.root, job, attempt);
   assert.deepEqual(updated.progress.checkpoints.slice(0, 2), history); assert.equal(updated.progress.checkpoints.length, 4);
@@ -927,7 +945,7 @@ test('current policy retains v4 rejection of edge-only crop reasoning and migrat
   assert.equal(attempt.status, 'needs_review'); assert.equal(attempt.qa.issues, 0); assert.equal(attempt.qa.passed, 0);
   assert.equal(attempt.qa.historicalReviews, 2); assert.equal(attempt.qa.unreviewed, 2);
   restarted.queue['continue-qa'](job.id); restarted.queue.pump(); const next = restarted.sessions[0]; next.bind();
-  assert.equal(next.config.policy.version, 5); assert.notEqual(next.config.policy.hash, previousPolicy.hash);
+  assert.equal(next.config.policy.version, 6); assert.notEqual(next.config.policy.hash, previousPolicy.hash);
   assert.equal(next.config.files.length, 2);
   for (const prompt of [child.config.prompt, next.config.prompt]) {
     for (const required of [
@@ -937,7 +955,7 @@ test('current policy retains v4 rejection of edge-only crop reasoning and migrat
       'source clipping и странности исходной вёрстки допустимы',
       'только при подтверждающих inventory/report diagnostics (geometry changed, overflow, overlay, resource failure)',
       'явном внутреннем шве/повторе/разрыве сборки', 'фактически неверной панели/сегменте относительно полного inventory',
-      'Реальные unloaded/placeholder/failed iframe', 'внутренний seam/duplicate и wrong active tab остаются issues',
+      'Реальные unloaded/placeholder/blank iframe', 'внутренний seam/duplicate и wrong active tab остаются issues',
       'Назови конкретное подтверждение, относящееся к заявленному дефекту, а не только внешний край',
     ]) assert.ok(prompt.includes(required), required);
   }
@@ -945,7 +963,7 @@ test('current policy retains v4 rejection of edge-only crop reasoning and migrat
   assert.match(instructions, /touching\/crossing a PNG edge[\s\S]*is not evidence of crop/);
   assert.match(instructions, /Never imagine\s+continuation outside the frame/);
   assert.match(instructions, /requires relevant inventory\/report diagnostics/);
-  assert.match(instructions, /wrong active tab remain defects even with\s+technical OK/);
+  assert.match(instructions, /wrong active tab remain defects\s+even with technical OK/);
   pass(next); next.finish(); assert.equal(attempt.status, 'complete');
   const updated = loadQa(ctx.root, job, attempt);
   assert.deepEqual(updated.progress.checkpoints.slice(0, 2), history);
@@ -977,7 +995,7 @@ test('v5 rejects exact edge-chrome header claims and migrates v4 reviews without
     assert.equal(attempt.qa.passed, 0); assert.equal(attempt.qa.historicalReviews, 2); assert.equal(attempt.qa.unreviewed, 2);
     restarted.queue['continue-qa'](job.id); restarted.queue.pump();
     const next = restarted.sessions[0]; next.bind();
-    assert.equal(next.config.policy.version, 5); assert.notEqual(next.config.policy.hash, previousPolicy.hash);
+    assert.equal(next.config.policy.version, 6); assert.notEqual(next.config.policy.hash, previousPolicy.hash);
     assert.deepEqual(next.config.files.map(file => ({ name: file.name, sha256: file.sha256 })), beforeFiles);
     for (const required of [
       'конец перед первой строкой/списком кнопок вкладок (ul.tabs)',
@@ -988,7 +1006,7 @@ test('v5 rejects exact edge-chrome header claims and migrates v4 reviews without
       'сами по себе не являются wrong boundary при segment.status=ok, корректном coverage и чистых diagnostics',
       'фактическая кнопочная панель или её содержимое в header',
       'фактически неверная содержательная панель или дублированный контент остаются issues',
-      'Реальные unloaded/placeholder/failed iframe', 'внутренний seam/duplicate и wrong active tab остаются issues',
+      'Реальные unloaded/placeholder/blank iframe', 'внутренний seam/duplicate и wrong active tab остаются issues',
     ]) assert.ok(next.config.prompt.includes(required), required);
     pass(next); next.finish(); assert.equal(attempt.status, 'complete');
     const updated = loadQa(ctx.root, job, attempt);

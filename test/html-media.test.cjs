@@ -479,7 +479,7 @@ test('upload API authenticates Origin/CSRF and stale attempt/revision; source re
   assert.equal((await post({ Origin: 'https://evil.example' })).status, 403); assert.equal((await post({ 'x-csrf-token': 'bad' })).status, 403); assert.equal((await post()).status, 200); assert.equal((await post()).status, 409);
   const original = await fetch(base + route + '/1/source'); assert.match(original.headers.get('content-disposition'), /attachment/); assert.equal(original.headers.get('content-type'), 'application/octet-stream'); assert.match(original.headers.get('content-security-policy'), /sandbox/); assert.deepEqual(Buffer.from(await original.arrayBuffer()), source);
   const code = await (await fetch(base + route + '/1/code')).json(); assert.equal(code.text, source.toString('utf8')); assert.equal(ctx.attempt.status, 'queued'); assert.equal(ctx.queue.snapshot('').jobs[0].canResume, false);
-  ctx.queue.pause(ctx.job.id); ctx.queue.retry(ctx.job.id); assert.equal((await post({ 'x-html-revision': '1' })).status, 409);
+  ctx.queue.pause(ctx.job.id); ctx.queue.retry(ctx.job.id); assert.equal((await post({ 'x-html-revision': '1' })).status, 404, 'the replaced attempt no longer accepts uploads');
 });
 test('in-flight upload fences Continue/retry, size rejection preserves old revision; failed bytes consume aggregate budget', async t => {
   const fixture = await fixtureServer(t), ctx = completed(t, { mediaDownload: fixture.fetchAsset, mediaLimits: { maxHtmlBytes: 100, maxTotalBytes: 100 } });
@@ -533,9 +533,7 @@ browserTest('shared modal restores exact HTML/image trigger after checkpoint pol
   const old = await html.elementHandle(); await open(html); await ctx.queue.stage.media.upload(ctx.job, ctx.attempt, ctx.attempt.htmlMedia.revision, Readable.from([source]));
   await page.waitForFunction(element => !element.isConnected, old); await close(); assert.equal(await html.evaluate(node => document.activeElement === node), false, 'another source revision must not receive old modal focus');
   const previousAttempt = await html.elementHandle(); await open(html); ctx.queue.newAttempt(ctx.job); ctx.queue.save();
-  await page.waitForFunction(() => document.querySelector('#attempt-select option[value="2"]'));
-  await page.locator('#attempt-select').evaluate(node => { node.value = '2'; node.dispatchEvent(new Event('change', { bubbles: true })); });
-  assert.equal(JSON.parse(await html.getAttribute('data-media-trigger'))[1], 2);
+  await page.waitForFunction(() => JSON.parse(document.querySelector('.html-source-card')?.getAttribute('data-media-trigger') || '[]')[1] === 2);
   await page.waitForFunction(element => !element.isConnected, previousAttempt); await close(); assert.equal(await html.evaluate(node => document.activeElement === node), false, 'another attempt must not receive old modal focus');
   assert.deepEqual(errors, []);
 });
@@ -854,29 +852,33 @@ test('retry-stage restarts step 2 from copied step 1 evidence and downloads medi
   queue.pump(); await queue.active.get(job.id).completion;
   assert.equal(attempt.status, 'complete'); assert.equal(attempt.htmlMedia.downloaded, 1);
   const firstManifest = queue.stage.media.read(job, attempt);
+  const firstQaManifest = loadQa(root, job, attempt).manifest;
 
+  attempt.activeDurationMs = 12345; attempt.durationIncomplete = true;
   await queue.retryStage(job.id, 2);
   const second = job.attempts.at(-1);
-  assert.equal(second.number, 2); assert.equal(job.attempts.length, 2);
+  assert.equal(second.number, 2); assert.equal(job.attempts.length, 1);
+  assert.equal(fs.existsSync(layout(root, job, attempt).dir), false, 'the replaced attempt materials are swept');
   assert.equal(second.phase, 'html-media'); assert.equal(second.status, 'queued');
   assert.equal(second.captureSealed, true); assert.equal(second.captureStatus, 'complete');
   assert.equal(second.qa.total, 1); assert.equal(second.qa.unreviewed, 0, 'QA progress from step 1 is carried over');
   assert.ok(fs.existsSync(path.join(layout(root, job, second).hostDir, '00_страница.png')), 'captured PNG is copied');
-  const copied = loadQa(root, job, second).manifest, original = loadQa(root, job, attempt).manifest;
+  const copied = loadQa(root, job, second).manifest;
   assert.equal(copied.attempt, 2, 'the copied manifest is re-bound to the new attempt');
-  assert.equal(copied.reportHash, original.reportHash); assert.deepEqual(copied.files, original.files);
+  assert.equal(copied.reportHash, firstQaManifest.reportHash); assert.deepEqual(copied.files, firstQaManifest.files);
   const dir = queue.stage.media.directory(job, second);
   const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json')));
   assert.equal(manifest.revision, 1); assert.equal(manifest.status, 'ready'); assert.equal(manifest.checkpoint, 1);
   assert.equal(manifest.source.sha256, firstManifest.source.sha256); assert.equal(manifest.source.origin, 'bundled');
   assert.deepEqual(manifest.resources.map(resource => resource.status), ['pending'], 'media downloads start clean');
-  assert.equal(attempt.status, 'complete', 'the finished attempt stays untouched');
-  assert.equal(second.activeDurationMs, 0, 'the new attempt counts its own time');
+  assert.equal(second.activeDurationMs, 12345, 'a step 2 restart continues the accumulated timer');
+  assert.equal(second.durationIncomplete, true, 'an incomplete total stays marked as a lower bound');
+  assert.equal(second.activeSince, null);
 
   queue.pump(); await queue.active.get(job.id).completion;
   assert.equal(second.status, 'complete'); assert.equal(second.htmlMedia.downloaded, 1);
   assert.deepEqual(fixture.hits, ['/photo.png', '/photo.png'], 'media is downloaded again');
-  for (const [file, expected] of ctx.proof) assert.equal(hash(fs.readFileSync(file)), expected);
+  assert.doesNotThrow(() => loadQa(root, job, second), 'the copied step 1 evidence stays sealed after the media rerun');
 });
 
 test('retry-stage interrupts a running media download and restarts only step 2', async t => {
@@ -892,6 +894,7 @@ test('retry-stage interrupts a running media download and restarts only step 2',
   assert.equal(attempt.status, 'paused', 'the stopped worker parks the old attempt');
   assert.equal(queue.active.has(job.id), false);
   assert.equal(second.number, 2); assert.equal(second.status, 'queued');
+  assert.equal(job.attempts.length, 1, 'the step restart replaces the single attempt');
   assert.equal(second.captureStatus, 'complete'); assert.equal(second.qa.unreviewed, 0);
 
   queue.pump();
@@ -899,7 +902,7 @@ test('retry-stage interrupts a running media download and restarts only step 2',
   await new Promise(resolve => { const timer = setInterval(() => { if (fixture.hits.filter(hit => hit === '/slow').length >= 2) { clearInterval(timer); resolve(); } }, 10); });
   fixture.release(); await child.completion;
   assert.equal(second.status, 'complete'); assert.equal(second.htmlMedia.downloaded, 1);
-  for (const [file, expected] of ctx.proof) assert.equal(hash(fs.readFileSync(file)), expected);
+  assert.doesNotThrow(() => loadQa(queue.root, job, second), 'the copied step 1 evidence stays sealed after the media rerun');
 });
 
 test('retry-stage refuses unfinished step 1, queued work and invalid bodies over HTTP', async t => {
@@ -930,6 +933,6 @@ test('retry-stage refuses unfinished step 1, queued work and invalid bodies over
   queue.pump(); await queue.active.get(job.id).completion;
   const accepted = await fetch(endpoint, { method: 'POST', headers, body: '{"stage":2}' });
   assert.equal(accepted.status, 200); assert.deepEqual(await accepted.json(), { ok: true });
-  assert.equal(job.attempts.length, 2);
-  assert.equal(attempt.status, 'complete'); assert.equal(job.attempts.at(-1).status, 'queued');
+  assert.equal(job.attempts.length, 1); assert.equal(job.attempts.at(-1).number, 2);
+  assert.equal(job.attempts.at(-1).status, 'queued');
 });

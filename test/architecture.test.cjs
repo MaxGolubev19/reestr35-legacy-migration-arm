@@ -86,7 +86,7 @@ test('legacy CommonJS entrypoints retain their contract and QA policy identity',
   assert.strictEqual(require('../src/app-server.cjs'), require('../src/stages/capture-qa/qa/app-server.cjs'));
   assert.strictEqual(require('../src/launcher.cjs'), require('../src/infrastructure/launcher.cjs'));
   // Baseline from the released policy: code relocation must not invalidate accepted reviews.
-  assert.deepEqual(qa.QA_POLICY, { version: 5, hash: '5f3785eb5ddaeebcdec47c5889cdda5b1f5ff01087c37ccc1404520d601d2eb9' });
+  assert.deepEqual(qa.QA_POLICY, { version: 6, hash: '867ccae89ff8dbde6c53ba2c04fa46218f2ffc3aa31b2c18aa95dfb9656150a9' });
 });
 
 test('Queue supports a capture-only stage factory while an installed media stage must retain its deletion guard', async t => {
@@ -96,15 +96,16 @@ test('Queue supports a capture-only stage factory while an installed media stage
   assert.equal(queue.stage.media, undefined);
   queue.add('https://capture-only.reestr35.ru/'); const job = queue.jobs[0], stored = queue.pageBuilder.read(job.id);
   assert.equal(queue.pageBuilder.write(job.id, stored.revision, stored.document).revision, stored.revision + 1);
-  job.attempts[0].status = 'paused'; queue.retry(job.id); assert.equal(job.attempts.length, 2);
+  job.attempts[0].status = 'paused'; queue.retry(job.id);
+  assert.equal(job.attempts.length, 1, 'retry replaces the single attempt'); assert.equal(job.attempts[0].number, 2);
   // Skipping is allowed only for a stage with no media capability. A present
   // but broken capability must never silently bypass the publication fence.
   queue.stage.media = {};
   assert.throws(() => queue.pageBuilder.assertWritable(), TypeError);
-  job.attempts[1].status = 'paused'; assert.throws(() => queue.retry(job.id), TypeError); assert.equal(job.attempts.length, 2);
+  job.attempts[0].status = 'paused'; assert.throws(() => queue.retry(job.id), TypeError); assert.equal(job.attempts.length, 1);
 });
 
-test('existing state v2 loads without stage schema migration or altered flat API fields', async t => {
+test('existing state v2 keeps only the latest attempt without stage schema migration or altered flat API fields', async t => {
   const root = fs.mkdtempSync(path.join(testTempRoot(), 'architecture-v2-'));
   const state = { version: 2, concurrency: 3, jobs: [{
     id: '12345678-1234-1234-1234-123456789abc', url: 'https://history.reestr35.ru/', createdAt: '2026-09-10T10:00:00Z',
@@ -117,6 +118,8 @@ test('existing state v2 loads without stage schema migration or altered flat API
   assert.ok(queue instanceof PageQueue);
   assert.equal(queue.stage.id, 'capture-qa');
   const expected = structuredClone(state);
+  // Startup prune keeps only the latest attempt of every job before the first save.
+  expected.jobs[0].attempts = [expected.jobs[0].attempts[1]];
   for (const attempt of expected.jobs[0].attempts) Object.assign(attempt, { activeDurationMs: 0, activeSince: null, durationIncomplete: attempt.status === 'complete' });
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(root, 'state.json'))), expected);
   const snapshot = queue.snapshot('token'), job = snapshot.jobs[0];
@@ -124,5 +127,5 @@ test('existing state v2 loads without stage schema migration or altered flat API
   assert.equal(job.status, 'paused'); assert.equal(job.canContinueQa, false); assert.equal(job.isActive, false);
   assert.deepEqual(job.attempts.map(({ pageBuilder, ...attempt }) => attempt), expected.jobs[0].attempts);
   assert.ok(job.attempts.every(attempt => attempt.pageBuilder.total === 0 && attempt.pageBuilder.revision === 0));
-  assert.ok(!Object.hasOwn(job, 'stage') && !Object.hasOwn(job.attempts[1], 'stages'));
+  assert.ok(!Object.hasOwn(job, 'stage') && !Object.hasOwn(job.attempts[0], 'stages'));
 });

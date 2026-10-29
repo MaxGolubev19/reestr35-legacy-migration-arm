@@ -155,6 +155,12 @@ class AppServer {
     const turnId = event.turnId || event.payload?.turnId;
     const session = this.threads.get(event.sessionId || (event.payload && event.payload.sessionId));
     if (event.type === 'tool.updated' && session?.onLog && event.toolName && event.kind) session.onLog(`${event.toolName} ${event.kind}\n`);
+    // The live reasoning stream arrives as model.streaming deltas; the payload
+    // may be a delta batch merged by the server, so only the kind is stable.
+    if (event.type === 'model.streaming' && session?.onReasoning) {
+      const delta = event.payload?.kind === 'reasoning_delta' && typeof event.payload.delta === 'string' ? event.payload.delta : '';
+      if (delta) session.onReasoning(delta);
+    }
     if (!session) return;
     if (event.type === 'turn.started') { this.bindTurn(session, turnId); return; }
     if (event.type !== 'turn.completed' && event.type !== 'turn.failed') return;
@@ -168,21 +174,21 @@ class AppServer {
     if (session.turnId) return;
     session.turnId = id; session.onIdentity({ appServerPid: this.child.pid, threadId: session.threadId, turnId: id });
   }
-  review({ generation, cwd, prompt, files, onIdentity, onReview, onLog }) {
+  review({ generation, cwd, prompt, files, onIdentity, onReview, onLog, onReasoning }) {
     if (this.used || this.closed) throw new Error('AppServer supports exactly one QA pass; create a new instance');
     this.used = true;
     const session = new EventEmitter();
-    Object.assign(session, { isQa: true, generation, exitCode: null, onIdentity, onReview, onLog });
+    Object.assign(session, { isQa: true, generation, exitCode: null, onIdentity, onReview, onLog, onReasoning });
     return this.dispatch(session, { cwd, prompt, files });
   }
   // Same one process/session/turn contract as review(), but for the page
   // builder: its tools are save_document and read_file, each relayed to the
   // session's onSave/onReadFile callbacks for validation before acknowledgement.
-  assemble({ generation, cwd, prompt, files, onIdentity, onSave, onReadFile, onLog }) {
+  assemble({ generation, cwd, prompt, files, onIdentity, onSave, onReadFile, onLog, onReasoning }) {
     if (this.used || this.closed) throw new Error('AppServer supports exactly one assembly pass; create a new instance');
     this.used = true;
     const session = new EventEmitter();
-    Object.assign(session, { isBuilder: true, generation, exitCode: null, onIdentity, onSave, onReadFile, onLog });
+    Object.assign(session, { isBuilder: true, generation, exitCode: null, onIdentity, onSave, onReadFile, onLog, onReasoning });
     return this.dispatch(session, { cwd, prompt, files });
   }
   dispatch(session, { cwd, prompt, files }) {

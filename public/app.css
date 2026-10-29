@@ -1,11 +1,12 @@
 #queue-card { max-height: calc(100dvh - 8rem); }
+.tooltip { pointer-events: none; }
 .job-table-wrap { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
 .job-table-wrap:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: -2px; }
-.job-table-wrap .job-drag-cell { width: 2.2rem; padding-left: .2rem !important; padding-right: 0 !important; }
-.job-table-wrap tr.table-active > td { border-top-left-radius: 0 !important; border-top-right-radius: 0 !important; }
-.job-drag-handle { display: inline-grid; place-items: center; width: 2rem; height: 2rem; padding: 0; border: 0; border-radius: .3rem; color: var(--tblr-secondary); background: transparent; cursor: grab; }
+.job-table-wrap .job-drag-cell { width: 2.2rem; vertical-align: middle; padding-left: .2rem !important; padding-right: 0 !important; }
+.job-table-wrap td { border-radius: 0 !important; }
+.job-drag-handle { display: inline-grid; place-items: center; width: 2rem; height: 2rem; padding: 0; border: 0; border-radius: var(--tblr-border-radius); color: var(--tblr-secondary); background: transparent; cursor: grab; }
 .job-drag-handle:active { cursor: grabbing; }
-.job-drag-handle:hover, .job-drag-handle:focus-visible { color: var(--tblr-primary); background: var(--tblr-primary-lt); }
+.job-drag-handle:hover, .job-drag-handle:focus-visible { background: var(--tblr-bg-surface-secondary); }
 .job-drag-handle:focus-visible { outline: 2px solid var(--tblr-primary); outline-offset: 1px; }
 .job-drag-handle svg { width: 1.2rem; height: 1.2rem; }
 #jobs-body tr.job-drop-before { box-shadow: inset 0 3px var(--tblr-primary); }
@@ -15,14 +16,28 @@
   #queue-card { max-height: calc(100dvh - 6rem); }
 }
 
-.raw-output {
-  max-height: 18rem;
+.reasoning-output {
+  height: 20rem;
   overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
-.raw-log {
-  height: 16rem;
-  overflow: auto;
+.png-remark {
+  overflow-wrap: anywhere;
+  white-space: pre-line;
+}
+
+.job-reasoning-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.job-table-wrap td {
+  vertical-align: top;
+  padding-top: .35rem;
+  padding-bottom: .35rem;
 }
 
 .detail-heading { flex: 0 1 auto; min-width: 0; }
@@ -87,7 +102,6 @@
 .qa-progress .progress { height: .25rem; }
 .qa-progress-segment { flex: 1 1 0; }
 .json-output { max-height: 65vh; overflow: auto; }
-.raw-output { white-space: pre-wrap; overflow-wrap: anywhere; }
 .media-modal-body { max-height: 75vh; overflow: auto; }
 .media-modal-body.gallery-viewport { max-height: 70vh; }
 .media-full-image { max-width: 100%; height: auto; }
